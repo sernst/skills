@@ -179,7 +179,7 @@ fn remote_cache_is_reused_and_failed_refresh_preserves_it() {
     let home = tempfile::tempdir().expect("temporary home");
     let archive_path = home.path().join("source.tar.gz");
     write_regular_archive(&archive_path, b"# cached");
-    let repository = FileConfigRepository::new(home.path().to_path_buf());
+    let repository = FileConfigRepository::new(home.path());
     let transport = ArchiveTransport::new(archive_path);
     let source = github_source("src_cached", 24);
 
@@ -215,7 +215,7 @@ fn zero_ttl_refreshes_and_dry_run_uses_only_temporary_storage() {
     let home = tempfile::tempdir().expect("temporary home");
     let archive_path = home.path().join("source.tar.gz");
     write_regular_archive(&archive_path, b"# remote");
-    let repository = FileConfigRepository::new(home.path().to_path_buf());
+    let repository = FileConfigRepository::new(home.path());
     let transport = ArchiveTransport::new(archive_path);
 
     let zero_ttl = github_source("src_zero", 0);
@@ -237,7 +237,7 @@ fn negative_ttl_and_archive_links_are_rejected() {
     let home = tempfile::tempdir().expect("temporary home");
     let regular = home.path().join("regular.tar.gz");
     write_regular_archive(&regular, b"# remote");
-    let repository = FileConfigRepository::new(home.path().to_path_buf());
+    let repository = FileConfigRepository::new(home.path());
     let regular_transport = ArchiveTransport::new(regular);
 
     let invalid_ttl = materialize_source(
@@ -277,7 +277,7 @@ fn negative_ttl_and_archive_links_are_rejected() {
 #[test]
 fn absolute_traversal_oversized_and_long_archive_paths_are_rejected() {
     let home = tempfile::tempdir().expect("temporary home");
-    let repository = FileConfigRepository::new(home.path().to_path_buf());
+    let repository = FileConfigRepository::new(home.path());
     let fixtures = [
         ("absolute", "/outside", 0_u64),
         ("traversal", "repo-root/../../outside", 0),
@@ -314,7 +314,7 @@ fn archive_entry_count_limit_is_enforced() {
     let home = tempfile::tempdir().expect("temporary home");
     let archive = home.path().join("many.tar.gz");
     write_many_entries_archive(&archive, 100_001);
-    let repository = FileConfigRepository::new(home.path().to_path_buf());
+    let repository = FileConfigRepository::new(home.path());
     let result = materialize_source(
         &repository,
         &ArchiveTransport::new(archive),

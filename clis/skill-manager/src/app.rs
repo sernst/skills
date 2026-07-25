@@ -1501,7 +1501,7 @@ mod tests {
         for path in [&first, &second] {
             std::fs::create_dir_all(path).unwrap_or_else(|error| unreachable!("{error}"));
         }
-        let repository = FileConfigRepository::new(home.path().to_path_buf());
+        let repository = FileConfigRepository::new(home.path());
         let network = NoNetwork;
         let hook = NoopTransactionHook;
         let mut prompt = TestPrompt {
@@ -1620,7 +1620,7 @@ mod tests {
     #[test]
     fn application_target_lifecycle_covers_custom_builtin_and_error_branches() {
         let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
-        let repository = FileConfigRepository::new(home.path().to_path_buf());
+        let repository = FileConfigRepository::new(home.path());
         let network = NoNetwork;
         let hook = NoopTransactionHook;
         let mut prompt = TestPrompt::default();
@@ -1708,7 +1708,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
         let source = home.path().join("source");
         std::fs::create_dir(&source).unwrap_or_else(|error| unreachable!("{error}"));
-        let repository = FileConfigRepository::new(home.path().to_path_buf());
+        let repository = FileConfigRepository::new(home.path());
         let network = NoNetwork;
         let hook = NoopTransactionHook;
         let mut prompt = TestPrompt::default();

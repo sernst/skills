@@ -1359,7 +1359,7 @@ fn v0_migration_preserves_disabled_builtin_target_state() {
     let claude = home.path().join(".claude/skills");
     let legacy = serde_json::json!({
         "targets": {
-            "claude": {
+            "Claude": {
                 "path": claude,
                 "label": "Claude Code",
                 "disabled": true
@@ -1376,10 +1376,11 @@ fn v0_migration_preserves_disabled_builtin_target_state() {
         .assert()
         .success();
     let config = read_config(home.path());
-    let enabled = config["builtins"]["claude"]["enabled"]
-        .as_bool()
-        .or_else(|| config["legacy_target_overrides"]["claude"]["enabled"].as_bool());
-    assert_eq!(enabled, Some(false));
+    assert!(config["builtins"]["claude"].is_null());
+    assert_eq!(
+        config["legacy_target_overrides"]["claude"]["enabled"].as_bool(),
+        Some(false)
+    );
     assert!(config["targets"]["claude"].is_null());
 
     let changed = home.path().join("legacy-claude");
@@ -1412,6 +1413,57 @@ fn v0_migration_preserves_disabled_builtin_target_state() {
         .success()
         .stdout(predicate::str::contains("\"name\":\"claude\""))
         .stdout(predicate::str::contains("\"legacy_override\":false"));
+}
+
+#[test]
+fn v0_migration_canonicalizes_mixed_case_builtin_target_for_lifecycle() {
+    let home = sandbox();
+    let legacy_path = home.path().join("mixed-case-claude");
+    fs::write(
+        home.path().join(".skill-manager.config.json"),
+        serde_json::json!({
+            "targets": {
+                "Claude": {
+                    "path": legacy_path,
+                    "disabled": true
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write mixed-case v0 config");
+
+    cli(home.path())
+        .args(["--json", "target", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\":\"claude\""))
+        .stdout(predicate::str::contains("\"enabled\":false"))
+        .stdout(predicate::str::contains("\"legacy_override\":true"));
+
+    let migrated = read_config(home.path());
+    assert!(migrated["legacy_target_overrides"]["Claude"].is_null());
+    assert_eq!(
+        migrated["legacy_target_overrides"]["claude"]["path"],
+        legacy_path.to_str().expect("utf8 path")
+    );
+
+    let changed_path = home.path().join("changed-mixed-case-claude");
+    cli(home.path())
+        .args([
+            "--json",
+            "target",
+            "set-path",
+            "CLAUDE",
+            changed_path.to_str().expect("utf8 path"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"event\":\"target.path-set\""));
+    assert_eq!(
+        read_config(home.path())["legacy_target_overrides"]["claude"]["path"],
+        changed_path.to_str().expect("utf8 path")
+    );
 }
 
 #[test]

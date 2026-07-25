@@ -119,7 +119,6 @@ pub trait ConfigRepository {
 /// User-home-backed configuration repository.
 #[derive(Clone, Debug)]
 pub struct FileConfigRepository {
-    home: PathBuf,
     current_path: PathBuf,
     legacy_path: PathBuf,
     cache_root: PathBuf,
@@ -137,12 +136,12 @@ impl FileConfigRepository {
 
     /// Build a repository rooted at an explicit home, primarily for tests.
     #[must_use]
-    pub fn new(home: PathBuf) -> Self {
+    pub fn new(home: impl AsRef<Path>) -> Self {
+        let home = home.as_ref();
         Self {
             current_path: home.join(".skill-manager.config.json"),
             legacy_path: home.join(".skills-syncer.config.json"),
             cache_root: home.join(".skill-manager-cache"),
-            home,
         }
     }
 
@@ -211,7 +210,7 @@ impl ConfigRepository for FileConfigRepository {
         }
         let migrated = schema == 0;
         if migrated {
-            value = migrate_v0(&value, &self.home)?;
+            value = migrate_v0(&value)?;
         }
         let config: Config =
             serde_json::from_value(value).map_err(|error| SkillManagerError::InvalidConfig {
@@ -367,12 +366,12 @@ fn ensure_v0_backup(path: &Path, expected: &[u8]) -> Result<()> {
     }
 }
 
-fn migrate_v0(value: &Value, home: &Path) -> Result<Value> {
+fn migrate_v0(value: &Value) -> Result<Value> {
     let mut root = value.as_object().cloned().ok_or_else(|| {
         SkillManagerError::InvalidInput("configuration root must be a JSON object".into())
     })?;
     migrate_v0_sources(&mut root)?;
-    migrate_v0_targets(&mut root, home)?;
+    migrate_v0_targets(&mut root)?;
     root.insert(
         "schema_version".into(),
         Value::Number(CONFIG_SCHEMA_VERSION.into()),
@@ -460,15 +459,14 @@ fn migrate_v0_sources(root: &mut Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
-fn migrate_v0_targets(root: &mut Map<String, Value>, home: &Path) -> Result<()> {
+fn migrate_v0_targets(root: &mut Map<String, Value>) -> Result<()> {
     let mut custom_targets = Map::new();
     let mut legacy_overrides = Map::new();
-    let mut builtins = Map::new();
+    let builtins = Map::new();
     if let Some(raw_targets) = root.remove("targets") {
         let targets = raw_targets.as_object().ok_or_else(|| {
             SkillManagerError::InvalidInput("configuration 'targets' must be an object".into())
         })?;
-        let defaults = builtin_targets(home);
         for (name, target) in targets {
             let mut normalized_target = target.clone();
             let object = normalized_target.as_object_mut().ok_or_else(|| {
@@ -500,20 +498,13 @@ fn migrate_v0_targets(root: &mut Map<String, Value>, home: &Path) -> Result<()> 
                 object.remove("disabled");
                 object.insert("enabled".into(), Value::Bool(enabled));
             }
-            if let Some(default) = defaults.get(name) {
-                let path_matches = normalized_target
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .is_some_and(|raw| paths_lexically_equal(Path::new(raw), &default.path));
-                if path_matches {
-                    let enabled = normalized_target
-                        .get("enabled")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true);
-                    builtins.insert(name.clone(), json!({ "enabled": enabled }));
-                } else {
-                    legacy_overrides.insert(name.clone(), normalized_target);
+            if let Some(canonical_name) = canonical_builtin_name(name) {
+                if legacy_overrides.contains_key(canonical_name) {
+                    return Err(SkillManagerError::InvalidInput(format!(
+                        "legacy target name '{name}' collides with another '{canonical_name}' built-in target"
+                    )));
                 }
+                legacy_overrides.insert(canonical_name.into(), normalized_target);
             } else {
                 custom_targets.insert(name.clone(), normalized_target);
             }
@@ -993,7 +984,16 @@ pub fn resolved_targets(config: &Config, home: &Path) -> IndexMap<String, Target
 /// Return whether a target name is reserved by a built-in.
 #[must_use]
 pub fn is_builtin_name(name: &str) -> bool {
-    matches!(fold(name).as_str(), "claude" | "shared" | "antigravity")
+    canonical_builtin_name(name).is_some()
+}
+
+fn canonical_builtin_name(name: &str) -> Option<&'static str> {
+    match fold(name).as_str() {
+        "claude" => Some("claude"),
+        "shared" => Some("shared"),
+        "antigravity" => Some("antigravity"),
+        _ => None,
+    }
 }
 
 fn builtin_targets(home: &Path) -> IndexMap<String, Target> {
@@ -1032,10 +1032,6 @@ fn builtin_targets(home: &Path) -> IndexMap<String, Target> {
             },
         ),
     ])
-}
-
-fn paths_lexically_equal(left: &Path, right: &Path) -> bool {
-    fold(&left.to_string_lossy()) == fold(&right.to_string_lossy())
 }
 
 fn title_case(value: &str) -> String {
@@ -1088,7 +1084,7 @@ mod tests {
             r#"{"skills_directories":{"C:\\skills":{"name":"mine"}}}"#,
         )
         .unwrap_or_else(|error| unreachable!("{error}"));
-        let repository = FileConfigRepository::new(home.path().to_path_buf());
+        let repository = FileConfigRepository::new(home.path());
         let loaded = repository
             .load(false)
             .unwrap_or_else(|error| unreachable!("{error}"));
@@ -1115,7 +1111,7 @@ mod tests {
             let bytes = serde_json::to_vec(&serde_json::json!({ "schema_version": schema }))
                 .unwrap_or_else(|error| unreachable!("{error}"));
             std::fs::write(&path, &bytes).unwrap_or_else(|error| unreachable!("{error}"));
-            let repository = FileConfigRepository::new(home.path().to_path_buf());
+            let repository = FileConfigRepository::new(home.path());
             assert!(repository.load(false).is_err());
             assert_eq!(
                 std::fs::read(&path).unwrap_or_else(|error| unreachable!("{error}")),
@@ -1139,7 +1135,7 @@ mod tests {
             r#"{"targets":{"custom":{"path":"C:\\custom","disabled":true}}}"#,
         )
         .unwrap_or_else(|error| unreachable!("{error}"));
-        let repository = FileConfigRepository::new(home.path().to_path_buf());
+        let repository = FileConfigRepository::new(home.path());
         let loaded = repository
             .load(false)
             .unwrap_or_else(|error| unreachable!("{error}"));
@@ -1166,7 +1162,7 @@ mod tests {
         .unwrap_or_else(|error| unreachable!("{error}"));
         std::fs::write(&legacy, r#"{"schema_version":1,"sources":[]}"#)
             .unwrap_or_else(|error| unreachable!("{error}"));
-        let repository = FileConfigRepository::new(home.path().to_path_buf());
+        let repository = FileConfigRepository::new(home.path());
         let mut loaded = repository
             .load(false)
             .unwrap_or_else(|error| unreachable!("{error}"));
@@ -1200,7 +1196,7 @@ mod tests {
         let current = home.path().join(".skill-manager.config.json");
         let original = br#"{"schema_version":0,"sources":[]}"#;
         std::fs::write(&current, original).unwrap_or_else(|error| unreachable!("{error}"));
-        let repository = FileConfigRepository::new(home.path().to_path_buf());
+        let repository = FileConfigRepository::new(home.path());
         let loaded = repository
             .load(true)
             .unwrap_or_else(|error| unreachable!("{error}"));
@@ -1370,7 +1366,7 @@ mod tests {
     #[test]
     fn invalid_config_sources_and_reserved_custom_targets_are_rejected() {
         let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
-        let repository = FileConfigRepository::new(home.path().to_path_buf());
+        let repository = FileConfigRepository::new(home.path());
         let active = home.path().join(".skill-manager.config.json");
         let invalid_schema = Config {
             schema_version: 0,
@@ -1463,8 +1459,7 @@ mod tests {
                 }
             }
         });
-        let migrated =
-            migrate_v0(&value, home.path()).unwrap_or_else(|error| unreachable!("{error}"));
+        let migrated = migrate_v0(&value).unwrap_or_else(|error| unreachable!("{error}"));
         let config: Config =
             serde_json::from_value(migrated).unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(config.sources.len(), 4);
@@ -1476,11 +1471,12 @@ mod tests {
         );
         assert_eq!(config.sources[3].label, "Mapped Label");
         assert_eq!(config.sources[3].exclude, ["draft-*"]);
+        assert!(config.builtins.get("claude").is_none());
         assert!(
             !config
-                .builtins
+                .legacy_target_overrides
                 .get("claude")
-                .unwrap_or_else(|| unreachable!("builtin"))
+                .unwrap_or_else(|| unreachable!("override"))
                 .enabled
         );
         assert!(
@@ -1504,8 +1500,31 @@ mod tests {
     }
 
     #[test]
+    fn v0_migration_rejects_colliding_builtin_target_aliases() {
+        let value = json!({
+            "targets": {
+                "Claude": {
+                    "path": "first",
+                    "disabled": true
+                },
+                "claude": {
+                    "path": "second",
+                    "disabled": false
+                }
+            }
+        });
+        let error = migrate_v0(&value)
+            .err()
+            .unwrap_or_else(|| unreachable!("case-folded aliases must collide"));
+        assert!(
+            error
+                .to_string()
+                .contains("collides with another 'claude' built-in target")
+        );
+    }
+
+    #[test]
     fn malformed_v0_shapes_and_incomplete_source_entries_are_rejected() {
-        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
         for value in [
             json!([]),
             json!({"sources": {}}),
@@ -1513,7 +1532,7 @@ mod tests {
             json!({"targets": []}),
             json!({"sources": [{"type": "github", "owner": "", "repo": ""}]}),
         ] {
-            assert!(migrate_v0(&value, home.path()).is_err(), "{value}");
+            assert!(migrate_v0(&value).is_err(), "{value}");
         }
 
         let base = SourceEntry {
@@ -1564,7 +1583,7 @@ mod tests {
             let path = home.path().join(".skill-manager.config.json");
             let bytes = serde_json::to_vec(&value).unwrap_or_else(|error| unreachable!("{error}"));
             std::fs::write(&path, &bytes).unwrap_or_else(|error| unreachable!("{error}"));
-            let repository = FileConfigRepository::new(home.path().to_path_buf());
+            let repository = FileConfigRepository::new(home.path());
             assert!(repository.load(false).is_err(), "{value}");
             assert_eq!(
                 std::fs::read(&path).unwrap_or_else(|error| unreachable!("{error}")),

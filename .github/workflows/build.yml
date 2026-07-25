@@ -11,12 +11,15 @@ permissions:
 
 jobs:
   discover:
+    name: Discover CLI build matrix
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.registry.outputs.matrix }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned Rust
         shell: pwsh
         run: pwsh -File tools/install-ci-tools.ps1 -Mode Base
@@ -28,10 +31,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "matrix=$matrix" | Add-Content $env:GITHUB_OUTPUT
   quality:
+    name: Run repository quality gate
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned quality tools
         shell: pwsh
         run: pwsh -File tools/install-ci-tools.ps1 -Mode Quality
@@ -39,6 +45,7 @@ jobs:
       - name: Audit GitHub workflows
         run: zizmor --pedantic .github/workflows
   package:
+    name: Package ${{ matrix.cli }} for ${{ matrix.target }}
     needs: [discover, quality]
     strategy:
       fail-fast: false
@@ -46,7 +53,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned Rust and build host-side generator
         shell: pwsh
         env:
@@ -104,7 +113,7 @@ jobs:
             if ($actualVersion -ne "$cli $version") { throw "Native binary version '$actualVersion' does not equal '$cli $version'." }
           }
           pwsh -File tools/build-package.ps1 -Cli $cli -Target $target -PrebuiltTarget
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.cli }}-${{ matrix.target }}
           path: |
