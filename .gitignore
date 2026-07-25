@@ -83,6 +83,11 @@ out
 dist
 .output
 
+# Native CLI build and release artifacts
+**/target/
+/dist/
+/.tools/
+
 # Gatsby files
 .cache/
 # Comment in the public line in if your project uses Gatsby and not Next.js

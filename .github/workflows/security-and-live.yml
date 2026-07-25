@@ -1,0 +1,35 @@
+name: Weekly advisory and live smoke
+
+on:
+  schedule:
+    - cron: '23 4 * * 1'
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  advisory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - shell: pwsh
+        run: pwsh -File tools/install-ci-tools.ps1 -Mode Advisory
+      - run: just advisory
+  live-github-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Build current CLI
+        shell: pwsh
+        run: |
+          pwsh -File tools/install-ci-tools.ps1 -Mode Advisory
+          pwsh -File tools/get-build-matrix.ps1 -ValidateOnly
+          just release-build
+      - name: Exercise GitHub source at an exact commit
+        run: |
+          sudo useradd --create-home --shell /bin/bash skill-manager-smoke
+          sudo --user skill-manager-smoke --set-home just live-smoke "https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}/skills"

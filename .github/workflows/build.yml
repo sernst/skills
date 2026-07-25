@@ -1,0 +1,114 @@
+name: Main and manual builds
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.registry.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust
+        shell: pwsh
+        run: pwsh -File tools/install-ci-tools.ps1 -Mode Base
+      - id: registry
+        name: Validate registry and generate CLI × target matrix
+        shell: pwsh
+        run: |
+          $matrix = pwsh -File tools/get-build-matrix.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "matrix=$matrix" | Add-Content $env:GITHUB_OUTPUT
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned quality tools
+        shell: pwsh
+        run: pwsh -File tools/install-ci-tools.ps1 -Mode Quality
+      - run: just check
+      - name: Audit GitHub workflows
+        run: zizmor --pedantic .github/workflows
+  package:
+    needs: [discover, quality]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust and build host-side generator
+        shell: pwsh
+        env:
+          CLI: ${{ matrix.cli }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          pwsh -File tools/install-ci-tools.ps1 -Mode Base -Target $env:TARGET
+          cargo build --locked --release --manifest-path "clis/$env:CLI/Cargo.toml"
+      - name: Install pinned cargo-zigbuild
+        if: matrix.zig
+        shell: pwsh
+        run: cargo install cargo-zigbuild --version (pwsh -File tools/get-tool-version.ps1 cargo-zigbuild) --locked
+      - name: Install pinned Zig
+        if: matrix.zig
+        shell: bash
+        run: bash tools/install-zig.sh "$(pwsh -File tools/get-tool-version.ps1 zig)"
+      - name: Install musl linker
+        if: matrix.musl
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Enable Visual C++ ARM64 compiler
+        if: matrix.msvc_arm64
+        shell: pwsh
+        run: pwsh -File tools/enable-msvc-arm64.ps1
+      - name: Build target, test safely, verify, and package
+        shell: pwsh
+        env:
+          CLI: ${{ matrix.cli }}
+          TARGET: ${{ matrix.target }}
+          NATIVE: ${{ matrix.native }}
+          ZIG: ${{ matrix.zig }}
+        run: |
+          $cli = $env:CLI
+          $target = $env:TARGET
+          $manifest = "clis/$cli/Cargo.toml"
+          if ($env:ZIG -eq 'true') {
+            cargo zigbuild --locked --release --target $target --manifest-path $manifest
+            cargo zigbuild --locked --all-features --target $target --manifest-path $manifest --tests
+          } else {
+            cargo build --locked --release --target $target --manifest-path $manifest
+            if ($env:NATIVE -eq 'true') { cargo test --locked --all-features --target $target --manifest-path $manifest }
+            else { cargo test --locked --all-features --target $target --manifest-path $manifest --no-run }
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = (Get-Content VERSION -Raw).Trim()
+          $targetExtension = if ($target -match 'windows') { '.exe' } else { '' }
+          $hostExtension = if ($IsWindows) { '.exe' } else { '' }
+          $binary = "clis/$cli/target/$target/release/$cli$targetExtension"
+          $hostBinary = "clis/$cli/target/release/$cli$hostExtension"
+          pwsh -File tools/verify-target.ps1 -Path $binary -Target $target
+          if ($env:NATIVE -eq 'true') {
+            $actualVersion = (& $binary --version).Trim()
+            if ($actualVersion -ne "$cli $version") { throw "Native binary version '$actualVersion' does not equal '$cli $version'." }
+          }
+          pwsh -File tools/build-package.ps1 -Cli $cli -Target $target -PrebuiltTarget
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.cli }}-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+          retention-days: 14

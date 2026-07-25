@@ -1,0 +1,54 @@
+set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
+
+export RUSTDOCFLAGS := "-D warnings"
+
+crate := "skill-manager"
+
+format:
+    cargo fmt
+
+format-check:
+    cargo fmt --check
+
+lint:
+    cargo clippy --all-targets --all-features -- -D warnings
+
+build:
+    cargo build --locked
+
+release-build:
+    cargo build --locked --release
+
+test:
+    cargo test --locked --all-features
+
+coverage:
+    cargo llvm-cov --locked --all-features --fail-under-lines 85 --summary-only
+
+docs:
+    cargo doc --locked --no-deps --document-private-items
+
+deny:
+    cargo deny --manifest-path Cargo.toml --config ../../deny.toml check
+
+advisory:
+    cargo deny --manifest-path Cargo.toml --config ../../deny.toml check advisories bans licenses sources
+
+live-smoke url:
+    target/release/skill-manager --json source add {{quote(url)}}
+    target/release/skill-manager --json status --refresh
+
+check: format-check lint build test docs deny coverage
+
+metadata:
+    cargo metadata --locked --no-deps --format-version 1
+
+build-target target:
+    cargo build --locked --release --target {{target}}
+
+# Cargo can compile tests for a foreign target but cannot execute them.
+test-target target:
+    cargo test --locked --all-features --target {{target}} --no-run
+
+package target:
+    pwsh -File ../../tools/build-package.ps1 -Cli {{crate}} -Target {{target}}

@@ -3,6 +3,13 @@
 My personal collection of AI Agent Skills. Mix of ones I've developed myself and
 others I've adapted from others.
 
+## Command-line tools
+
+Native executable tools live in [`clis`](./clis). The first is
+[`skill-manager`](./clis/skill-manager), a Rust CLI for discovering, resolving,
+and deploying skills. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the Just-based
+quality workflow and [RELEASES.md](./RELEASES.md) for tagged release procedures.
+
 # Manifest
 
 ## [drafting-commit-message](./skills/drafting-commit-message/SKILL.md)

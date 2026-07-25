@@ -1,0 +1,96 @@
+name: Tagged release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Install pinned Rust
+        shell: pwsh
+        run: pwsh -File tools/install-ci-tools.ps1 -Mode Base
+      - name: Validate annotated, main-reachable release tag and versions
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          pwsh -File tools/validate-release.ps1 -Tag $env:TAG
+          pwsh -File tools/get-build-matrix.ps1 -ValidateOnly
+  build:
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build.yml
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: '*-*'
+          path: release-assets
+          merge-multiple: true
+      - name: Verify exact asset set and create manifest/checksums
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: pwsh -File tools/assemble-release.ps1 -Tag $env:TAG -ArtifactDirectory release-assets
+      - name: Create or repair draft, reconcile assets, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          awk -v heading="## $version" '
+            $0 == heading || index($0, heading " - ") == 1 { emit=1; next }
+            emit && /^## / { exit }
+            emit { print }
+          ' CHANGELOG.md > curated-notes.md
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" --jq .body > generated-notes.md
+          {
+            cat curated-notes.md
+            printf '\n## Changes and contributors\n\n'
+            cat generated-notes.md
+          } > release-notes.md
+
+          if gh release view "$TAG" --json isDraft > release.json 2>/dev/null; then
+            if [ "$(jq -r .isDraft release.json)" != "true" ]; then
+              echo "A published release already exists for $TAG; refusing to modify it." >&2
+              exit 1
+            fi
+            gh release edit "$TAG" --notes-file release-notes.md
+          else
+            prerelease=()
+            [[ "$TAG" == *-* ]] && prerelease=(--prerelease)
+            gh release create "$TAG" --draft "${prerelease[@]}" --title "$TAG" --notes-file release-notes.md
+          fi
+
+          mapfile -t expected < <(find release-assets -maxdepth 1 -type f -printf '%f\n' | sort)
+          mapfile -t existing < <(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
+          for asset in "${existing[@]}"; do
+            if ! printf '%s\n' "${expected[@]}" | grep -Fxq -- "$asset"; then
+              gh release delete-asset "$TAG" "$asset" --yes
+            fi
+          done
+          gh release upload "$TAG" release-assets/* --clobber
+          mapfile -t reconciled < <(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
+          diff -u <(printf '%s\n' "${expected[@]}") <(printf '%s\n' "${reconciled[@]}")
+          gh release edit "$TAG" --draft=false

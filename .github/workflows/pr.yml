@@ -1,0 +1,25 @@
+name: Pull request quality
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust and quality tools
+        shell: pwsh
+        run: pwsh -File tools/install-ci-tools.ps1 -Mode Quality
+      - name: Validate registry contract
+        shell: pwsh
+        run: pwsh -File tools/get-build-matrix.ps1 -ValidateOnly
+      - name: Full Linux GNU quality gate
+        run: just check
+      - name: Audit GitHub workflows
+        run: zizmor --pedantic .github/workflows
