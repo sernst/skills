@@ -126,12 +126,119 @@ fn write_link_archive(path: &Path) {
     encoder.finish().expect("finish gzip");
 }
 
+fn write_scoped_archive_with_link(path: &Path, link_path: &str) {
+    let output = fs::File::create(path).expect("create archive");
+    let encoder = GzEncoder::new(output, Compression::default());
+    let mut archive = Builder::new(encoder);
+
+    let body = b"# selected";
+    let mut file_header = Header::new_gnu();
+    file_header.set_size(u64::try_from(body.len()).expect("fixture length"));
+    file_header.set_mode(0o644);
+    file_header.set_cksum();
+    archive
+        .append_data(
+            &mut file_header,
+            "repo-root/skills/productivity/alpha/SKILL.md",
+            body.as_slice(),
+        )
+        .expect("append selected file");
+
+    let mut link_header = Header::new_gnu();
+    link_header.set_entry_type(EntryType::Symlink);
+    link_header.set_size(0);
+    link_header.set_mode(0o777);
+    link_header.set_cksum();
+    archive
+        .append_link(
+            &mut link_header,
+            format!("repo-root/{link_path}"),
+            Path::new("../../outside"),
+        )
+        .expect("append link");
+
+    let encoder = archive.into_inner().expect("finish tar");
+    encoder.finish().expect("finish gzip");
+}
+
+fn write_scoped_archive_with_pax(path: &Path, entry_type: EntryType) {
+    let output = fs::File::create(path).expect("create archive");
+    let encoder = GzEncoder::new(output, Compression::default());
+    let mut archive = Builder::new(encoder);
+
+    let metadata = b"25 comment=fixture-value\n";
+    let mut pax_header = Header::new_gnu();
+    pax_header.set_entry_type(entry_type);
+    pax_header.set_size(u64::try_from(metadata.len()).expect("fixture length"));
+    pax_header.set_mode(0o644);
+    pax_header.set_cksum();
+    archive
+        .append_data(&mut pax_header, "pax_header", metadata.as_slice())
+        .expect("append PAX header");
+
+    let body = b"# selected";
+    let mut file_header = Header::new_gnu();
+    file_header.set_size(u64::try_from(body.len()).expect("fixture length"));
+    file_header.set_mode(0o644);
+    file_header.set_cksum();
+    archive
+        .append_data(
+            &mut file_header,
+            "repo-root/skills/productivity/alpha/SKILL.md",
+            body.as_slice(),
+        )
+        .expect("append selected file");
+
+    let encoder = archive.into_inner().expect("finish tar");
+    encoder.finish().expect("finish gzip");
+}
+
+fn write_long_global_pax_path_archive(path: &Path) {
+    let output = fs::File::create(path).expect("create archive");
+    let encoder = GzEncoder::new(output, Compression::default());
+    let mut archive = Builder::new(encoder);
+    let mut header = Header::new_gnu();
+    header.set_entry_type(EntryType::XGlobalHeader);
+    header.set_size(0);
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, "p".repeat(4_100), io::empty())
+        .expect("append long global PAX path");
+    let encoder = archive.into_inner().expect("finish tar");
+    encoder.finish().expect("finish gzip");
+}
+
+fn write_scoped_archive_with_gnu_longname(path: &Path) -> PathBuf {
+    let output = fs::File::create(path).expect("create archive");
+    let encoder = GzEncoder::new(output, Compression::default());
+    let mut archive = Builder::new(encoder);
+    let long_name = format!("{}.md", "a".repeat(120));
+    let relative = PathBuf::from("alpha").join(&long_name);
+    let archive_path = Path::new("repo-root/skills/productivity").join(&relative);
+    let body = b"long path";
+    let mut header = Header::new_gnu();
+    header.set_size(u64::try_from(body.len()).expect("fixture length"));
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, archive_path, body.as_slice())
+        .expect("append GNU longname file");
+    let encoder = archive.into_inner().expect("finish tar");
+    encoder.finish().expect("finish gzip");
+    relative
+}
+
 fn write_raw_header_archive(path: &Path, name: &str, size: u64) {
+    write_raw_typed_header_archive(path, name, size, EntryType::Regular);
+}
+
+fn write_raw_typed_header_archive(path: &Path, name: &str, size: u64, entry_type: EntryType) {
     assert!(name.len() <= 100, "raw fixture name must fit a tar header");
     let output = fs::File::create(path).expect("create archive");
     let mut encoder = GzEncoder::new(output, Compression::default());
     let mut header = Header::new_gnu();
-    header.set_entry_type(EntryType::Regular);
+    header.set_entry_type(entry_type);
     header.set_size(size);
     header.set_mode(0o644);
     header.as_mut_bytes()[..name.len()].copy_from_slice(name.as_bytes());
@@ -170,6 +277,40 @@ fn write_many_entries_archive(path: &Path, entries: usize) {
             .append_data(&mut header, "repo-root", io::empty())
             .expect("append directory entry");
     }
+    let encoder = archive.into_inner().expect("finish tar");
+    encoder.finish().expect("finish gzip");
+}
+
+fn write_many_entries_with_hidden_metadata(path: &Path) {
+    let output = fs::File::create(path).expect("create archive");
+    let encoder = GzEncoder::new(output, Compression::fast());
+    let mut archive = Builder::new(encoder);
+    for _ in 0..99_999 {
+        let mut header = Header::new_gnu();
+        header.set_entry_type(EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "repo-root", io::empty())
+            .expect("append directory entry");
+    }
+    let metadata = b"25 comment=fixture-value\n";
+    let mut pax_header = Header::new_gnu();
+    pax_header.set_entry_type(EntryType::XHeader);
+    pax_header.set_size(u64::try_from(metadata.len()).expect("fixture length"));
+    pax_header.set_mode(0o644);
+    pax_header.set_cksum();
+    archive
+        .append_data(&mut pax_header, "pax_header", metadata.as_slice())
+        .expect("append hidden local PAX header");
+    let mut file_header = Header::new_gnu();
+    file_header.set_size(0);
+    file_header.set_mode(0o644);
+    file_header.set_cksum();
+    archive
+        .append_data(&mut file_header, "repo-root/alpha/SKILL.md", io::empty())
+        .expect("append logical file");
     let encoder = archive.into_inner().expect("finish tar");
     encoder.finish().expect("finish gzip");
 }
@@ -275,6 +416,96 @@ fn negative_ttl_and_archive_links_are_rejected() {
 }
 
 #[test]
+fn scoped_source_ignores_unrelated_link_but_rejects_links_in_or_above_scope() {
+    let home = tempfile::tempdir().expect("temporary home");
+    let repository = FileConfigRepository::new(home.path());
+
+    let unrelated = home.path().join("unrelated-link.tar.gz");
+    write_scoped_archive_with_link(&unrelated, "AGENTS.md");
+    let mut source = github_source("scoped", 24);
+    source.repo_path = Some("skills/productivity".into());
+    let resolved = materialize_source(
+        &repository,
+        &ArchiveTransport::new(unrelated),
+        &source,
+        false,
+        false,
+    )
+    .expect("unrelated repository link must not block a scoped source");
+    assert_eq!(
+        fs::read_to_string(resolved.path.join("alpha/SKILL.md")).expect("read selected skill"),
+        "# selected"
+    );
+
+    for (id, entry_type) in [
+        ("global-pax", EntryType::XGlobalHeader),
+        ("local-pax", EntryType::XHeader),
+    ] {
+        let with_pax = home.path().join(format!("{id}.tar.gz"));
+        write_scoped_archive_with_pax(&with_pax, entry_type);
+        let mut pax_source = github_source(id, 24);
+        pax_source.repo_path = Some("skills/productivity".into());
+        let pax_resolved = materialize_source(
+            &repository,
+            &ArchiveTransport::new(with_pax),
+            &pax_source,
+            false,
+            false,
+        )
+        .expect("PAX metadata must not be materialized as a source entry");
+        assert_eq!(
+            fs::read_to_string(pax_resolved.path.join("alpha/SKILL.md"))
+                .expect("read PAX archive skill"),
+            "# selected"
+        );
+    }
+
+    let with_longname = home.path().join("gnu-longname.tar.gz");
+    let long_relative = write_scoped_archive_with_gnu_longname(&with_longname);
+    let mut longname_source = github_source("gnu-longname", 24);
+    longname_source.repo_path = Some("skills/productivity".into());
+    let longname_resolved = materialize_source(
+        &repository,
+        &ArchiveTransport::new(with_longname),
+        &longname_source,
+        false,
+        false,
+    )
+    .expect("bounded GNU longname metadata must resolve normally");
+    assert_eq!(
+        fs::read_to_string(longname_resolved.path.join(long_relative))
+            .expect("read GNU longname file"),
+        "long path"
+    );
+
+    for (id, link_path) in [
+        ("link-inside-scope", "skills/productivity/leak"),
+        ("link-above-scope", "skills"),
+        ("link-at-archive-root", ""),
+    ] {
+        let archive = home.path().join(format!("{id}.tar.gz"));
+        write_scoped_archive_with_link(&archive, link_path);
+        let mut linked_source = github_source(id, 24);
+        linked_source.repo_path = Some("skills/productivity".into());
+        let result = materialize_source(
+            &repository,
+            &ArchiveTransport::new(archive),
+            &linked_source,
+            false,
+            false,
+        );
+        assert!(
+            result
+                .expect_err("link intersecting selected path must fail")
+                .to_string()
+                .contains("link or special entry"),
+            "{id}"
+        );
+        assert!(!repository.cache_root().join(id).join("content").exists());
+    }
+}
+
+#[test]
 fn absolute_traversal_oversized_and_long_archive_paths_are_rejected() {
     let home = tempfile::tempdir().expect("temporary home");
     let repository = FileConfigRepository::new(home.path());
@@ -307,6 +538,62 @@ fn absolute_traversal_oversized_and_long_archive_paths_are_rejected() {
         false,
     );
     assert!(result.is_err(), "over-limit archive path must be rejected");
+
+    for (id, entry_type) in [
+        ("global-pax-bomb", EntryType::XGlobalHeader),
+        ("local-pax-bomb", EntryType::XHeader),
+        ("gnu-longname-bomb", EntryType::GNULongName),
+        ("gnu-longlink-bomb", EntryType::GNULongLink),
+    ] {
+        let metadata_bomb = home.path().join(format!("{id}.tar.gz"));
+        write_raw_typed_header_archive(
+            &metadata_bomb,
+            "metadata_header",
+            1024 * 1024 * 1024 + 1,
+            entry_type,
+        );
+        let result = materialize_source(
+            &repository,
+            &ArchiveTransport::new(metadata_bomb),
+            &github_source(id, 24),
+            false,
+            false,
+        );
+        assert!(
+            result
+                .expect_err("expanded metadata limit must fail")
+                .to_string()
+                .contains("expanded bytes"),
+            "{id}"
+        );
+    }
+
+    let traversal_pax = home.path().join("traversal-pax.tar.gz");
+    write_raw_typed_header_archive(
+        &traversal_pax,
+        "../pax_global_header",
+        0,
+        EntryType::XGlobalHeader,
+    );
+    let result = materialize_source(
+        &repository,
+        &ArchiveTransport::new(traversal_pax),
+        &github_source("traversal-pax", 24),
+        false,
+        false,
+    );
+    assert!(result.is_err(), "traversing PAX header path must fail");
+
+    let long_pax = home.path().join("long-pax.tar.gz");
+    write_long_global_pax_path_archive(&long_pax);
+    let result = materialize_source(
+        &repository,
+        &ArchiveTransport::new(long_pax),
+        &github_source("long-pax", 24),
+        false,
+        false,
+    );
+    assert!(result.is_err(), "over-limit PAX header path must fail");
 }
 
 #[test]
@@ -325,6 +612,22 @@ fn archive_entry_count_limit_is_enforced() {
     assert!(
         result
             .expect_err("entry overflow must fail")
+            .to_string()
+            .contains("100000 entries")
+    );
+
+    let hidden = home.path().join("hidden-metadata.tar.gz");
+    write_many_entries_with_hidden_metadata(&hidden);
+    let result = materialize_source(
+        &repository,
+        &ArchiveTransport::new(hidden),
+        &github_source("hidden-metadata", 24),
+        false,
+        false,
+    );
+    assert!(
+        result
+            .expect_err("hidden metadata must count as an entry")
             .to_string()
             .contains("100000 entries")
     );

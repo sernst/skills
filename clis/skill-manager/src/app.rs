@@ -23,6 +23,7 @@ use crate::skills::{
     deployed_skills, detect_skill_dirs, discover_skills, matches_patterns, skill_name, skill_state,
     validate_skill_name,
 };
+use crate::status::{SkillRow, SourceRow, skill_table, source_table, status_summary};
 use crate::transaction::{TransactionHook, deploy_skill, remove_skill};
 
 /// Outcome converted to the executable exit code.
@@ -725,14 +726,10 @@ where
     fn run_status(&mut self, config: &Config, args: &StatusArgs) -> Result<()> {
         let sources =
             self.resolve_sources(config, &[], &args.source_selection, args.refresh, false)?;
+        let (source_rows, source_names) = status_source_rows(config, &sources);
         self.reporter.human("Sources:")?;
-        for source in &sources {
-            self.reporter.human(&format!(
-                "{}\t({})\t{}",
-                source.entry.name,
-                source.entry.label,
-                source_reference(&source.entry)
-            ))?;
+        for line in source_table(&source_rows) {
+            self.reporter.human(&line)?;
         }
         self.reporter.human("")?;
         let discovery = discover_skills(&sources, &[], &config.exclude)?;
@@ -749,32 +746,21 @@ where
         }
         let mut filters = args.filters.clone();
         filters.extend(args.option_filters.clone());
-        if names.is_empty() {
-            self.reporter
-                .human("No skills found in sources or deployed targets.")?;
-        } else {
-            self.reporter.human(&format!(
-                "skill\tsource\t{}",
-                targets
-                    .iter()
-                    .map(|target| target.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\t")
-            ))?;
-        }
-        let mut rows = 0_usize;
+        let has_any_skills = !names.is_empty();
         let mut counts = BTreeMap::from([
             ("up-to-date", 0_usize),
             ("needs-update", 0),
             ("not-loaded", 0),
             ("no-connection", 0),
         ]);
+        let mut status_rows = Vec::new();
         for (identity, name) in names {
             let candidate = discovery.winners.get(&identity);
             if !status_matches(&name, candidate, &filters)? {
                 continue;
             }
             let mut states = IndexMap::new();
+            let mut rendered_states = Vec::with_capacity(targets.len());
             for target in &targets {
                 let state = skill_state(
                     candidate.map(|value| value.path.as_path()),
@@ -785,58 +771,66 @@ where
                     *count += 1;
                 }
                 states.insert(target.name.clone(), state.as_str());
+                rendered_states.push((target.name.clone(), state));
             }
-            let source_reference_text =
-                candidate.map(|value| source_reference(&value.source.entry));
             let source = candidate.map(|value| source_data(&value.source.entry));
-            let display_states = if self.reporter.is_interactive() {
-                states
-                    .iter()
-                    .map(|(target, state)| {
-                        let symbol = match *state {
-                            "up-to-date" => "✓",
-                            "needs-update" => "↑",
-                            "not-loaded" => "✗",
-                            _ => "~",
-                        };
-                        format!("{target}:{symbol} {state}")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            } else {
-                states
-                    .iter()
-                    .map(|(target, state)| format!("{target}:{state}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
-            self.reporter.human(&format!(
-                "{}\t{}\t{}",
-                name,
-                source_reference_text.as_deref().unwrap_or("-"),
-                display_states
-            ))?;
+            let source_name = candidate
+                .and_then(|value| source_names.get(&value.source.entry.id))
+                .cloned()
+                .unwrap_or_else(|| "unknown".into());
+            status_rows.push((
+                SkillRow {
+                    skill: name,
+                    source: source_name,
+                    targets: rendered_states,
+                },
+                source,
+                states,
+            ));
+        }
+        if has_any_skills {
+            let target_names = targets
+                .iter()
+                .map(|target| target.name.clone())
+                .collect::<Vec<_>>();
+            let rendered = status_rows
+                .iter()
+                .map(|(row, _, _)| row.clone())
+                .collect::<Vec<_>>();
+            for line in skill_table(
+                &rendered,
+                &target_names,
+                self.reporter.is_interactive(),
+                self.reporter.color_enabled(),
+            ) {
+                self.reporter.human(&line)?;
+            }
+        } else {
+            self.reporter
+                .human("No skills found in sources or deployed targets.")?;
+        }
+        for (row, source, states) in &status_rows {
             self.reporter.event(
                 "status.row",
                 Level::Info,
-                json!({ "skill": name, "source": source, "targets": states }),
+                json!({ "skill": row.skill, "source": source, "targets": states }),
             )?;
-            rows += 1;
         }
-        if rows > 0 {
+        if !status_rows.is_empty() {
             self.reporter.human("")?;
-            self.reporter.human(&format!(
-                "Summary: up-to-date: {}, needs-update: {}, not-loaded: {}, no-connection: {}",
+            self.reporter.human(&status_summary(
                 counts["up-to-date"],
                 counts["needs-update"],
                 counts["not-loaded"],
-                counts["no-connection"]
+                counts["no-connection"],
+                self.reporter.is_interactive(),
+                self.reporter.color_enabled(),
             ))?;
         }
         self.reporter.event(
             "summary",
             Level::Info,
-            json!({ "action": "status", "skills": rows }),
+            json!({ "action": "status", "skills": status_rows.len() }),
         )
     }
 
@@ -1092,6 +1086,65 @@ fn source_data(source: &SourceEntry) -> Value {
         "source_type": source.source_type,
         "mode": source.mode
     })
+}
+
+fn status_source_rows(
+    config: &Config,
+    sources: &[ResolvedSource],
+) -> (Vec<SourceRow>, IndexMap<String, String>) {
+    let current_directory = std::env::current_dir()
+        .ok()
+        .map(|path| path.canonicalize().unwrap_or(path));
+    let mut used_names = BTreeSet::new();
+    let mut names = IndexMap::new();
+    let mut rows = Vec::with_capacity(sources.len());
+
+    for source in sources {
+        let configured = config
+            .sources
+            .iter()
+            .any(|configured| configured.id == source.entry.id);
+        let is_current_directory = !configured
+            && current_directory.as_ref().is_some_and(|cwd| {
+                source
+                    .entry
+                    .path
+                    .as_ref()
+                    .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
+                    .is_some_and(|path| path == *cwd)
+            });
+        let base = if is_current_directory {
+            "cwd".into()
+        } else if !source.entry.name.is_empty() {
+            source.entry.name.clone()
+        } else if !source.entry.label.is_empty() {
+            source.entry.label.clone()
+        } else {
+            source_reference(&source.entry)
+        };
+        let mut name = base.clone();
+        let mut suffix = 2_usize;
+        while !used_names.insert(fold(&name)) {
+            name = format!("{base}#{suffix}");
+            suffix += 1;
+        }
+        let label = if is_current_directory {
+            "Current directory".into()
+        } else if source.entry.label.is_empty() {
+            name.clone()
+        } else {
+            source.entry.label.clone()
+        };
+
+        names.insert(source.entry.id.clone(), name.clone());
+        rows.push(SourceRow {
+            name,
+            label,
+            location: source_reference(&source.entry),
+        });
+    }
+
+    (rows, names)
 }
 
 fn target_data(target: &Target) -> Value {

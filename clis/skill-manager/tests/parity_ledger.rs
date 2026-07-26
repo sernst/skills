@@ -37,19 +37,19 @@ const REQUIRED_MAPPINGS: &[(&str, &str)] = &[
     ),
     (
         "TestStatus.test_shows_source_preamble",
-        "operations_contract::human_status_renders_sources_header_rows_summary_and_empty_state",
+        "operations_contract::human_status_renders_compact_source_legend_table_and_plain_summary",
     ),
     (
         "TestStatus.test_no_skills_prints_message",
-        "operations_contract::human_status_renders_sources_header_rows_summary_and_empty_state",
+        "operations_contract::human_status_renders_compact_source_legend_table_and_plain_summary",
     ),
     (
         "TestStatus.test_table_header_contains_target_keys",
-        "operations_contract::human_status_renders_sources_header_rows_summary_and_empty_state",
+        "operations_contract::human_status_renders_compact_source_legend_table_and_plain_summary",
     ),
     (
         "TestStatus.test_summary_line_printed",
-        "operations_contract::human_status_renders_sources_header_rows_summary_and_empty_state",
+        "operations_contract::human_status_renders_compact_source_legend_table_and_plain_summary",
     ),
     (
         "TestJsonOutputLoad.test_overwritten_action",
@@ -64,7 +64,7 @@ const REQUIRED_MAPPINGS: &[(&str, &str)] = &[
 const REQUIRED_CONTRACT_TESTS: &[&str] = &[
     "operations_contract::explicit_named_and_builtin_target_selectors_form_a_deduplicated_union",
     "operations_contract::human_prompts_cover_text_confirmation_cancellation_and_invalid_answers",
-    "operations_contract::human_status_renders_sources_header_rows_summary_and_empty_state",
+    "operations_contract::human_status_renders_compact_source_legend_table_and_plain_summary",
     "operations_contract::nested_v0_type_errors_fail_without_rewriting_or_creating_a_backup",
     "operations_contract::status_json_preserves_stable_and_human_source_provenance",
     "operations_contract::skill_action_events_preserve_loaded_overwritten_updated_copied_and_removed_provenance",

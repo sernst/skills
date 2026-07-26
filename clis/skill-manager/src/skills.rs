@@ -515,7 +515,13 @@ fn token_matches(token: &PatternToken, character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::detect_skill_dirs;
     use super::{directories_equal, matches_patterns, validate_skill_name};
+    #[cfg(unix)]
+    use crate::config::source_from_reference;
+    #[cfg(unix)]
+    use crate::domain::{ResolvedSource, SourceMode};
 
     #[test]
     fn rejects_portability_hazards() {
@@ -563,5 +569,39 @@ mod tests {
             matches_patterns("STRASSE-α", &["straße-?".into()])
                 .unwrap_or_else(|error| unreachable!("{error}"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_root_may_have_a_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let real_parent = sandbox.path().join("real");
+        let source_root = real_parent.join("collection");
+        let skill = source_root.join("alpha");
+        std::fs::create_dir_all(&skill).unwrap_or_else(|error| unreachable!("{error}"));
+        std::fs::write(skill.join("SKILL.md"), "# alpha")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let alias = sandbox.path().join("alias");
+        symlink(&real_parent, &alias).unwrap_or_else(|error| unreachable!("{error}"));
+
+        let mut entry = source_from_reference(
+            source_root
+                .to_str()
+                .unwrap_or_else(|| unreachable!("temporary path must be UTF-8")),
+            Some(SourceMode::Collection),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        entry.path = Some(alias.join("collection"));
+        let resolved = ResolvedSource {
+            entry,
+            path: alias.join("collection"),
+            from_cache: false,
+            temporary: None,
+        };
+
+        let found = detect_skill_dirs(&resolved).unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(found, vec![skill]);
     }
 }

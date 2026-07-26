@@ -21,5 +21,7 @@ pub mod prompt;
 pub mod recipe;
 /// Skill discovery and status helpers.
 pub mod skills;
+/// Human-readable status table rendering.
+pub mod status;
 /// Journaled filesystem transactions.
 pub mod transaction;

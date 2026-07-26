@@ -380,7 +380,7 @@ fn migrate_v0(value: &Value) -> Result<Value> {
 }
 
 fn migrate_v0_sources(root: &mut Map<String, Value>) -> Result<()> {
-    let mut sources = match root.remove("sources") {
+    let sources = match root.remove("sources") {
         Some(Value::Array(values)) => values,
         Some(_) => {
             return Err(SkillManagerError::InvalidInput(
@@ -389,6 +389,25 @@ fn migrate_v0_sources(root: &mut Map<String, Value>) -> Result<()> {
         }
         None => Vec::new(),
     };
+    let mut normalized_sources = Vec::new();
+    // Hybrid v0 files may describe the same local source in both representations.
+    // Normalize the explicit array first so its identity, metadata, and order win
+    // even when the legacy map uses a symlink or another equivalent spelling.
+    let mut explicit_local_paths = BTreeSet::new();
+    let mut seen_source_ids = BTreeSet::new();
+    for raw in sources {
+        let entry = coerce_v0_source(&raw)?;
+        if entry.source_type == SourceType::Local
+            && let Some(path) = &entry.path
+        {
+            explicit_local_paths.insert(path.clone());
+        }
+        if seen_source_ids.insert(entry.id.clone()) {
+            normalized_sources.push(serde_json::to_value(entry).map_err(|error| {
+                SkillManagerError::InvalidInput(format!("could not migrate source: {error}"))
+            })?);
+        }
+    }
     if let Some(legacy) = root.remove("skills_directories") {
         let directories = legacy.as_object().ok_or_else(|| {
             SkillManagerError::InvalidInput(
@@ -440,19 +459,18 @@ fn migrate_v0_sources(root: &mut Map<String, Value>) -> Result<()> {
                     })
                     .collect::<Result<Vec<_>>>()?;
             }
-            sources.push(serde_json::to_value(entry).map_err(|error| {
-                SkillManagerError::InvalidInput(format!("could not migrate source: {error}"))
-            })?);
-        }
-    }
-    let mut normalized_sources = Vec::new();
-    let mut seen_source_ids = BTreeSet::new();
-    for raw in sources {
-        let entry = coerce_v0_source(&raw)?;
-        if seen_source_ids.insert(entry.id.clone()) {
-            normalized_sources.push(serde_json::to_value(entry).map_err(|error| {
-                SkillManagerError::InvalidInput(format!("could not migrate source: {error}"))
-            })?);
+            if entry
+                .path
+                .as_ref()
+                .is_some_and(|path| explicit_local_paths.contains(path))
+            {
+                continue;
+            }
+            if seen_source_ids.insert(entry.id.clone()) {
+                normalized_sources.push(serde_json::to_value(entry).map_err(|error| {
+                    SkillManagerError::InvalidInput(format!("could not migrate source: {error}"))
+                })?);
+            }
         }
     }
     root.insert("sources".into(), Value::Array(normalized_sources));
@@ -1062,7 +1080,7 @@ mod tests {
     use super::{
         BuiltinTargetSettings, Config, ConfigRepository, FileConfigRepository, derive_source_id,
         ensure_ascii, find_source_index, is_builtin_name, migrate_v0, resolved_targets,
-        source_from_reference, source_reference, validate_source,
+        source_from_reference, source_reference, validate_config, validate_source,
     };
     use crate::domain::{SourceEntry, SourceMode, SourceType, TargetEntry};
 
@@ -1497,6 +1515,170 @@ mod tests {
             config.extra.get("root_extension"),
             Some(&json!({"preserve": true}))
         );
+    }
+
+    #[test]
+    fn hybrid_v0_migration_keeps_explicit_source_for_overlapping_legacy_path() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let explicit_path = home.path().join("personal");
+        let legacy_only_path = home.path().join("legacy-only");
+        for path in [&explicit_path, &legacy_only_path] {
+            std::fs::create_dir_all(path).unwrap_or_else(|error| unreachable!("{error}"));
+        }
+        let config_path = home.path().join(".skill-manager.config.json");
+        let value = json!({
+            "root_extension": "keep",
+            "sources": [
+                {
+                    "id": "explicit-personal-id",
+                    "type": "local",
+                    "mode": "collection",
+                    "name": "personal",
+                    "label": "Explicit Personal",
+                    "exclude": ["private-*"],
+                    "path": explicit_path,
+                    "source_extension": {"keep": true}
+                },
+                "owner/repo:main/skills"
+            ],
+            "skills_directories": {
+                explicit_path.to_string_lossy().into_owned(): {
+                    "name": "personal",
+                    "label": "Legacy Personal",
+                    "exclude": ["legacy-*"]
+                },
+                legacy_only_path.to_string_lossy().into_owned(): {
+                    "name": "legacy-only",
+                    "label": "Legacy Only"
+                }
+            }
+        });
+        let original = serde_json::to_vec(&value).unwrap_or_else(|error| unreachable!("{error}"));
+        std::fs::write(&config_path, &original).unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+
+        let dry_run = repository
+            .load(true)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(dry_run.config.sources.len(), 3);
+        assert_eq!(dry_run.config.sources[0].id, "explicit-personal-id");
+        assert_eq!(dry_run.config.sources[0].label, "Explicit Personal");
+        assert_eq!(dry_run.config.sources[0].exclude, ["private-*"]);
+        assert_eq!(
+            dry_run.config.sources[0].extra.get("source_extension"),
+            Some(&json!({"keep": true}))
+        );
+        assert_eq!(dry_run.config.sources[1].name, "repo");
+        assert_eq!(dry_run.config.sources[2].name, "legacy-only");
+        assert_eq!(
+            std::fs::read(&config_path).unwrap_or_else(|error| unreachable!("{error}")),
+            original
+        );
+        let backup = home.path().join(".skill-manager.config.json.v0.bak");
+        assert!(!backup.exists());
+
+        let written = repository
+            .load(false)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(written.config.sources.len(), 3);
+        assert_eq!(
+            std::fs::read(&backup).unwrap_or_else(|error| unreachable!("{error}")),
+            original
+        );
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&config_path).unwrap_or_else(|error| unreachable!("{error}")),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(persisted.get("skills_directories").is_none());
+        assert_eq!(persisted["root_extension"], "keep");
+        assert_eq!(persisted["sources"][0]["id"], "explicit-personal-id");
+        assert_eq!(
+            persisted["sources"][0]["source_extension"],
+            json!({"keep": true})
+        );
+    }
+
+    #[test]
+    fn hybrid_v0_migration_rejects_same_name_at_different_paths() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let explicit_path = home.path().join("explicit");
+        let legacy_path = home.path().join("legacy");
+        for path in [&explicit_path, &legacy_path] {
+            std::fs::create_dir_all(path).unwrap_or_else(|error| unreachable!("{error}"));
+        }
+        let value = json!({
+            "sources": [{
+                "id": "explicit-id",
+                "type": "local",
+                "mode": "collection",
+                "name": "personal",
+                "label": "Personal",
+                "path": explicit_path
+            }],
+            "skills_directories": {
+                legacy_path.to_string_lossy().into_owned(): {
+                    "name": "PERSONAL"
+                }
+            }
+        });
+        let migrated = migrate_v0(&value).unwrap_or_else(|error| unreachable!("{error}"));
+        let config: Config =
+            serde_json::from_value(migrated).unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(config.sources.len(), 2);
+        let error = validate_config(&config, &home.path().join("config.json"))
+            .err()
+            .unwrap_or_else(|| unreachable!("different paths must preserve the collision"));
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate source name 'PERSONAL'")
+        );
+    }
+
+    #[test]
+    fn hybrid_v0_migration_validates_overlapping_legacy_metadata_before_skipping() {
+        let invalid_metadata = [
+            json!(null),
+            json!({"name": 1}),
+            json!({"label": false}),
+            json!({"exclude": "not-an-array"}),
+            json!({"exclude": ["valid", 1]}),
+        ];
+        for metadata in invalid_metadata {
+            let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+            let source_path = home.path().join("personal");
+            std::fs::create_dir_all(&source_path).unwrap_or_else(|error| unreachable!("{error}"));
+            let config_path = home.path().join(".skill-manager.config.json");
+            let value = json!({
+                "sources": [{
+                    "id": "explicit-personal-id",
+                    "type": "local",
+                    "mode": "collection",
+                    "name": "personal",
+                    "label": "Personal",
+                    "path": source_path
+                }],
+                "skills_directories": {
+                    source_path.to_string_lossy().into_owned(): metadata
+                }
+            });
+            let original =
+                serde_json::to_vec(&value).unwrap_or_else(|error| unreachable!("{error}"));
+            std::fs::write(&config_path, &original).unwrap_or_else(|error| unreachable!("{error}"));
+            let repository = FileConfigRepository::new(home.path());
+
+            assert!(repository.load(false).is_err(), "{value}");
+            assert_eq!(
+                std::fs::read(&config_path).unwrap_or_else(|error| unreachable!("{error}")),
+                original
+            );
+            assert!(
+                !home
+                    .path()
+                    .join(".skill-manager.config.json.v0.bak")
+                    .exists()
+            );
+        }
     }
 
     #[test]

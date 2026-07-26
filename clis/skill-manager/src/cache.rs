@@ -338,7 +338,12 @@ fn materialize_github<R: ConfigRepository, G: GitHubTransport, C: Clock>(
         let archive = temporary.path().join("source.tar.gz");
         let extracted = temporary.path().join("content");
         github.download_archive(owner, repo, &reference, &archive)?;
-        extract_archive(&archive, &extracted, &source_ref)?;
+        extract_archive(
+            &archive,
+            &extracted,
+            source.repo_path.as_deref(),
+            &source_ref,
+        )?;
         let selected = select_repo_path(&extracted, source)?;
         return Ok(ResolvedSource {
             entry: source.clone(),
@@ -372,7 +377,12 @@ fn materialize_github<R: ConfigRepository, G: GitHubTransport, C: Clock>(
     let archive = staging.path().join("source.tar.gz");
     let new_content = staging.path().join("content");
     github.download_archive(owner, repo, &reference, &archive)?;
-    extract_archive(&archive, &new_content, &source_ref)?;
+    extract_archive(
+        &archive,
+        &new_content,
+        source.repo_path.as_deref(),
+        &source_ref,
+    )?;
     let selected = select_repo_path(&new_content, source)?;
     if !selected.exists() {
         return Err(SkillManagerError::GitHub {
@@ -592,8 +602,17 @@ fn cleanup_cache_staging(staging_root: &Path, destination: &Path) -> Result<()> 
     fs::remove_dir_all(staging_root).map_err(|error| SkillManagerError::io(staging_root, error))
 }
 
-fn extract_archive(archive_path: &Path, destination: &Path, source: &str) -> Result<()> {
+fn extract_archive(
+    archive_path: &Path,
+    destination: &Path,
+    repo_path: Option<&str>,
+    source: &str,
+) -> Result<()> {
+    validate_raw_archive(archive_path, source)?;
     fs::create_dir_all(destination).map_err(|error| SkillManagerError::io(destination, error))?;
+    let selected_path = repo_path
+        .map(|path| validate_relative_path(Path::new(path), source))
+        .transpose()?;
     let archive_file =
         File::open(archive_path).map_err(|error| SkillManagerError::io(archive_path, error))?;
     let decoder = GzDecoder::new(archive_file);
@@ -604,58 +623,44 @@ fn extract_archive(archive_path: &Path, destination: &Path, source: &str) -> Res
             reference: source.to_owned(),
             message: error.to_string(),
         })?;
-    let mut count = 0_usize;
-    let mut expanded = 0_u64;
     for entry_result in entries {
-        count += 1;
-        if count > MAX_ENTRIES {
-            return archive_error(source, format!("archive exceeds {MAX_ENTRIES} entries"));
-        }
         let mut entry = entry_result.map_err(|error| SkillManagerError::GitHub {
             reference: source.to_owned(),
             message: error.to_string(),
         })?;
         let entry_type = entry.header().entry_type();
-        if !entry_type.is_file() && !entry_type.is_dir() {
-            return archive_error(source, "archive contains a link or special entry");
-        }
-        let raw_path = entry.path().map_err(|error| SkillManagerError::GitHub {
-            reference: source.to_owned(),
-            message: error.to_string(),
-        })?;
-        if raw_path.as_os_str().to_string_lossy().len() > MAX_ARCHIVE_PATH_BYTES {
-            return archive_error(source, "archive path exceeds portable limit");
-        }
-        let validated_raw = validate_relative_path(&raw_path, source)?;
-        let stripped: PathBuf = validated_raw.components().skip(1).collect();
-        if stripped.as_os_str().is_empty() {
+        let relative = archive_entry_relative_path(&entry, source)?;
+        if entry_type.is_pax_global_extensions() {
             continue;
         }
-        let relative = validate_relative_path(&stripped, source)?;
+        if relative.is_none() && !entry_type.is_file() && !entry_type.is_dir() {
+            return archive_error(source, "archive root is a link or special entry");
+        }
+        let Some(relative) = relative else {
+            continue;
+        };
+        let is_selected = selected_path.as_ref().is_none_or(|selected| {
+            relative.starts_with(selected) || selected.starts_with(&relative)
+        });
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            if is_selected {
+                return archive_error(
+                    source,
+                    format!(
+                        "archive contains a link or special entry in the selected source path: {}",
+                        relative.display()
+                    ),
+                );
+            }
+            continue;
+        }
+        if !is_selected {
+            continue;
+        }
         let output = destination.join(relative);
         if entry_type.is_dir() {
             fs::create_dir_all(&output).map_err(|error| SkillManagerError::io(&output, error))?;
             continue;
-        }
-        let size = entry
-            .header()
-            .size()
-            .map_err(|error| SkillManagerError::GitHub {
-                reference: source.to_owned(),
-                message: error.to_string(),
-            })?;
-        if size > MAX_FILE_BYTES {
-            return archive_error(
-                source,
-                format!("archive file exceeds {MAX_FILE_BYTES} bytes"),
-            );
-        }
-        expanded = expanded.saturating_add(size);
-        if expanded > MAX_EXPANDED_BYTES {
-            return archive_error(
-                source,
-                format!("archive exceeds {MAX_EXPANDED_BYTES} expanded bytes"),
-            );
         }
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent).map_err(|error| SkillManagerError::io(parent, error))?;
@@ -671,6 +676,108 @@ fn extract_archive(archive_path: &Path, destination: &Path, source: &str) -> Res
             return archive_error(source, "archive file exceeds per-file limit");
         }
         preserve_executable_permission(&entry, &output)?;
+    }
+    Ok(())
+}
+
+fn validate_raw_archive(archive_path: &Path, source: &str) -> Result<()> {
+    let archive_file =
+        File::open(archive_path).map_err(|error| SkillManagerError::io(archive_path, error))?;
+    let decoder = GzDecoder::new(archive_file);
+    let mut archive = Archive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|error| SkillManagerError::GitHub {
+            reference: source.to_owned(),
+            message: error.to_string(),
+        })?
+        .raw(true);
+    let mut count = 0_usize;
+    let mut expanded = 0_u64;
+    for entry_result in entries {
+        count += 1;
+        if count > MAX_ENTRIES {
+            return archive_error(source, format!("archive exceeds {MAX_ENTRIES} entries"));
+        }
+        let entry = entry_result.map_err(|error| SkillManagerError::GitHub {
+            reference: source.to_owned(),
+            message: error.to_string(),
+        })?;
+        validate_raw_archive_entry_path(&entry, source)?;
+        account_expanded_size(&entry, &mut expanded, source)?;
+    }
+    Ok(())
+}
+
+fn validate_raw_archive_entry_path<R: Read>(entry: &tar::Entry<'_, R>, source: &str) -> Result<()> {
+    let entry_type = entry.header().entry_type();
+    let raw_path = entry.path().map_err(|error| SkillManagerError::GitHub {
+        reference: source.to_owned(),
+        message: error.to_string(),
+    })?;
+    if (entry_type.is_gnu_longname() || entry_type.is_gnu_longlink())
+        && raw_path == Path::new("././@LongLink")
+    {
+        return Ok(());
+    }
+    validate_archive_path(&raw_path, source).map(|_| ())
+}
+
+fn archive_entry_relative_path<R: Read>(
+    entry: &tar::Entry<'_, R>,
+    source: &str,
+) -> Result<Option<PathBuf>> {
+    let validated_raw = validated_archive_entry_path(entry, source)?;
+    let stripped: PathBuf = validated_raw.components().skip(1).collect();
+    if stripped.as_os_str().is_empty() {
+        Ok(None)
+    } else {
+        validate_relative_path(&stripped, source).map(Some)
+    }
+}
+
+fn validated_archive_entry_path<R: Read>(
+    entry: &tar::Entry<'_, R>,
+    source: &str,
+) -> Result<PathBuf> {
+    let raw_path = entry.path().map_err(|error| SkillManagerError::GitHub {
+        reference: source.to_owned(),
+        message: error.to_string(),
+    })?;
+    validate_archive_path(&raw_path, source)
+}
+
+fn validate_archive_path(path: &Path, source: &str) -> Result<PathBuf> {
+    if path.as_os_str().to_string_lossy().len() > MAX_ARCHIVE_PATH_BYTES {
+        return archive_error(source, "archive path exceeds portable limit");
+    }
+    validate_relative_path(path, source)
+}
+
+fn account_expanded_size<R: Read>(
+    entry: &tar::Entry<'_, R>,
+    expanded: &mut u64,
+    source: &str,
+) -> Result<()> {
+    let size = entry
+        .header()
+        .size()
+        .map_err(|error| SkillManagerError::GitHub {
+            reference: source.to_owned(),
+            message: error.to_string(),
+        })?;
+    if entry.header().entry_type().is_file() && size > MAX_FILE_BYTES {
+        return archive_error(
+            source,
+            format!("archive file exceeds {MAX_FILE_BYTES} bytes"),
+        );
+    }
+    *expanded = expanded.saturating_add(size);
+    if *expanded > MAX_EXPANDED_BYTES {
+        return archive_error(
+            source,
+            format!("archive exceeds {MAX_EXPANDED_BYTES} expanded bytes"),
+        );
     }
     Ok(())
 }

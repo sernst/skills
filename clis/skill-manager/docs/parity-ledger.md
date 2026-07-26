@@ -54,16 +54,16 @@ This ledger covers the committed inventory generated from `toolbelt/tests/test_s
 | `TestSkillState.test_not_loaded_with_source` | Merged | `behavior_contract::status_covers_all_four_states` |
 | `TestSkillState.test_no_connection` | Merged | `behavior_contract::status_covers_all_four_states` |
 | `TestSkillState.test_not_loaded_no_source_no_deploy` | Merged | `behavior_contract::status_covers_all_four_states` |
-| `TestStatus.test_shows_source_preamble` | Merged | `operations_contract::human_status_renders_sources_header_rows_summary_and_empty_state` |
-| `TestStatus.test_no_skills_prints_message` | Merged | `operations_contract::human_status_renders_sources_header_rows_summary_and_empty_state` |
-| `TestStatus.test_table_header_contains_target_keys` | Merged | `operations_contract::human_status_renders_sources_header_rows_summary_and_empty_state` |
+| `TestStatus.test_shows_source_preamble` | Merged | `operations_contract::human_status_renders_compact_source_legend_table_and_plain_summary` |
+| `TestStatus.test_no_skills_prints_message` | Merged | `operations_contract::human_status_renders_compact_source_legend_table_and_plain_summary` |
+| `TestStatus.test_table_header_contains_target_keys` | Merged | `operations_contract::human_status_renders_compact_source_legend_table_and_plain_summary` |
 | `TestStatus.test_status_columns_use_each_target_header_width` | Replaced (D-013) | `D-013` |
 | `TestStatus.test_up_to_date_state` | Merged | `operations_contract::copy_load_update_status_and_remove_mutate_expected_trees` |
 | `TestStatus.test_needs_update_state` | Merged | `behavior_contract::status_covers_all_four_states` |
 | `TestStatus.test_not_loaded_state` | Replaced (D-013) | `D-013` |
 | `TestStatus.test_no_connection_state` | Merged | `operations_contract::status_filter_sorting_and_target_scoping_are_deterministic` |
-| `TestStatus.test_summary_line_printed` | Merged | `operations_contract::human_status_renders_sources_header_rows_summary_and_empty_state` |
-| `TestStatus.test_summary_omits_unsourced_deployed_when_zero` | Merged | `operations_contract::human_status_renders_sources_header_rows_summary_and_empty_state` |
+| `TestStatus.test_summary_line_printed` | Merged | `operations_contract::human_status_renders_compact_source_legend_table_and_plain_summary` |
+| `TestStatus.test_summary_omits_unsourced_deployed_when_zero` | Merged | `operations_contract::human_status_renders_compact_source_legend_table_and_plain_summary` |
 | `TestStatus.test_skills_sorted_alphabetically` | Merged | `operations_contract::status_filter_sorting_and_target_scoping_are_deterministic` |
 | `TestStatus.test_target_flag_scoping` | Merged | `operations_contract::status_filter_sorting_and_target_scoping_are_deterministic` |
 | `TestStatus.test_filter_restricts_source_skills` | Merged | `operations_contract::status_filter_sorting_and_target_scoping_are_deterministic` |
@@ -71,7 +71,7 @@ This ledger covers the committed inventory generated from `toolbelt/tests/test_s
 | `TestStatus.test_missing_target_dir_treated_as_not_loaded` | Merged | `operations_contract::status_filter_sorting_and_target_scoping_are_deterministic` |
 | `TestStatus.test_all_four_states_in_one_run` | Replaced (D-013) | `D-013` |
 | `TestOutHelper.test_normal_mode_prints_text` | Merged | `operations_contract::human_output_honors_color_policy_and_diagnostic_streams` |
-| `TestOutHelper.test_normal_mode_suppresses_nothing` | Merged | `operations_contract::human_status_renders_sources_header_rows_summary_and_empty_state` |
+| `TestOutHelper.test_normal_mode_suppresses_nothing` | Merged | `operations_contract::human_status_renders_compact_source_legend_table_and_plain_summary` |
 | `TestOutHelper.test_json_mode_prints_record` | Merged | `operations_contract::no_command_defaults_to_status_and_every_json_line_has_the_envelope` |
 | `TestOutHelper.test_json_mode_suppresses_text_without_record` | Merged | `operations_contract::no_command_defaults_to_status_and_every_json_line_has_the_envelope` |
 | `TestOutHelper.test_json_mode_blank_line_suppressed` | Merged | `operations_contract::no_command_defaults_to_status_and_every_json_line_has_the_envelope` |

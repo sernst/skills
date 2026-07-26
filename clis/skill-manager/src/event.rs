@@ -59,6 +59,10 @@ pub trait Reporter {
     fn is_interactive(&self) -> bool {
         false
     }
+    /// Whether semantic status cells may use ANSI colors.
+    fn color_enabled(&self) -> bool {
+        false
+    }
 }
 
 /// Reporter backed by stdout and stderr.
@@ -80,11 +84,11 @@ impl ConsoleReporter {
     pub fn with_color_policy(json: bool, policy: ColorChoice) -> Self {
         let interactive = io::stdout().is_terminal();
         let no_color = std::env::var_os("NO_COLOR").is_some();
-        let color = !json
+        let color = interactive
+            && !json
             && !no_color
             && match policy {
-                ColorChoice::Auto => interactive,
-                ColorChoice::Always => true,
+                ColorChoice::Auto | ColorChoice::Always => true,
                 ColorChoice::Never => false,
             };
         Self {
@@ -116,12 +120,8 @@ impl Reporter for ConsoleReporter {
         if self.json {
             return Ok(());
         }
-        if self.color {
-            writeln!(io::stdout().lock(), "\u{1b}[36m{text}\u{1b}[0m")
-        } else {
-            writeln!(io::stdout().lock(), "{text}")
-        }
-        .map_err(|error| SkillManagerError::io("<stdout>", error))
+        writeln!(io::stdout().lock(), "{text}")
+            .map_err(|error| SkillManagerError::io("<stdout>", error))
     }
 
     fn diagnostic(&mut self, text: &str) -> Result<()> {
@@ -142,5 +142,9 @@ impl Reporter for ConsoleReporter {
 
     fn is_interactive(&self) -> bool {
         self.interactive && !self.json
+    }
+
+    fn color_enabled(&self) -> bool {
+        self.color
     }
 }

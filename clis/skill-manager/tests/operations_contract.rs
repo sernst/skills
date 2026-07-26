@@ -667,6 +667,15 @@ fn status_filter_sorting_and_target_scoping_are_deterministic() {
     }));
 
     cli(home.path())
+        .args(["status", "--target", "one"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("orphan  unknown  no-connection"))
+        .stdout(predicate::str::contains("up-to-date: 2, no-connection: 1"))
+        .stdout(predicate::str::contains("~").not())
+        .stdout(predicate::str::contains("\u{1b}[").not());
+
+    cli(home.path())
         .args(["--json", "status", "--target", "one", "--filter", "a*"])
         .assert()
         .success()
@@ -731,11 +740,14 @@ fn status_json_preserves_stable_and_human_source_provenance() {
 }
 
 #[test]
-fn human_status_renders_sources_header_rows_summary_and_empty_state() {
+fn human_status_renders_compact_source_legend_table_and_plain_summary() {
     let home = sandbox();
-    let source = home.path().join("source");
+    let source = home.path().join("source with spaces");
+    let second_source = home.path().join("second source");
     let target = home.path().join("target");
     create_skill(&source, "alpha", "# Alpha");
+    create_skill(&source, "skill-with-long-name", "# Long");
+    create_skill(&second_source, "zeta", "# Zeta");
     cli(home.path())
         .args([
             "--json",
@@ -745,6 +757,18 @@ fn human_status_renders_sources_header_rows_summary_and_empty_state() {
             "primary",
             "--label",
             "Primary Label",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            second_source.to_str().expect("utf8 path"),
+            "very-long-source-alias",
+            "--label",
+            "Other Label",
         ])
         .assert()
         .success();
@@ -766,12 +790,26 @@ fn human_status_renders_sources_header_rows_summary_and_empty_state() {
         .stdout(predicate::str::contains("Sources:"))
         .stdout(predicate::str::contains("primary"))
         .stdout(predicate::str::contains("(Primary Label)"))
-        .stdout(predicate::str::contains("skill\tsource\tcustom"))
-        .stdout(predicate::str::contains("alpha\t"))
-        .stdout(predicate::str::contains("custom:not-loaded"))
+        .stdout(predicate::str::contains("NAME").not())
+        .stdout(predicate::str::contains("LABEL").not())
+        .stdout(predicate::str::contains("LOCATION").not())
+        .stdout(predicate::str::contains("skill"))
+        .stdout(predicate::str::contains("source"))
+        .stdout(predicate::str::contains("custom"))
+        .stdout(predicate::str::contains("--------------------"))
         .stdout(predicate::str::contains(
-            "Summary: up-to-date: 0, needs-update: 0, not-loaded: 1, no-connection: 0",
+            "alpha                 primary                 not-loaded",
         ))
+        .stdout(predicate::str::contains(
+            "skill-with-long-name  primary                 not-loaded",
+        ))
+        .stdout(predicate::str::contains(
+            "zeta                  very-long-source-alias  not-loaded",
+        ))
+        .stdout(predicate::str::contains("source with spaces"))
+        .stdout(predicate::str::contains("\t").not())
+        .stdout(predicate::str::contains("not-loaded: 3"))
+        .stdout(predicate::str::contains("Summary:").not())
         .stdout(predicate::str::contains("\u{1b}[").not());
 
     let empty_home = sandbox();
@@ -793,6 +831,24 @@ fn human_status_renders_sources_header_rows_summary_and_empty_state() {
         .success()
         .stdout(predicate::str::contains("Sources:"))
         .stdout(predicate::str::contains("No skills found"));
+}
+
+#[test]
+fn human_status_names_an_implicit_current_directory_source() {
+    let home = sandbox();
+    let working_directory = home.path().join("working collection");
+    create_skill(&working_directory, "from-cwd", "# CWD");
+
+    let mut command = cli(home.path());
+    command.current_dir(&working_directory);
+    command
+        .args(["status", "--cd-only"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cwd  (Current directory)  "))
+        .stdout(predicate::str::contains("from-cwd  cwd"))
+        .stdout(predicate::str::contains("\t").not())
+        .stdout(predicate::str::contains("\u{1b}[").not());
 }
 
 #[test]
@@ -1256,19 +1312,40 @@ fn human_output_honors_color_policy_and_diagnostic_streams() {
         .assert()
         .success();
 
-    let mut colored = cli(home.path());
-    colored.env_remove("NO_COLOR");
-    colored
+    let mut redirected = cli(home.path());
+    redirected.env_remove("NO_COLOR");
+    redirected
         .args(["--color", "always", "target", "list"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\u{1b}[36m"))
+        .stdout(predicate::str::contains("\u{1b}[").not())
+        .stdout(predicate::str::contains("\u{1b}[36m").not())
         .stderr(predicate::str::is_empty());
 
-    let mut plain = cli(home.path());
-    plain.env_remove("NO_COLOR");
-    plain
-        .args(["--color", "never", "target", "list"])
+    let source = home.path().join("source");
+    create_skill(&source, "alpha", "# Alpha");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 path"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args(["--color", "always", "status", "--target", "custom"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\u{1b}[36m").not())
+        .stdout(predicate::str::contains("\u{1b}[").not())
+        .stdout(predicate::str::contains("alpha  primary  not-loaded"));
+
+    let mut no_color = cli(home.path());
+    no_color
+        .env("NO_COLOR", "1")
+        .args(["--color", "always", "status", "--target", "custom"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\u{1b}[").not());
@@ -1282,7 +1359,8 @@ fn human_output_honors_color_policy_and_diagnostic_streams() {
         .assert()
         .failure()
         .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("\u{1b}[31mError:"));
+        .stderr(predicate::str::contains("Error:"))
+        .stderr(predicate::str::contains("\u{1b}[").not());
 }
 
 #[test]

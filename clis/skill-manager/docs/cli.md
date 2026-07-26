@@ -2,7 +2,7 @@
 
 ## Common behavior
 
-Running without a command is `status`. `--color auto|always|never` controls human color; `NO_COLOR` disables automatic color. Non-TTY human output is plain text. `--json` emits NDJSON and implies `--no-input`.
+Running without a command is `status`. `--color auto|always|never` controls human color; `NO_COLOR` disables color. Non-TTY human output is aligned plain text with no ANSI escapes or emoji. On an interactive terminal, color is limited to semantic status cells rather than whole lines; status symbols remain available when color is disabled. `--json` emits NDJSON and implies `--no-input`.
 
 | Command | Purpose |
 | --- | --- |
@@ -26,3 +26,5 @@ All discovery commands accept repeatable `--filter PATTERN`, `--refresh`, and `-
 ## Status values
 
 Each source/target pair is `up-to-date`, `needs-update`, `not-loaded`, or `no-connection`. Equality compares relative regular-file names and SHA-256 content only; timestamps, ownership, and empty directories do not affect it.
+
+Human `status` output first maps compact source names to labels and local or GitHub locations without a redundant legend header, then uses those names in an aligned skill-by-target table. The table has lowercase headers, a dashed separator, and two-space column gaps. Interactive terminals show one colored symbol per target state (`✓`, `↑`, `✗`, or `~`) and a matching, nonzero-only summary legend; custom target names therefore widen only their headers. Redirected output remains ANSI-free and uses textual state names. Deployed-only skills display `unknown` as their human source while the NDJSON event schema and source provenance remain unchanged. Ad hoc current-directory sources use `cwd`; other unconfigured sources use a deterministic, disambiguated short name.
