@@ -7,9 +7,10 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::{Map, Value};
 
 use crate::cli::{
-    Cli, Command, CopyArgs, RemoveArgs, ResolveArgs, SourceAction, SourceAddArgs, SourceArgs,
-    SourceModeArg, SourceRemoveArgs, SourceSelection, SourceUpdateArgs, StatusArgs, SyncArgs,
-    TargetAction, TargetArgs, TargetNameArgs, TargetPathArgs, TargetSelection,
+    Cli, Command, CopyArgs, RemoveArgs, ResolveArgs, SourceAction, SourceAddArgs,
+    SourceAlternateArgs, SourceArgs, SourceLocateArgs, SourceModeArg, SourceRemoveArgs,
+    SourceSelection, SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction,
+    TargetArgs, TargetNameArgs, TargetPathArgs, TargetSelection,
 };
 use crate::error::{Result, SkillManagerError};
 
@@ -104,7 +105,7 @@ fn overlay_command(command: &mut Command, object: &Map<String, Value>, base: &Pa
     Ok(())
 }
 
-fn overlay_sync(args: &mut SyncArgs, object: &Map<String, Value>, base: &Path) -> Result<()> {
+fn overlay_sync(args: &mut SyncArgs, object: &Map<String, Value>, _base: &Path) -> Result<()> {
     reject_unknown(
         object,
         &[
@@ -128,7 +129,7 @@ fn overlay_sync(args: &mut SyncArgs, object: &Map<String, Value>, base: &Path) -
             "refresh",
         ],
     )?;
-    overlay_references(&mut args.sources, object, &["sources", "source"], base)?;
+    overlay_strings(&mut args.sources, object, &["sources", "source"])?;
     overlay_strings(&mut args.filters, object, &["filters", "filter"])?;
     overlay_source_selection(&mut args.source_selection, object)?;
     overlay_target_selection(&mut args.targets, object)?;
@@ -154,9 +155,7 @@ fn overlay_copy(args: &mut CopyArgs, object: &Map<String, Value>, base: &Path) -
     overlay_bool(&mut args.dry_run, object.get("dry_run"))?;
     overlay_bool(&mut args.refresh, object.get("refresh"))?;
     if args.source.is_empty() {
-        args.source = first_string(object, &["source"])?
-            .map(|value| rebase_reference(&value, base, false))
-            .unwrap_or_default();
+        args.source = first_string(object, &["source"])?.unwrap_or_default();
     }
     if let Some(destination) = object.get("destination")
         && args.destination.as_os_str().is_empty()
@@ -255,6 +254,10 @@ fn overlay_resolve(args: &mut ResolveArgs, object: &Map<String, Value>) -> Resul
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Strict field validation and precedence for the source lifecycle stay auditable together."
+)]
 fn overlay_source(
     action: &mut SourceAction,
     object: &Map<String, Value>,
@@ -309,8 +312,7 @@ fn overlay_source(
         SourceAction::Remove(args) => {
             reject_unknown(object, &["command", "no_input", "source", "directory"])?;
             if args.source.is_none() {
-                args.source = first_string(object, &["source", "directory"])?
-                    .map(|value| rebase_reference(&value, base, false));
+                args.source = first_string(object, &["source", "directory"])?;
             }
         }
         SourceAction::List => reject_unknown(object, &["command", "no_input"])?,
@@ -322,6 +324,7 @@ fn overlay_source(
                     "no_input",
                     "source",
                     "directory",
+                    "location",
                     "name",
                     "label",
                     "exclude",
@@ -330,12 +333,14 @@ fn overlay_source(
                 ],
             )?;
             if args.source.is_empty() {
-                args.source = first_string(object, &["source", "directory"])?
-                    .map(|value| rebase_reference(&value, base, false))
-                    .unwrap_or_default();
+                args.source = first_string(object, &["source", "directory"])?.unwrap_or_default();
             }
             if args.name.is_none() {
                 args.name = first_string(object, &["name"])?;
+            }
+            if args.location.is_none() {
+                args.location = first_string(object, &["location"])?
+                    .map(|value| rebase_reference(&value, base, true));
             }
             if args.label.is_none() {
                 args.label = first_string(object, &["label"])?;
@@ -344,6 +349,54 @@ fn overlay_source(
             overlay_bool(&mut args.clear_exclude, object.get("clear_exclude"))?;
             if args.cache_ttl_hours.is_none() {
                 args.cache_ttl_hours = object.get("cache_ttl_hours").map(strict_i64).transpose()?;
+            }
+        }
+        SourceAction::Locate(args) => {
+            reject_unknown(object, &["command", "no_input", "source", "location"])?;
+            if args.source.is_empty() {
+                args.source = first_string(object, &["source"])?.unwrap_or_default();
+            }
+            if args.location.is_empty() {
+                args.location = first_string(object, &["location"])?
+                    .map(|value| rebase_reference(&value, base, true))
+                    .unwrap_or_default();
+            }
+        }
+        SourceAction::Alternate(args) => {
+            reject_unknown(
+                object,
+                &["command", "no_input", "source", "location", "clear"],
+            )?;
+            if args.source.is_empty() {
+                args.source = first_string(object, &["source"])?.unwrap_or_default();
+            }
+            if args.location.is_some() {
+                let _same_field = first_string(object, &["location"])?;
+                args.clear = false;
+            } else if args.clear {
+                let _same_field = object.get("clear").map(strict_bool).transpose()?;
+                args.location = None;
+            } else {
+                let recipe_location = first_string(object, &["location"])?;
+                let recipe_clear = object.get("clear").map(strict_bool).transpose()?;
+                match (recipe_location, recipe_clear) {
+                    (Some(location), None | Some(false)) => {
+                        args.location = Some(rebase_reference(&location, base, true));
+                    }
+                    (None, Some(true)) => args.clear = true,
+                    _ => {
+                        return Err(SkillManagerError::InvalidInput(
+                            "source.alternate requires exactly one of location or clear:true"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        }
+        SourceAction::Swap(args) => {
+            reject_unknown(object, &["command", "no_input", "source"])?;
+            if args.source.is_empty() {
+                args.source = first_string(object, &["source"])?.unwrap_or_default();
             }
         }
     }
@@ -521,6 +574,9 @@ fn command_name(command: &Command) -> &'static str {
             SourceAction::Remove(_) => "source.remove",
             SourceAction::List => "source.list",
             SourceAction::Update(_) => "source.update",
+            SourceAction::Locate(_) => "source.locate",
+            SourceAction::Alternate(_) => "source.alternate",
+            SourceAction::Swap(_) => "source.swap",
         },
         Command::Target(args) => match args.action {
             TargetAction::Add(_) => "target.add",
@@ -547,6 +603,9 @@ fn canonical_command(value: &str) -> Result<&'static str> {
         "source.remove" => Ok("source.remove"),
         "source.list" => Ok("source.list"),
         "source.update" => Ok("source.update"),
+        "source.locate" => Ok("source.locate"),
+        "source.alternate" => Ok("source.alternate"),
+        "source.swap" => Ok("source.swap"),
         "target.add" => Ok("target.add"),
         "target.list" => Ok("target.list"),
         "target.enable" => Ok("target.enable"),
@@ -587,8 +646,9 @@ fn default_command(name: &str) -> Result<Command> {
             action: TargetAction::List,
         })),
         // Commands with required positional fields must be expressed on argv.
-        "copy" | "source.update" | "target.add" | "target.enable" | "target.disable"
-        | "target.remove" | "target.set-path" => build_required_command(name),
+        "copy" | "source.update" | "source.locate" | "source.alternate" | "source.swap"
+        | "target.add" | "target.enable" | "target.disable" | "target.remove"
+        | "target.set-path" => build_required_command(name),
         _ => Err(SkillManagerError::InvalidInput(format!(
             "cannot create recipe command: {name}"
         ))),
@@ -602,6 +662,25 @@ fn validate_required(command: &Command) -> Result<()> {
         Command::Source(SourceArgs {
             action: SourceAction::Update(args),
         }) if args.source.is_empty() => Some("source.update.source"),
+        Command::Source(SourceArgs {
+            action: SourceAction::Locate(args),
+        }) if args.source.is_empty() => Some("source.locate.source"),
+        Command::Source(SourceArgs {
+            action: SourceAction::Locate(args),
+        }) if args.location.is_empty() => Some("source.locate.location"),
+        Command::Source(SourceArgs {
+            action: SourceAction::Alternate(args),
+        }) if args.source.is_empty() => Some("source.alternate.source"),
+        Command::Source(SourceArgs {
+            action: SourceAction::Alternate(args),
+        }) if args.location.is_some() == args.clear => {
+            return Err(SkillManagerError::InvalidInput(
+                "source.alternate requires exactly one of location or clear:true".into(),
+            ));
+        }
+        Command::Source(SourceArgs {
+            action: SourceAction::Swap(args),
+        }) if args.source.is_empty() => Some("source.swap.source"),
         Command::Target(TargetArgs {
             action: TargetAction::Add(args) | TargetAction::SetPath(args),
         }) if args.name.is_empty() => Some("target.name"),
@@ -637,10 +716,29 @@ fn build_required_command(name: &str) -> Result<Command> {
             action: SourceAction::Update(SourceUpdateArgs {
                 source: String::new(),
                 name: None,
+                location: None,
                 label: None,
                 exclude: Vec::new(),
                 clear_exclude: false,
                 cache_ttl_hours: None,
+            }),
+        })),
+        "source.locate" => Ok(Command::Source(SourceArgs {
+            action: SourceAction::Locate(SourceLocateArgs {
+                source: String::new(),
+                location: String::new(),
+            }),
+        })),
+        "source.alternate" => Ok(Command::Source(SourceArgs {
+            action: SourceAction::Alternate(SourceAlternateArgs {
+                source: String::new(),
+                location: None,
+                clear: false,
+            }),
+        })),
+        "source.swap" => Ok(Command::Source(SourceArgs {
+            action: SourceAction::Swap(SourceSwapArgs {
+                source: String::new(),
             }),
         })),
         "target.add" | "target.set-path" => Ok(Command::Target(TargetArgs {
@@ -764,12 +862,12 @@ mod tests {
     }
 
     #[test]
-    fn file_recipe_rebases_sources_but_explicit_cli_paths_win() {
+    fn file_recipe_keeps_selectors_verbatim_and_rebases_only_paths_and_locations() {
         let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
         let recipes = root.path().join("recipes");
-        let source = root.path().join("source");
+        let source_path = root.path().join("source");
         std::fs::create_dir_all(&recipes).unwrap_or_else(|error| unreachable!("{error}"));
-        std::fs::create_dir_all(&source).unwrap_or_else(|error| unreachable!("{error}"));
+        std::fs::create_dir_all(&source_path).unwrap_or_else(|error| unreachable!("{error}"));
         let recipe_path = recipes.join("copy.json");
         std::fs::write(
             &recipe_path,
@@ -783,11 +881,37 @@ mod tests {
         let Some(Command::Copy(copy)) = cli.command else {
             unreachable!("copy command");
         };
-        assert_eq!(copy.source, source.to_string_lossy());
+        assert_eq!(copy.source, "../source");
         assert_eq!(copy.destination, root.path().join("destination"));
+
+        std::fs::write(
+            &recipe_path,
+            r#"{"command":"source.update","source":"../selector","location":"../source"}"#,
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        let mut update =
+            Cli::try_parse_from(["skill-manager", "--input", &recipe_path.to_string_lossy()])
+                .unwrap_or_else(|error| unreachable!("{error}"));
+        apply_recipe(&mut update).unwrap_or_else(|error| unreachable!("{error}"));
+        let Some(Command::Source(source)) = update.command else {
+            unreachable!("source command");
+        };
+        let SourceAction::Update(update) = source.action else {
+            unreachable!("source update");
+        };
+        assert_eq!(update.source, "../selector");
+        assert_eq!(
+            update.location.as_deref(),
+            Some(source_path.to_string_lossy().as_ref())
+        );
 
         let explicit_source = root.path().join("explicit-source");
         let explicit_destination = root.path().join("explicit-destination");
+        std::fs::write(
+            &recipe_path,
+            r#"{"command":"copy","source":"../source","destination":"../destination"}"#,
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
         let mut explicit = Cli::try_parse_from([
             "skill-manager",
             "--input",

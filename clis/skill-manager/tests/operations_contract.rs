@@ -1115,11 +1115,18 @@ fn strict_recipe_modes_resolve_paths_and_cli_values_win() {
 
     let recipe_dir = home.path().join("recipes");
     fs::create_dir_all(&recipe_dir).expect("create recipe directory");
-    create_skill(
-        &recipe_dir.join("relative-source"),
-        "from-recipe",
-        "# rebased",
-    );
+    let recipe_source = recipe_dir.join("relative-source");
+    create_skill(&recipe_source, "from-recipe", "# rebased");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            recipe_source.to_str().expect("utf8 recipe source"),
+            "relative-source",
+        ])
+        .assert()
+        .success();
     fs::write(
         recipe_dir.join("copy.json"),
         serde_json::json!({

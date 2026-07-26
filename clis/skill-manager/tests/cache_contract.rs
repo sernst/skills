@@ -87,6 +87,7 @@ fn github_source(id: &str, ttl: i64) -> SourceEntry {
         repo: Some("repo".into()),
         r#ref: None,
         repo_path: None,
+        alternate: None,
         extra: IndexMap::new(),
     }
 }
@@ -349,6 +350,157 @@ fn remote_cache_is_reused_and_failed_refresh_preserves_it() {
         .expect("old cache survives"),
         "# cached"
     );
+}
+
+#[test]
+fn cache_reuse_requires_the_complete_remote_identity_even_in_dry_runs() {
+    for mismatch in ["owner", "repo", "ref", "repo_path", "legacy_metadata"] {
+        let home = tempfile::tempdir().expect("temporary home");
+        let archive_path = home.path().join("source.tar.gz");
+        write_regular_archive(&archive_path, b"# original identity");
+        let repository = FileConfigRepository::new(home.path());
+        let transport = ArchiveTransport::new(archive_path);
+        let source = github_source("stable-id", 24);
+        materialize_source(&repository, &transport, &source, false, false).expect("seed cache");
+
+        let mut changed = source.clone();
+        match mismatch {
+            "owner" => changed.owner = Some("different-owner".into()),
+            "repo" => changed.repo = Some("different-repo".into()),
+            "ref" => changed.r#ref = Some("different-ref".into()),
+            "repo_path" => changed.repo_path = Some("alpha".into()),
+            "legacy_metadata" => {
+                let metadata_path = repository
+                    .cache_root()
+                    .join("stable-id")
+                    .join("metadata.json");
+                let mut metadata: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&metadata_path).expect("read metadata"))
+                        .expect("parse metadata");
+                for field in ["owner", "repo", "ref", "repo_path"] {
+                    metadata
+                        .as_object_mut()
+                        .expect("metadata object")
+                        .remove(field);
+                }
+                fs::write(
+                    metadata_path,
+                    serde_json::to_vec_pretty(&metadata).expect("serialize legacy metadata"),
+                )
+                .expect("write legacy metadata");
+            }
+            _ => unreachable!("known mismatch"),
+        }
+
+        let result = materialize_source(&repository, &FailingTransport, &changed, false, true);
+        assert!(
+            result.is_err(),
+            "{mismatch} mismatch must refresh instead of returning stale cache"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                repository
+                    .cache_root()
+                    .join("stable-id/content/alpha/SKILL.md")
+            )
+            .expect("old cache remains available"),
+            "# original identity"
+        );
+    }
+}
+
+#[test]
+fn changed_remote_identity_refreshes_successfully_and_never_falls_back_on_failure() {
+    let home = tempfile::tempdir().expect("temporary home");
+    let old_archive = home.path().join("old.tar.gz");
+    let new_archive = home.path().join("new.tar.gz");
+    write_regular_archive(&old_archive, b"# old identity");
+    write_regular_archive(&new_archive, b"# new identity");
+    let repository = FileConfigRepository::new(home.path());
+    let source = github_source("stable-id", 24);
+    materialize_source(
+        &repository,
+        &ArchiveTransport::new(old_archive),
+        &source,
+        false,
+        false,
+    )
+    .expect("seed old identity");
+
+    let mut changed = source.clone();
+    changed.owner = Some("new-owner".into());
+    let new_transport = ArchiveTransport::new(new_archive);
+    let refreshed = materialize_source(&repository, &new_transport, &changed, false, false)
+        .expect("identity mismatch refreshes");
+    assert_eq!(new_transport.downloads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fs::read_to_string(refreshed.path.join("alpha/SKILL.md")).expect("read refreshed cache"),
+        "# new identity"
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            repository
+                .cache_root()
+                .join("stable-id")
+                .join("metadata.json"),
+        )
+        .expect("read refreshed metadata"),
+    )
+    .expect("parse refreshed metadata");
+    assert_eq!(metadata["owner"], "new-owner");
+
+    let mut failing_identity = changed;
+    failing_identity.repo = Some("another-repo".into());
+    assert!(
+        materialize_source(
+            &repository,
+            &FailingTransport,
+            &failing_identity,
+            false,
+            false,
+        )
+        .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(
+            repository
+                .cache_root()
+                .join("stable-id/content/alpha/SKILL.md")
+        )
+        .expect("last matching cache survives failed refresh"),
+        "# new identity"
+    );
+}
+
+#[test]
+fn remote_to_local_to_same_remote_reuses_the_matching_stable_id_cache() {
+    let home = tempfile::tempdir().expect("temporary home");
+    let archive = home.path().join("source.tar.gz");
+    write_regular_archive(&archive, b"# reusable");
+    let repository = FileConfigRepository::new(home.path());
+    let transport = ArchiveTransport::new(archive);
+    let remote = github_source("stable-id", 24);
+    materialize_source(&repository, &transport, &remote, false, false).expect("seed remote");
+    assert_eq!(transport.downloads.load(Ordering::SeqCst), 1);
+
+    let local_path = home.path().join("local");
+    fs::create_dir_all(&local_path).expect("create local source");
+    let mut local = remote.clone();
+    local.source_type = SourceType::Local;
+    local.path = Some(local_path.clone());
+    local.owner = None;
+    local.repo = None;
+    local.r#ref = None;
+    local.repo_path = None;
+    let resolved_local =
+        materialize_source(&repository, &transport, &local, false, false).expect("use local");
+    assert_eq!(resolved_local.path, local_path);
+    assert!(repository.cache_root().join("stable-id/content").is_dir());
+
+    let reused =
+        materialize_source(&repository, &transport, &remote, false, false).expect("reuse remote");
+    assert!(reused.from_cache);
+    assert_eq!(transport.downloads.load(Ordering::SeqCst), 1);
 }
 
 #[test]

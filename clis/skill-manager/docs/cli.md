@@ -12,7 +12,7 @@ Running without a command is `status`. `--color auto|always|never` controls huma
 | `remove [SKILL...]` | Remove selected or auto-detected deployed skills. |
 | `status [FILTER...]` | Show source-relative target states; aliases: `ls`, `list`. |
 | `resolve [SKILL...]` | Persist collision preferences. |
-| `source …` | Add, remove, list, or update local/GitHub source definitions. |
+| `source …` | Add, remove, list, update, locate, pair, or swap source definitions. |
 | `target …` | Add, list, enable, disable, remove, or update target paths. |
 
 `load`, `update`, `remove`, and `status` accept built-in selectors `--claude`, `--shared`, `--antigravity`/`--ag`, `--all`, and repeatable `--target NAME`. Selectors form a deduplicated union; an explicit `--target` can include a disabled target alongside enabled built-ins. `load` and `update` prompt when there is no explicit target; noninteractive calls must select a target. `remove` prompts before destructive work unless `--yes`/`-y` is supplied.
@@ -21,7 +21,15 @@ All discovery commands accept repeatable `--filter PATTERN`, `--refresh`, and `-
 
 ## Source and target lifecycle
 
-`source add` accepts a local path, GitHub URL, or GitHub shorthand and optional name, label, source mode, excludes, and cache TTL. Names and labels are updated with `source update`; IDs do not change. `target add` only creates custom targets; `target set-path` changes a custom path. Built-ins are `claude`, `shared`, and `antigravity`. `target remove` deletes custom targets and instead disables an unoverridden built-in. Legacy built-in overrides remain available as explicit legacy overrides and warn until updated or removed.
+`source add` accepts a local path, GitHub URL, or GitHub shorthand and optional name, label, source mode, excludes, and cache TTL. Names, labels, and the active location are updated atomically with `source update`; `--location LOCATION` can be combined with metadata flags. IDs do not change when a source moves.
+
+`source locate SOURCE LOCATION` is the location-only spelling, with visible aliases `relocate`, `move`, and `mv`. `source alternate SOURCE LOCATION` saves or replaces an inactive location, while `source alternate SOURCE --clear` removes it. `source swap SOURCE` exchanges the active and inactive locations. Local/local, local/GitHub, and GitHub/GitHub pairs are supported, and local paths need not exist yet. Locating to the current location is a no-op; locating to the saved alternate directs the user to `source swap`. A swap requires an alternate.
+
+Source selectors are a stable ID, name, unique label, or active location. Inactive locations are deliberately not selectors; an error identifies the stable name and ID to use. A newly set active or alternate location cannot collide with any slot of another source. Existing cross-source collisions remain loadable for compatibility and swaps may retain them.
+
+`source list` and the status source preamble use the same display-width-aware aligned renderer. An inactive location appears immediately below its source as `alternate (inactive)`.
+
+`target add` only creates custom targets; `target set-path` changes a custom path. Built-ins are `claude`, `shared`, and `antigravity`. `target remove` deletes custom targets and instead disables an unoverridden built-in. Legacy built-in overrides remain available as explicit legacy overrides and warn until updated or removed.
 
 ## Status values
 

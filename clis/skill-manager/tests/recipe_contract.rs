@@ -176,6 +176,7 @@ fn recipe_overlay_covers_source_and_target_lifecycle_shapes() {
     let source_update = recipe(&serde_json::json!({
         "command": "source.update",
         "source": "local",
+        "location": "owner/repo",
         "name": "renamed",
         "label": "Renamed",
         "exclude": "private-*",
@@ -189,6 +190,7 @@ fn recipe_overlay_covers_source_and_target_lifecycle_shapes() {
         unreachable!("source update")
     };
     assert_eq!(args.source, "local");
+    assert_eq!(args.location.as_deref(), Some("owner/repo"));
     assert!(args.clear_exclude);
     assert_eq!(args.cache_ttl_hours, Some(4));
 
@@ -224,6 +226,53 @@ fn recipe_overlay_covers_source_and_target_lifecycle_shapes() {
     assert!(matches!(
         target_list.command,
         Some(Command::Target(target)) if matches!(target.action, TargetAction::List)
+    ));
+}
+
+#[test]
+fn recipe_overlay_covers_source_location_switching_shapes() {
+    let source_locate = recipe(&serde_json::json!({
+        "command": "source.locate",
+        "source": "local",
+        "location": "owner/repo"
+    }));
+    assert!(matches!(
+        source_locate.command,
+        Some(Command::Source(source))
+            if matches!(source.action, SourceAction::Locate(ref args)
+                if args.source == "local" && args.location == "owner/repo")
+    ));
+
+    let source_alternate = recipe(&serde_json::json!({
+        "command": "source.alternate",
+        "source": "local",
+        "location": "owner/repo"
+    }));
+    assert!(matches!(
+        source_alternate.command,
+        Some(Command::Source(source))
+            if matches!(source.action, SourceAction::Alternate(ref args)
+                if args.location.as_deref() == Some("owner/repo") && !args.clear)
+    ));
+    let source_alternate_clear = recipe(&serde_json::json!({
+        "command": "source.alternate",
+        "source": "local",
+        "clear": true
+    }));
+    assert!(matches!(
+        source_alternate_clear.command,
+        Some(Command::Source(source))
+            if matches!(source.action, SourceAction::Alternate(ref args)
+                if args.location.is_none() && args.clear)
+    ));
+    let source_swap = recipe(&serde_json::json!({
+        "command": "source.swap",
+        "source": "local"
+    }));
+    assert!(matches!(
+        source_swap.command,
+        Some(Command::Source(source))
+            if matches!(source.action, SourceAction::Swap(ref args) if args.source == "local")
     ));
 }
 
@@ -303,4 +352,124 @@ fn recipe_strictness_rejects_all_invalid_carrier_shapes() {
             .to_string()
             .contains("does not match")
     );
+}
+
+#[test]
+fn source_location_recipes_reject_missing_conflicting_alias_and_unknown_fields() {
+    let failures = [
+        (
+            serde_json::json!({"command": "source.locate", "source": "one"}),
+            "requires field source.locate.location",
+        ),
+        (
+            serde_json::json!({"command": "source.alternate", "source": "one"}),
+            "requires exactly one",
+        ),
+        (
+            serde_json::json!({
+                "command": "source.alternate",
+                "source": "one",
+                "location": "owner/repo",
+                "clear": true
+            }),
+            "requires exactly one",
+        ),
+        (
+            serde_json::json!({"command": "source.swap"}),
+            "requires field source.swap.source",
+        ),
+        (
+            serde_json::json!({
+                "command": "source.alternate",
+                "source": "one",
+                "clear": "yes"
+            }),
+            "must be a boolean",
+        ),
+        (
+            serde_json::json!({
+                "command": "source.locate",
+                "source": "one",
+                "unknown": true
+            }),
+            "unknown JSON invocation field",
+        ),
+        (
+            serde_json::json!({
+                "command": "source.relocate",
+                "source": "one",
+                "location": "owner/repo"
+            }),
+            "unknown recipe command",
+        ),
+    ];
+    for (value, expected) in failures {
+        assert!(
+            recipe_error(&value).contains(expected),
+            "failure must mention {expected}"
+        );
+    }
+}
+
+#[test]
+fn alternate_cli_values_suppress_the_opposite_recipe_value() {
+    let mut explicit_location = Cli::try_parse_from([
+        "skill-manager",
+        r#"--json={"command":"source.alternate","source":"recipe","clear":true}"#,
+        "source",
+        "alternate",
+        "cli-selector",
+        "owner/cli",
+    ])
+    .expect("parse explicit location");
+    apply_recipe(&mut explicit_location).expect("overlay explicit location");
+    assert!(matches!(
+        explicit_location.command,
+        Some(Command::Source(source))
+            if matches!(source.action, SourceAction::Alternate(ref args)
+                if args.source == "cli-selector"
+                    && args.location.as_deref() == Some("owner/cli")
+                    && !args.clear)
+    ));
+
+    let mut explicit_clear = Cli::try_parse_from([
+        "skill-manager",
+        r#"--json={"command":"source.alternate","source":"recipe","location":"owner/recipe"}"#,
+        "source",
+        "alternate",
+        "cli-selector",
+        "--clear",
+    ])
+    .expect("parse explicit clear");
+    apply_recipe(&mut explicit_clear).expect("overlay explicit clear");
+    assert!(matches!(
+        explicit_clear.command,
+        Some(Command::Source(source))
+            if matches!(source.action, SourceAction::Alternate(ref args)
+                if args.source == "cli-selector" && args.location.is_none() && args.clear)
+    ));
+
+    let mut malformed_suppressed_clear = Cli::try_parse_from([
+        "skill-manager",
+        r#"--json={"command":"source.alternate","source":"recipe","clear":"malformed"}"#,
+        "source",
+        "alternate",
+        "cli-selector",
+        "owner/cli",
+    ])
+    .expect("parse location suppressing malformed clear");
+    apply_recipe(&mut malformed_suppressed_clear)
+        .expect("explicit location suppresses recipe clear before type parsing");
+
+    let mut malformed_suppressed_location = Cli::try_parse_from([
+        "skill-manager",
+        r#"--json={"command":"source.alternate","source":"recipe","location":false}"#,
+        "source",
+        "alternate",
+        "cli-selector",
+        "--clear",
+    ])
+    .expect("parse clear suppressing malformed location");
+    apply_recipe(&mut malformed_suppressed_location)
+        .expect("explicit clear suppresses recipe location before type parsing");
 }

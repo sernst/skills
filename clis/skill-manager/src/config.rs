@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(windows)]
@@ -21,7 +21,7 @@ use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 use url::Url;
 
-use crate::domain::{SourceEntry, SourceMode, SourceType, Target, TargetEntry};
+use crate::domain::{SourceEntry, SourceLocation, SourceMode, SourceType, Target, TargetEntry};
 use crate::error::{Result, SkillManagerError};
 
 /// Current configuration schema.
@@ -212,11 +212,12 @@ impl ConfigRepository for FileConfigRepository {
         if migrated {
             value = migrate_v0(&value)?;
         }
-        let config: Config =
+        let mut config: Config =
             serde_json::from_value(value).map_err(|error| SkillManagerError::InvalidConfig {
                 path: active_path.clone(),
                 message: error.to_string(),
             })?;
+        normalize_config_locations(&mut config)?;
         validate_config(&config, &active_path)?;
         if migrated && !dry_run {
             ensure_v0_backup(&active_path, &raw)?;
@@ -230,7 +231,9 @@ impl ConfigRepository for FileConfigRepository {
     }
 
     fn save(&self, active_path: &Path, config: &Config) -> Result<()> {
-        validate_config(config, active_path)?;
+        let mut normalized = config.clone();
+        normalize_config_locations(&mut normalized)?;
+        validate_config(&normalized, active_path)?;
         let _lock = acquire_lock(&self.lock_path(), "configuration", Duration::from_secs(10))?;
         let parent = active_path.parent().ok_or_else(|| {
             SkillManagerError::InvalidInput(format!(
@@ -239,7 +242,7 @@ impl ConfigRepository for FileConfigRepository {
             ))
         })?;
         fs::create_dir_all(parent).map_err(|error| SkillManagerError::io(parent, error))?;
-        let mut bytes = serde_json::to_vec_pretty(config)
+        let mut bytes = serde_json::to_vec_pretty(&normalized)
             .map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
         bytes.push(b'\n');
         let mut temporary = tempfile::NamedTempFile::new_in(parent)
@@ -649,6 +652,17 @@ fn validate_config(config: &Config, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn normalize_config_locations(config: &mut Config) -> Result<()> {
+    for source in &mut config.sources {
+        let active = normalize_location(raw_source_location(source)?)?;
+        set_source_location(source, &active);
+        if let Some(alternate) = source.alternate.take() {
+            source.alternate = Some(normalize_location(alternate)?);
+        }
+    }
+    Ok(())
+}
+
 fn validate_source(source: &SourceEntry) -> Result<()> {
     if source.id.trim().is_empty() || source.name.trim().is_empty() {
         return Err(SkillManagerError::InvalidInput(
@@ -661,18 +675,18 @@ fn validate_source(source: &SourceEntry) -> Result<()> {
             source.name
         )));
     }
-    match source.source_type {
-        SourceType::Local if source.path.is_none() => Err(SkillManagerError::InvalidInput(
-            format!("local source '{}' requires path", source.name),
-        )),
-        SourceType::GitHub if source.owner.is_none() || source.repo.is_none() => {
-            Err(SkillManagerError::InvalidInput(format!(
-                "GitHub source '{}' requires owner and repo",
+    let active = source_location(source)?;
+    validate_location(&active, &source.name)?;
+    if let Some(alternate) = &source.alternate {
+        validate_location(alternate, &source.name)?;
+        if locations_equal(&active, alternate) {
+            return Err(SkillManagerError::InvalidInput(format!(
+                "source '{}' active and alternate locations must differ",
                 source.name
-            )))
+            )));
         }
-        _ => Ok(()),
     }
+    Ok(())
 }
 
 /// Normalize a local path or supported GitHub reference into a source.
@@ -695,6 +709,7 @@ pub fn source_from_reference(raw: &str, mode: Option<SourceMode>) -> Result<Sour
             repo: Some(repo),
             r#ref: reference,
             repo_path,
+            alternate: None,
             extra: IndexMap::new(),
         };
         entry.id = derive_source_id(&entry);
@@ -708,7 +723,7 @@ pub fn source_from_reference(raw: &str, mode: Option<SourceMode>) -> Result<Sour
             .map_err(|error| SkillManagerError::io(".", error))?
             .join(expanded)
     };
-    let normalized = portable_canonicalize(absolute);
+    let normalized = portable_canonicalize(&absolute);
     let source_mode = mode.unwrap_or_else(|| {
         if normalized.join("SKILL.md").is_file() {
             SourceMode::Single
@@ -734,14 +749,271 @@ pub fn source_from_reference(raw: &str, mode: Option<SourceMode>) -> Result<Sour
         repo: None,
         r#ref: None,
         repo_path: None,
+        alternate: None,
         extra: IndexMap::new(),
     };
     entry.id = derive_source_id(&entry);
     Ok(entry)
 }
 
-fn portable_canonicalize(path: PathBuf) -> PathBuf {
-    let canonical = path.canonicalize().unwrap_or(path);
+/// Parse and normalize a reference into a location without changing source metadata.
+///
+/// `mode` is supplied so local location changes never infer or change a source's
+/// collection/single layout based on whether the path currently exists.
+///
+/// # Errors
+///
+/// Returns an error when a reference cannot be normalized safely.
+pub fn location_from_reference(raw: &str, mode: SourceMode) -> Result<SourceLocation> {
+    let entry = source_from_reference(raw, Some(mode))?;
+    source_location(&entry)
+}
+
+/// Return the active location stored in a flattened source entry.
+///
+/// # Errors
+///
+/// Returns an error when fields for the active source type are missing or
+/// forbidden fields for the other type are present.
+pub fn source_location(source: &SourceEntry) -> Result<SourceLocation> {
+    normalize_location(raw_source_location(source)?)
+}
+
+fn raw_source_location(source: &SourceEntry) -> Result<SourceLocation> {
+    match source.source_type {
+        SourceType::Local => {
+            if source.owner.is_some()
+                || source.repo.is_some()
+                || source.r#ref.is_some()
+                || source.repo_path.is_some()
+            {
+                return Err(SkillManagerError::InvalidInput(format!(
+                    "local source '{}' forbids GitHub location fields",
+                    source.name
+                )));
+            }
+            let path = source.path.clone().ok_or_else(|| {
+                SkillManagerError::InvalidInput(format!(
+                    "local source '{}' requires path",
+                    source.name
+                ))
+            })?;
+            Ok(SourceLocation::Local { path })
+        }
+        SourceType::GitHub => {
+            if source.path.is_some() {
+                return Err(SkillManagerError::InvalidInput(format!(
+                    "GitHub source '{}' forbids path",
+                    source.name
+                )));
+            }
+            let owner = source.owner.clone().ok_or_else(|| {
+                SkillManagerError::InvalidInput(format!(
+                    "GitHub source '{}' requires owner",
+                    source.name
+                ))
+            })?;
+            let repo = source.repo.clone().ok_or_else(|| {
+                SkillManagerError::InvalidInput(format!(
+                    "GitHub source '{}' requires repo",
+                    source.name
+                ))
+            })?;
+            Ok(SourceLocation::GitHub {
+                owner,
+                repo,
+                r#ref: source.r#ref.clone(),
+                repo_path: source.repo_path.clone(),
+            })
+        }
+    }
+}
+
+fn normalize_location(location: SourceLocation) -> Result<SourceLocation> {
+    match location {
+        SourceLocation::Local { path } => {
+            if path.as_os_str().is_empty() || !path.is_absolute() {
+                return Err(SkillManagerError::InvalidInput(
+                    "local source location must be an absolute non-blank path".into(),
+                ));
+            }
+            Ok(SourceLocation::Local {
+                path: portable_canonicalize(&path),
+            })
+        }
+        SourceLocation::GitHub {
+            owner,
+            repo,
+            r#ref,
+            repo_path,
+        } => Ok(SourceLocation::GitHub {
+            owner,
+            repo,
+            r#ref,
+            repo_path: repo_path
+                .map(|path| normalize_repo_path(&path))
+                .transpose()?,
+        }),
+    }
+}
+
+fn normalize_repo_path(path: &str) -> Result<String> {
+    let normalized = path.replace('\\', "/");
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.ends_with('/')
+        || normalized
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(SkillManagerError::InvalidInput(
+            "GitHub repository path must be a normalized relative path".into(),
+        ));
+    }
+    Ok(normalized)
+}
+
+/// Replace only the flattened active-location fields of a source.
+pub fn set_source_location(source: &mut SourceEntry, location: &SourceLocation) {
+    source.path = None;
+    source.owner = None;
+    source.repo = None;
+    source.r#ref = None;
+    source.repo_path = None;
+    match location {
+        SourceLocation::Local { path } => {
+            source.source_type = SourceType::Local;
+            source.path = Some(path.clone());
+        }
+        SourceLocation::GitHub {
+            owner,
+            repo,
+            r#ref,
+            repo_path,
+        } => {
+            source.source_type = SourceType::GitHub;
+            source.owner = Some(owner.clone());
+            source.repo = Some(repo.clone());
+            source.r#ref.clone_from(r#ref);
+            source.repo_path.clone_from(repo_path);
+        }
+    }
+}
+
+/// Compare two locations by their normalized platform-aware identities.
+#[must_use]
+pub fn locations_equal(left: &SourceLocation, right: &SourceLocation) -> bool {
+    location_identity(left) == location_identity(right)
+}
+
+/// Canonical identity used for collision and equality checks.
+#[must_use]
+pub fn location_identity(location: &SourceLocation) -> String {
+    match location {
+        SourceLocation::Local { path } => {
+            let normalized = portable_canonicalize(path);
+            let value = normalized.to_string_lossy().replace('\\', "/");
+            #[cfg(windows)]
+            let value = value.to_lowercase();
+            format!("local\0{value}")
+        }
+        SourceLocation::GitHub {
+            owner,
+            repo,
+            r#ref,
+            repo_path,
+        } => {
+            let normalized_repo_path = repo_path
+                .as_deref()
+                .map(|path| path.replace('\\', "/"))
+                .unwrap_or_default();
+            format!(
+                "github\0{}\0{}\0{}\0{}",
+                owner.to_ascii_lowercase(),
+                repo.to_ascii_lowercase(),
+                r#ref.as_deref().unwrap_or_default(),
+                normalized_repo_path
+            )
+        }
+    }
+}
+
+/// Human-safe canonical reference for a standalone location.
+#[must_use]
+pub fn location_reference(location: &SourceLocation) -> String {
+    match location {
+        SourceLocation::Local { path } => path.display().to_string(),
+        SourceLocation::GitHub {
+            owner,
+            repo,
+            r#ref,
+            repo_path,
+        } => {
+            let mut value = format!("{owner}/{repo}");
+            if let Some(reference) = r#ref {
+                value.push(':');
+                value.push_str(reference);
+            }
+            if let Some(path) = repo_path {
+                value.push('/');
+                value.push_str(path);
+            }
+            value
+        }
+    }
+}
+
+fn validate_location(location: &SourceLocation, source_name: &str) -> Result<()> {
+    match location {
+        SourceLocation::Local { path } => {
+            if path.as_os_str().is_empty() || !path.is_absolute() {
+                return Err(SkillManagerError::InvalidInput(format!(
+                    "local location for source '{source_name}' must be an absolute non-blank path"
+                )));
+            }
+            if path.to_string_lossy().contains('\0') {
+                return Err(SkillManagerError::InvalidInput(format!(
+                    "local location for source '{source_name}' contains a NUL byte"
+                )));
+            }
+        }
+        SourceLocation::GitHub {
+            owner,
+            repo,
+            r#ref,
+            repo_path,
+        } => {
+            if !valid_github_segment(owner) || !valid_github_segment(repo) {
+                return Err(SkillManagerError::InvalidInput(format!(
+                    "GitHub location for source '{source_name}' requires a valid owner and repo"
+                )));
+            }
+            if r#ref.as_ref().is_some_and(|value| value.trim().is_empty()) {
+                return Err(SkillManagerError::InvalidInput(format!(
+                    "GitHub location for source '{source_name}' has a blank ref"
+                )));
+            }
+            if let Some(path) = repo_path {
+                validate_github_repo_path(path, source_name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_github_repo_path(path: &str, source_name: &str) -> Result<()> {
+    if normalize_repo_path(path).is_err() || path.contains('\\') {
+        return Err(SkillManagerError::InvalidInput(format!(
+            "GitHub repository path for source '{source_name}' must be a normalized relative path"
+        )));
+    }
+    Ok(())
+}
+
+fn portable_canonicalize(path: &Path) -> PathBuf {
+    let canonical = path
+        .canonicalize()
+        .unwrap_or_else(|_| lexically_normalized(path));
     #[cfg(windows)]
     {
         let wide: Vec<u16> = canonical.as_os_str().encode_wide().collect();
@@ -755,6 +1027,22 @@ fn portable_canonicalize(path: PathBuf) -> PathBuf {
         }
     }
     canonical
+}
+
+fn lexically_normalized(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _removed = normalized.pop();
+            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    normalized
 }
 
 fn expand_home(raw: &str) -> Result<PathBuf> {
@@ -853,6 +1141,21 @@ fn valid_github_segment(value: &str) -> bool {
 /// Derive the Python-compatible canonical source ID.
 #[must_use]
 pub fn derive_source_id(source: &SourceEntry) -> String {
+    source_id_from_bytes(&canonical_source_identity_bytes(source))
+}
+
+/// Derive a deterministic fallback ID when the canonical ID remains occupied
+/// by a source that has since moved to another location.
+#[must_use]
+pub fn derive_salted_source_id(source: &SourceEntry, salt: u64) -> String {
+    let mut bytes = canonical_source_identity_bytes(source);
+    bytes.push(0);
+    bytes.extend_from_slice(b"skill-manager-source-id-salt=");
+    bytes.extend_from_slice(salt.to_string().as_bytes());
+    source_id_from_bytes(&bytes)
+}
+
+fn canonical_source_identity_bytes(source: &SourceEntry) -> Vec<u8> {
     let value = json!({
         "mode": source.mode,
         "owner": source.owner,
@@ -863,8 +1166,11 @@ pub fn derive_source_id(source: &SourceEntry) -> String {
         "type": source.source_type,
     });
     let serialized = serde_json::to_string(&value).unwrap_or_default();
-    let ascii = ensure_ascii(&serialized);
-    let digest = Sha256::digest(ascii.as_bytes());
+    ensure_ascii(&serialized).into_bytes()
+}
+
+fn source_id_from_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
     format!("src_{}", &hex::encode(digest)[..12])
 }
 
@@ -907,16 +1213,17 @@ fn push_unicode_escape(output: &mut String, code: u32) {
 pub fn find_source_index(config: &Config, selector: &str) -> Result<Option<usize>> {
     let selector_folded = fold(selector);
     let direct = config.sources.iter().position(|source| {
-        fold(&source.id) == selector_folded
-            || fold(&source.name) == selector_folded
-            || source
-                .path
-                .as_ref()
-                .is_some_and(|path| fold(&path.to_string_lossy()) == selector_folded)
-            || fold(&source_reference(source)) == selector_folded
+        fold(&source.id) == selector_folded || fold(&source.name) == selector_folded
     });
     if direct.is_some() {
         return Ok(direct);
+    }
+    if let Ok(location) = location_from_reference(selector, SourceMode::Collection)
+        && let Some(index) = config.sources.iter().position(|source| {
+            source_location(source).is_ok_and(|active| locations_equal(&active, &location))
+        })
+    {
+        return Ok(Some(index));
     }
     let mut labels = config
         .sources
@@ -1078,11 +1385,12 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        BuiltinTargetSettings, Config, ConfigRepository, FileConfigRepository, derive_source_id,
-        ensure_ascii, find_source_index, is_builtin_name, migrate_v0, resolved_targets,
-        source_from_reference, source_reference, validate_config, validate_source,
+        BuiltinTargetSettings, Config, ConfigRepository, FileConfigRepository,
+        derive_salted_source_id, derive_source_id, ensure_ascii, find_source_index,
+        is_builtin_name, locations_equal, migrate_v0, resolved_targets, source_from_reference,
+        source_location, source_reference, validate_config, validate_source,
     };
-    use crate::domain::{SourceEntry, SourceMode, SourceType, TargetEntry};
+    use crate::domain::{SourceEntry, SourceLocation, SourceMode, SourceType, TargetEntry};
 
     #[test]
     fn source_id_is_stable() {
@@ -1091,6 +1399,21 @@ mod tests {
         assert_eq!(source.id, derive_source_id(&source));
         assert!(source.id.starts_with("src_"));
         assert_eq!(source.id.len(), 16);
+    }
+
+    #[test]
+    fn salted_source_id_uses_canonical_identity_bytes_and_decimal_salt() {
+        let source = source_from_reference("owner/repo", Some(SourceMode::Collection))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(derive_salted_source_id(&source, 1), "src_e5e18bfaf9b8");
+        assert_eq!(
+            derive_salted_source_id(&source, 1),
+            derive_salted_source_id(&source, 1)
+        );
+        assert_ne!(
+            derive_salted_source_id(&source, 1),
+            derive_salted_source_id(&source, 2)
+        );
     }
 
     #[test]
@@ -1267,7 +1590,7 @@ mod tests {
         for selector in [
             shorthand.id.as_str(),
             shorthand.name.as_str(),
-            "OWNER/REPO:FEATURE/TEAM/SKILLS",
+            "OWNER/REPO:feature/team/skills",
         ] {
             assert_eq!(
                 find_source_index(&config, selector)
@@ -1730,6 +2053,7 @@ mod tests {
             repo: None,
             r#ref: None,
             repo_path: None,
+            alternate: None,
             extra: IndexMap::new(),
         };
         assert!(validate_source(&base).is_err());
@@ -1778,5 +2102,200 @@ mod tests {
                     .exists()
             );
         }
+    }
+
+    #[test]
+    fn alternate_locations_are_closed_typed_objects_and_round_trip_in_schema_one() {
+        for invalid in [
+            json!({"type":"local","path":"C:\\skills","owner":"forbidden"}),
+            json!({"type":"github","owner":"o","repo":"r","path":"forbidden"}),
+            json!({"type":"github","owner":"o","repo":"r","unknown":true}),
+            json!({"type":"local"}),
+            json!({"type":"github","owner":"o"}),
+        ] {
+            assert!(
+                serde_json::from_value::<SourceLocation>(invalid.clone()).is_err(),
+                "{invalid}"
+            );
+        }
+
+        let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let mut source = source_from_reference("owner/repo:main/skills", None)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        source
+            .extra
+            .insert("source_extension".into(), json!("kept"));
+        source.alternate = Some(SourceLocation::Local {
+            path: root.path().to_path_buf(),
+        });
+        let config = Config {
+            sources: vec![source],
+            extra: IndexMap::from([("root_extension".into(), json!(42))]),
+            ..Config::default()
+        };
+        let value = serde_json::to_value(&config).unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["sources"][0]["alternate"]["type"], "local");
+        let decoded: Config =
+            serde_json::from_value(value).unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(decoded.extra["root_extension"], 42);
+        assert_eq!(decoded.sources[0].extra["source_extension"], "kept");
+    }
+
+    #[test]
+    fn persistence_normalizes_local_paths_and_github_repo_path_separators() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(root.path());
+        let config_path = root.path().join(".skill-manager.config.json");
+        let mut source = source_from_reference("owner/repo:main/Skills", None)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        source.repo_path = Some(r"Skills\Team".into());
+        source.alternate = Some(SourceLocation::Local {
+            path: root.path().join("one").join("..").join("two"),
+        });
+        repository
+            .save(
+                &config_path,
+                &Config {
+                    sources: vec![source],
+                    ..Config::default()
+                },
+            )
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&config_path).unwrap_or_else(|error| unreachable!("{error}")),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(persisted["sources"][0]["repo_path"], json!("Skills/Team"));
+        assert_eq!(
+            std::path::Path::new(
+                persisted["sources"][0]["alternate"]["path"]
+                    .as_str()
+                    .unwrap_or_else(|| unreachable!("path"))
+            ),
+            root.path().join("two")
+        );
+
+        assert!(locations_equal(
+            &SourceLocation::GitHub {
+                owner: "OWNER".into(),
+                repo: "Repo".into(),
+                r#ref: Some("Main".into()),
+                repo_path: Some(r"Skills\Team".into()),
+            },
+            &SourceLocation::GitHub {
+                owner: "owner".into(),
+                repo: "repo".into(),
+                r#ref: Some("Main".into()),
+                repo_path: Some("Skills/Team".into()),
+            }
+        ));
+    }
+
+    #[test]
+    fn normalized_equivalent_persisted_pairs_are_rejected_on_load() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let location = root.path().join("skills");
+        let config_path = root.path().join(".skill-manager.config.json");
+        let value = json!({
+            "schema_version": 1,
+            "sources": [{
+                "id": "src_test",
+                "type": "local",
+                "mode": "collection",
+                "name": "test",
+                "label": "Test",
+                "path": location.join("child").join(".."),
+                "alternate": {
+                    "type": "local",
+                    "path": location
+                }
+            }]
+        });
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&value).unwrap_or_else(|error| unreachable!("{error}")),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(FileConfigRepository::new(root.path()).load(false).is_err());
+    }
+
+    #[test]
+    fn repository_load_and_save_reject_equal_active_and_alternate_locations() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(root.path());
+        let config_path = root.path().join(".skill-manager.config.json");
+        let location = root.path().join("skills");
+        let mut source = source_from_reference(&location.to_string_lossy(), None)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        source.alternate = Some(SourceLocation::Local {
+            path: location.clone(),
+        });
+        let config = Config {
+            sources: vec![source],
+            ..Config::default()
+        };
+
+        assert!(repository.save(&config_path, &config).is_err());
+        assert!(
+            !config_path.exists(),
+            "rejected saves must not create a file"
+        );
+
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&config).unwrap_or_else(|error| unreachable!("{error}")),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(repository.load(false).is_err());
+    }
+
+    #[test]
+    fn local_normalization_clamps_excess_parent_components_at_the_root() {
+        let temporary = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let filesystem_root = temporary
+            .path()
+            .ancestors()
+            .last()
+            .unwrap_or_else(|| unreachable!("absolute temporary path has a root"));
+        let mut input = temporary.path().to_path_buf();
+        for _ in 0..64 {
+            input.push("..");
+        }
+        input.push("clamped-location-that-does-not-exist");
+
+        let source = source_from_reference(&input.to_string_lossy(), None)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let location = source_location(&source).unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            location,
+            SourceLocation::Local {
+                path: filesystem_root.join("clamped-location-that-does-not-exist"),
+            }
+        );
+    }
+
+    #[test]
+    fn own_location_duplicates_are_invalid_but_legacy_cross_source_collisions_load() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let mut first = source_from_reference(&root.path().to_string_lossy(), None)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        first.name = "first".into();
+        first.alternate =
+            Some(source_location(&first).unwrap_or_else(|error| unreachable!("{error}")));
+        assert!(validate_source(&first).is_err());
+
+        first.alternate = None;
+        let mut second = first.clone();
+        second.id = "different-id".into();
+        second.name = "second".into();
+        let config = Config {
+            sources: vec![first, second],
+            ..Config::default()
+        };
+        assert!(
+            validate_config(&config, &root.path().join("config.json")).is_ok(),
+            "pre-existing cross-source collisions remain loadable"
+        );
     }
 }

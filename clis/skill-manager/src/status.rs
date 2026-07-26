@@ -14,6 +14,8 @@ pub struct SourceRow {
     pub label: String,
     /// Canonical local or GitHub location.
     pub location: String,
+    /// Optional inactive location.
+    pub alternate: Option<String>,
 }
 
 /// One skill and its state for every selected target.
@@ -34,15 +36,27 @@ pub fn source_table(rows: &[SourceRow]) -> Vec<String> {
     for row in rows {
         widths[0] = widths[0].max(display_width(&row.name));
         widths[1] = widths[1].max(display_width(&parenthesized_label(&row.label)));
+        if row.alternate.is_some() {
+            widths[0] = widths[0].max(display_width("  alternate"));
+            widths[1] = widths[1].max(display_width("(inactive)"));
+        }
     }
 
     rows.iter()
-        .map(|row| {
-            join_columns(&[
+        .flat_map(|row| {
+            let mut rendered = vec![join_columns(&[
                 padded(&row.name, widths[0]),
                 padded(&parenthesized_label(&row.label), widths[1]),
                 row.location.clone(),
-            ])
+            ])];
+            if let Some(alternate) = &row.alternate {
+                rendered.push(join_columns(&[
+                    padded("  alternate", widths[0]),
+                    padded("(inactive)", widths[1]),
+                    alternate.clone(),
+                ]));
+            }
+            rendered
         })
         .collect()
 }
@@ -202,11 +216,13 @@ mod tests {
                 name: "短い".into(),
                 label: "Wide".into(),
                 location: "/a path/with spaces".into(),
+                alternate: None,
             },
             SourceRow {
                 name: "long-source".into(),
                 label: "Longer label".into(),
                 location: "owner/repo:main/skills".into(),
+                alternate: None,
             },
         ]);
 
@@ -215,6 +231,33 @@ mod tests {
             [
                 "短い         (Wide)          /a path/with spaces",
                 "long-source  (Longer label)  owner/repo:main/skills",
+            ]
+        );
+    }
+
+    #[test]
+    fn source_alternate_rows_align_by_unicode_display_width() {
+        let lines = source_table(&[
+            SourceRow {
+                name: "短い".into(),
+                label: "技能".into(),
+                location: "/active".into(),
+                alternate: Some("所有者/倉庫".into()),
+            },
+            SourceRow {
+                name: "long-source".into(),
+                label: "Label".into(),
+                location: "owner/repo".into(),
+                alternate: None,
+            },
+        ]);
+
+        assert_eq!(
+            lines,
+            [
+                "短い         (技能)      /active",
+                "  alternate  (inactive)  所有者/倉庫",
+                "long-source  (Label)     owner/repo",
             ]
         );
     }

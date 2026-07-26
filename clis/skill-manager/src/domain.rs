@@ -33,8 +33,35 @@ pub enum SourceMode {
     Single,
 }
 
+/// One local or GitHub location associated with a source.
+///
+/// The nested representation is deliberately closed even though [`SourceEntry`]
+/// preserves unknown source-wide fields for forward compatibility.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+pub enum SourceLocation {
+    /// A local filesystem location.
+    Local {
+        /// Absolute local source path.
+        path: PathBuf,
+    },
+    /// A GitHub repository location.
+    GitHub {
+        /// GitHub owner.
+        owner: String,
+        /// GitHub repository.
+        repo: String,
+        /// Git ref; omitted to resolve the default branch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#ref: Option<String>,
+        /// Path within the GitHub repository.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo_path: Option<String>,
+    },
+}
+
 /// Persisted source definition.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SourceEntry {
     /// Stable identifier.
     #[serde(default)]
@@ -72,6 +99,9 @@ pub struct SourceEntry {
     /// Path within the GitHub repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_path: Option<String>,
+    /// Inactive location that can be exchanged with the active location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alternate: Option<SourceLocation>,
     /// Unknown fields preserved across configuration updates.
     #[serde(flatten)]
     pub extra: IndexMap<String, serde_json::Value>,

@@ -21,7 +21,15 @@ Use `--dry-run` before a mutating command to emit its plan without changing conf
 
 `status` is the default command and has `ls` and `list` aliases. `load` creates or replaces deployments, while `update` only changes skills already present in a target. `copy` copies one source to an arbitrary destination. `remove` removes deployments and needs `--yes` for unattended use. `resolve` records a collision preference by excluding the losing source's duplicate.
 
-`source add|remove|list|update` manages sources. `target add|list|enable|disable|remove|set-path` manages deployment targets. See [the command reference](docs/cli.md) for the full contract.
+`source add|remove|list|update|locate|alternate|swap` manages sources. For example, pair a development checkout with its normal remote and switch without retyping either location:
+
+```console
+$ skill-manager source alternate personal sernst/skills
+$ skill-manager source swap personal
+$ skill-manager source swap personal
+```
+
+`source locate` also has `relocate`, `move`, and `mv` aliases, and `source update --location` combines relocation with metadata changes. `target add|list|enable|disable|remove|set-path` manages deployment targets. See [the command reference](docs/cli.md) for the full contract.
 
 ## Configuration and safety
 

@@ -252,6 +252,13 @@ pub enum SourceAction {
     List,
     /// Update source metadata.
     Update(SourceUpdateArgs),
+    /// Change the active source location.
+    #[command(visible_aliases = ["relocate", "move", "mv"])]
+    Locate(SourceLocateArgs),
+    /// Set, replace, or clear the inactive source location.
+    Alternate(SourceAlternateArgs),
+    /// Exchange the active and inactive source locations.
+    Swap(SourceSwapArgs),
 }
 
 /// Arguments for `source add`.
@@ -304,6 +311,9 @@ pub struct SourceUpdateArgs {
     /// Replacement unique name.
     #[arg(long)]
     pub name: Option<String>,
+    /// Replacement active local path or GitHub reference.
+    #[arg(long, value_name = "LOCATION")]
+    pub location: Option<String>,
     /// Replacement human label.
     #[arg(long)]
     pub label: Option<String>,
@@ -316,6 +326,35 @@ pub struct SourceUpdateArgs {
     /// Replacement cache lifetime.
     #[arg(long, value_name = "HOURS")]
     pub cache_ttl_hours: Option<i64>,
+}
+
+/// Arguments for `source locate`.
+#[derive(Clone, Debug, Args)]
+pub struct SourceLocateArgs {
+    /// Source name, ID, label, path, or GitHub reference.
+    pub source: String,
+    /// Replacement active local path or GitHub reference.
+    pub location: String,
+}
+
+/// Arguments for `source alternate`.
+#[derive(Clone, Debug, Args)]
+pub struct SourceAlternateArgs {
+    /// Source name, ID, label, path, or GitHub reference.
+    pub source: String,
+    /// Replacement inactive local path or GitHub reference.
+    #[arg(conflicts_with = "clear")]
+    pub location: Option<String>,
+    /// Remove the inactive location.
+    #[arg(long, conflicts_with = "location")]
+    pub clear: bool,
+}
+
+/// Arguments for `source swap`.
+#[derive(Clone, Debug, Args)]
+pub struct SourceSwapArgs {
+    /// Source name, ID, label, path, or GitHub reference.
+    pub source: String,
 }
 
 /// Target-management command wrapper.

@@ -32,6 +32,15 @@ pub struct CacheMetadata {
     pub fetched_at: DateTime<Utc>,
     /// Exact branch, tag, or commit downloaded.
     pub resolved_ref: String,
+    /// Normalized GitHub owner associated with the cached content.
+    pub owner: String,
+    /// Normalized GitHub repository associated with the cached content.
+    pub repo: String,
+    /// Configured ref, or null when the default branch was requested.
+    #[serde(rename = "ref")]
+    pub source_ref: Option<String>,
+    /// Configured repository subpath.
+    pub repo_path: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -324,7 +333,7 @@ fn materialize_github<R: ConfigRepository, G: GitHubTransport, C: Clock>(
     let swap_paths = cache_swap_paths(&source_cache)?;
     if dry_run {
         if !swap_paths.journal.exists()
-            && cache_can_be_reused(clock, &content, &metadata_path, ttl, refresh)
+            && cache_can_be_reused(clock, &content, &metadata_path, source, ttl, refresh)
         {
             return resolved_cached(source, &content);
         }
@@ -361,7 +370,7 @@ fn materialize_github<R: ConfigRepository, G: GitHubTransport, C: Clock>(
     recover_cache_swap(&source_cache, &swap_paths.backup, &swap_paths.journal)?;
     // Recovery runs before reuse, and another process may have refreshed while
     // this process waited for the source lock.
-    if cache_can_be_reused(clock, &content, &metadata_path, ttl, refresh) {
+    if cache_can_be_reused(clock, &content, &metadata_path, source, ttl, refresh) {
         return resolved_cached(source, &content);
     }
     fs::create_dir_all(repository.cache_root())
@@ -399,6 +408,10 @@ fn materialize_github<R: ConfigRepository, G: GitHubTransport, C: Clock>(
         &CacheMetadata {
             fetched_at: clock.now(),
             resolved_ref: reference,
+            owner: owner.to_ascii_lowercase(),
+            repo: repo.to_ascii_lowercase(),
+            source_ref: source.r#ref.clone(),
+            repo_path: source.repo_path.clone(),
         },
     )?;
     swap_cache(&source_cache, &staged_cache, staging.path())?;
@@ -409,15 +422,33 @@ fn cache_can_be_reused<C: Clock>(
     clock: &C,
     content: &Path,
     metadata_path: &Path,
+    source: &SourceEntry,
     ttl: i64,
     refresh: bool,
 ) -> bool {
     !refresh
         && ttl > 0
         && content.is_dir()
-        && read_metadata(metadata_path)
-            .as_ref()
-            .is_some_and(|value| cache_is_fresh(clock, value, ttl))
+        && read_metadata(metadata_path).as_ref().is_some_and(|value| {
+            cache_is_fresh(clock, value, ttl) && cache_identity_matches(value, source)
+        })
+}
+
+fn cache_identity_matches(metadata: &CacheMetadata, source: &SourceEntry) -> bool {
+    metadata.owner
+        == source
+            .owner
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+        && metadata.repo
+            == source
+                .repo
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+        && metadata.source_ref == source.r#ref
+        && metadata.repo_path == source.repo_path
 }
 
 fn cache_is_fresh<C: Clock>(clock: &C, metadata: &CacheMetadata, ttl: i64) -> bool {
@@ -962,6 +993,10 @@ mod tests {
         let metadata = CacheMetadata {
             fetched_at,
             resolved_ref: "abc123".into(),
+            owner: "owner".into(),
+            repo: "repo".into(),
+            source_ref: None,
+            repo_path: None,
         };
         write_metadata(&path, &metadata).unwrap_or_else(|error| unreachable!("{error}"));
         let decoded = read_metadata(&path).unwrap_or_else(|| unreachable!("valid metadata"));

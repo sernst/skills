@@ -8,14 +8,20 @@ use serde_json::{Value, json};
 
 use crate::cache::{GitHubTransport, materialize_source};
 use crate::cli::{
-    Command, CopyArgs, RemoveArgs, ResolveArgs, SourceAction, SourceAddArgs, SourceModeArg,
-    SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction, TargetSelection,
+    Command, CopyArgs, RemoveArgs, ResolveArgs, SourceAction, SourceAddArgs, SourceAlternateArgs,
+    SourceLocateArgs, SourceModeArg, SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs,
+    TargetAction, TargetSelection,
 };
 use crate::config::{
-    Config, ConfigRepository, FileConfigRepository, find_source_index, fold, is_builtin_name,
-    manager_home, resolved_targets, source_from_reference, source_reference,
+    Config, ConfigRepository, FileConfigRepository, derive_salted_source_id, find_source_index,
+    fold, is_builtin_name, location_from_reference, location_identity, location_reference,
+    locations_equal, manager_home, resolved_targets, set_source_location, source_from_reference,
+    source_location, source_reference,
 };
-use crate::domain::{ResolvedSource, SkillCandidate, SourceEntry, SourceMode, Target, TargetEntry};
+use crate::domain::{
+    ResolvedSource, SkillCandidate, SourceEntry, SourceLocation, SourceMode, SourceType, Target,
+    TargetEntry,
+};
 use crate::error::{Result, SkillManagerError};
 use crate::event::{Level, Reporter};
 use crate::prompt::Prompt;
@@ -143,12 +149,7 @@ where
                     },
                     Ok,
                 )?;
-                let index = find_source_index(config, &selector)?.ok_or_else(|| {
-                    SkillManagerError::NotFound {
-                        kind: "source",
-                        reference: selector.clone(),
-                    }
-                })?;
+                let index = source_selector_index(config, &selector)?;
                 let removed = config.sources.remove(index);
                 self.repository.save(active_path, config)?;
                 self.reporter.human(&format!(
@@ -160,13 +161,20 @@ where
                     .event("source.removed", Level::Info, source_data(&removed))
             }
             SourceAction::List => {
+                let rows = config
+                    .sources
+                    .iter()
+                    .map(|source| SourceRow {
+                        name: source.name.clone(),
+                        label: source.label.clone(),
+                        location: source_reference(source),
+                        alternate: source.alternate.as_ref().map(location_reference),
+                    })
+                    .collect::<Vec<_>>();
+                for line in source_table(&rows) {
+                    self.reporter.human(&line)?;
+                }
                 for source in &config.sources {
-                    self.reporter.human(&format!(
-                        "{}\t{}\t{}",
-                        source.name,
-                        source.label,
-                        source_reference(source)
-                    ))?;
                     self.reporter
                         .event("source.listed", Level::Info, source_data(source))?;
                 }
@@ -177,6 +185,9 @@ where
                 )
             }
             SourceAction::Update(args) => self.source_update(config, active_path, args),
+            SourceAction::Locate(args) => self.source_locate(config, active_path, &args),
+            SourceAction::Alternate(args) => self.source_alternate(config, active_path, args),
+            SourceAction::Swap(args) => self.source_swap(config, active_path, &args),
         }
     }
 
@@ -204,11 +215,22 @@ where
             SourceModeArg::Single => SourceMode::Single,
         });
         let mut source = source_from_reference(&reference, mode)?;
-        if config.sources.iter().any(|entry| entry.id == source.id) {
+        let new_location = source_location(&source)?;
+        if let Some(existing) = find_location_owner(config, &new_location, None) {
             return Err(SkillManagerError::InvalidInput(format!(
-                "source is already configured: {}",
-                source_reference(&source)
+                "location is already configured by source '{}': {}",
+                existing.name,
+                location_reference(&new_location)
             )));
+        }
+        if config.sources.iter().any(|entry| entry.id == source.id) {
+            for salt in 1_u64.. {
+                let candidate = derive_salted_source_id(&source, salt);
+                if config.sources.iter().all(|entry| entry.id != candidate) {
+                    source.id = candidate;
+                    break;
+                }
+            }
         }
         source.name = match args.name.or(args.source_name) {
             Some(name) if !name.trim().is_empty() => name,
@@ -266,12 +288,7 @@ where
                 "cache TTL must be zero or positive".into(),
             ));
         }
-        let index = find_source_index(config, &args.source)?.ok_or_else(|| {
-            SkillManagerError::NotFound {
-                kind: "source",
-                reference: args.source.clone(),
-            }
-        })?;
+        let index = source_selector_index(config, &args.source)?;
         if let Some(name) = &args.name {
             if name.trim().is_empty() {
                 return Err(SkillManagerError::InvalidInput(
@@ -289,32 +306,192 @@ where
                 )));
             }
         }
-        let source = config.sources.get_mut(index).ok_or_else(|| {
+        let previous = config.sources.get(index).cloned().ok_or_else(|| {
             SkillManagerError::InvalidInput("source index changed unexpectedly".into())
         })?;
+        let mut proposed = previous.clone();
+        if let Some(location) = &args.location {
+            let replacement = location_from_reference(location, proposed.mode)?;
+            let active = source_location(&proposed)?;
+            if !locations_equal(&active, &replacement) {
+                if proposed
+                    .alternate
+                    .as_ref()
+                    .is_some_and(|alternate| locations_equal(alternate, &replacement))
+                {
+                    return Err(SkillManagerError::InvalidInput(
+                        "requested location is the saved alternate; use 'source swap'".into(),
+                    ));
+                }
+                reject_location_collision(config, &replacement, index)?;
+                set_source_location(&mut proposed, &replacement);
+            }
+        }
         if let Some(name) = args.name {
-            source.name = name;
+            proposed.name = name;
         }
         if let Some(label) = args.label {
-            source.label = label;
+            proposed.label = label;
         }
         if args.clear_exclude {
-            source.exclude.clear();
+            proposed.exclude.clear();
         }
         for pattern in normalized_patterns(args.exclude) {
-            if !source.exclude.iter().any(|existing| existing == &pattern) {
-                source.exclude.push(pattern);
+            if !proposed.exclude.iter().any(|existing| existing == &pattern) {
+                proposed.exclude.push(pattern);
             }
         }
         if let Some(ttl) = args.cache_ttl_hours {
-            source.cache_ttl_hours = Some(ttl);
+            proposed.cache_ttl_hours = Some(ttl);
         }
-        let changed = source.clone();
+        let changed = proposed != previous;
+        if changed {
+            config.sources[index] = proposed.clone();
+            self.repository.save(active_path, config)?;
+        }
+        self.reporter
+            .human(&format!("Updated source {}", proposed.name))?;
+        self.reporter.event(
+            "source.updated",
+            Level::Info,
+            source_change_data(&proposed, &previous, changed),
+        )
+    }
+
+    fn source_locate(
+        &mut self,
+        config: &mut Config,
+        active_path: &Path,
+        args: &SourceLocateArgs,
+    ) -> Result<()> {
+        let index = source_selector_index(config, &args.source)?;
+        let previous = config.sources[index].clone();
+        let replacement = location_from_reference(&args.location, previous.mode)?;
+        let active = source_location(&previous)?;
+        if locations_equal(&active, &replacement) {
+            return self.reporter.event(
+                "source.location-set",
+                Level::Info,
+                source_change_data(&previous, &previous, false),
+            );
+        }
+        if previous
+            .alternate
+            .as_ref()
+            .is_some_and(|alternate| locations_equal(alternate, &replacement))
+        {
+            return Err(SkillManagerError::InvalidInput(
+                "requested location is the saved alternate; use 'source swap'".into(),
+            ));
+        }
+        reject_location_collision(config, &replacement, index)?;
+        let mut proposed = previous.clone();
+        set_source_location(&mut proposed, &replacement);
+        config.sources[index] = proposed.clone();
         self.repository.save(active_path, config)?;
+        self.reporter.human(&format!(
+            "Located source {} at {}",
+            proposed.name,
+            source_reference(&proposed)
+        ))?;
+        self.reporter.event(
+            "source.location-set",
+            Level::Info,
+            source_change_data(&proposed, &previous, true),
+        )
+    }
+
+    fn source_alternate(
+        &mut self,
+        config: &mut Config,
+        active_path: &Path,
+        args: SourceAlternateArgs,
+    ) -> Result<()> {
+        let index = source_selector_index(config, &args.source)?;
+        let previous = config.sources[index].clone();
+        let replacement = match (args.location, args.clear) {
+            (Some(location), false) => Some(location_from_reference(&location, previous.mode)?),
+            (None, true) => None,
+            _ => {
+                return Err(SkillManagerError::InvalidInput(
+                    "source alternate requires exactly one of LOCATION or --clear".into(),
+                ));
+            }
+        };
+        let unchanged = match (&replacement, &previous.alternate) {
+            (Some(replacement), Some(existing)) => locations_equal(replacement, existing),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
+            let event = if replacement.is_some() {
+                "source.alternate-set"
+            } else {
+                "source.alternate-cleared"
+            };
+            return self.reporter.event(
+                event,
+                Level::Info,
+                source_change_data(&previous, &previous, false),
+            );
+        }
+        if let Some(location) = &replacement {
+            let active = source_location(&previous)?;
+            if locations_equal(&active, location) {
+                return Err(SkillManagerError::InvalidInput(
+                    "alternate location must differ from the active location".into(),
+                ));
+            }
+            reject_location_collision(config, location, index)?;
+        }
+        let mut proposed = previous.clone();
+        proposed.alternate = replacement;
+        config.sources[index] = proposed.clone();
+        self.repository.save(active_path, config)?;
+        let event = if proposed.alternate.is_some() {
+            "source.alternate-set"
+        } else {
+            "source.alternate-cleared"
+        };
         self.reporter
-            .human(&format!("Updated source {}", changed.name))?;
-        self.reporter
-            .event("source.updated", Level::Info, source_data(&changed))
+            .human(&format!("Updated alternate for source {}", proposed.name))?;
+        self.reporter.event(
+            event,
+            Level::Info,
+            source_change_data(&proposed, &previous, true),
+        )
+    }
+
+    fn source_swap(
+        &mut self,
+        config: &mut Config,
+        active_path: &Path,
+        args: &SourceSwapArgs,
+    ) -> Result<()> {
+        let index = source_selector_index(config, &args.source)?;
+        let previous = config.sources[index].clone();
+        let alternate = previous.alternate.clone().ok_or_else(|| {
+            SkillManagerError::InvalidInput(format!(
+                "source '{}' has no alternate location to swap",
+                previous.name
+            ))
+        })?;
+        let active = source_location(&previous)?;
+        let mut proposed = previous.clone();
+        set_source_location(&mut proposed, &alternate);
+        proposed.alternate = Some(active);
+        config.sources[index] = proposed.clone();
+        self.repository.save(active_path, config)?;
+        self.reporter.human(&format!(
+            "Swapped source {} to {}",
+            proposed.name,
+            source_reference(&proposed)
+        ))?;
+        self.reporter.event(
+            "source.locations-swapped",
+            Level::Info,
+            source_change_data(&proposed, &previous, true),
+        )
     }
 
     // Lifecycle policy is intentionally kept in one match so every target state
@@ -539,9 +716,7 @@ where
     }
 
     fn run_copy(&mut self, config: &Config, args: &CopyArgs) -> Result<()> {
-        let entry = find_source_index(config, &args.source)?
-            .and_then(|index| config.sources.get(index).cloned())
-            .map_or_else(|| source_from_reference(&args.source, None), Ok)?;
+        let entry = configured_source_or_reference(config, &args.source, None)?;
         let resolved = materialize_source(
             self.repository,
             self.github,
@@ -840,6 +1015,9 @@ where
         active_path: &Path,
         args: &ResolveArgs,
     ) -> Result<()> {
+        if let Some(preferred) = &args.prefer_source {
+            let _configured = configured_source_index(config, preferred)?;
+        }
         let sources =
             self.resolve_sources(config, &[], &args.source_selection, args.refresh, false)?;
         let discovery = discover_skills(&sources, &[], &config.exclude)?;
@@ -933,10 +1111,7 @@ where
         let mut entries = Vec::new();
         if !explicit.is_empty() {
             for reference in explicit {
-                let entry = find_source_index(config, reference)?
-                    .and_then(|index| config.sources.get(index).cloned())
-                    .map_or_else(|| source_from_reference(reference, None), Ok)?;
-                entries.push(entry);
+                entries.push(configured_source_or_reference(config, reference, None)?);
             }
         } else if selection.cd_only {
             entries.push(source_from_reference(
@@ -1084,8 +1259,117 @@ fn source_data(source: &SourceEntry) -> Value {
         "source_name": source.name,
         "source_label": source.label,
         "source_type": source.source_type,
-        "mode": source.mode
+        "mode": source.mode,
+        "alternate": source.alternate.as_ref().map(location_data)
     })
+}
+
+fn location_data(location: &SourceLocation) -> Value {
+    let source_type = match location {
+        SourceLocation::Local { .. } => SourceType::Local,
+        SourceLocation::GitHub { .. } => SourceType::GitHub,
+    };
+    json!({
+        "source": location_reference(location),
+        "source_type": source_type
+    })
+}
+
+fn source_snapshot(source: &SourceEntry) -> Value {
+    json!({
+        "source": source_reference(source),
+        "source_type": source.source_type,
+        "alternate": source.alternate.as_ref().map(location_data)
+    })
+}
+
+fn source_change_data(current: &SourceEntry, previous: &SourceEntry, changed: bool) -> Value {
+    let mut data = source_data(current);
+    if let Some(object) = data.as_object_mut() {
+        object.insert("changed".into(), json!(changed));
+        object.insert("previous".into(), source_snapshot(previous));
+    }
+    data
+}
+
+fn source_selector_index(config: &Config, selector: &str) -> Result<usize> {
+    if let Some(index) = configured_source_index(config, selector)? {
+        return Ok(index);
+    }
+    Err(SkillManagerError::NotFound {
+        kind: "source",
+        reference: selector.to_owned(),
+    })
+}
+
+fn configured_source_index(config: &Config, selector: &str) -> Result<Option<usize>> {
+    if let Some(index) = find_source_index(config, selector)? {
+        return Ok(Some(index));
+    }
+    if let Ok(candidate) = location_from_reference(selector, SourceMode::Collection)
+        && let Some(source) = config.sources.iter().find(|source| {
+            source
+                .alternate
+                .as_ref()
+                .is_some_and(|alternate| locations_equal(alternate, &candidate))
+        })
+    {
+        return Err(SkillManagerError::InvalidInput(format!(
+            "alternate locations are not source selectors; use '{}' or '{}'",
+            source.name, source.id
+        )));
+    }
+    Ok(None)
+}
+
+fn configured_source_or_reference(
+    config: &Config,
+    reference: &str,
+    mode: Option<SourceMode>,
+) -> Result<SourceEntry> {
+    if let Some(index) = configured_source_index(config, reference)? {
+        return config.sources.get(index).cloned().ok_or_else(|| {
+            SkillManagerError::InvalidInput("source index changed unexpectedly".into())
+        });
+    }
+    source_from_reference(reference, mode)
+}
+
+fn find_location_owner<'a>(
+    config: &'a Config,
+    location: &SourceLocation,
+    except_index: Option<usize>,
+) -> Option<&'a SourceEntry> {
+    let identity = location_identity(location);
+    config
+        .sources
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != except_index)
+        .find_map(|(_, source)| {
+            let active_matches =
+                source_location(source).is_ok_and(|active| location_identity(&active) == identity);
+            let alternate_matches = source
+                .alternate
+                .as_ref()
+                .is_some_and(|alternate| location_identity(alternate) == identity);
+            (active_matches || alternate_matches).then_some(source)
+        })
+}
+
+fn reject_location_collision(
+    config: &Config,
+    location: &SourceLocation,
+    source_index: usize,
+) -> Result<()> {
+    if let Some(existing) = find_location_owner(config, location, Some(source_index)) {
+        return Err(SkillManagerError::InvalidInput(format!(
+            "location is already configured by source '{}': {}",
+            existing.name,
+            location_reference(location)
+        )));
+    }
+    Ok(())
 }
 
 fn status_source_rows(
@@ -1141,6 +1425,7 @@ fn status_source_rows(
             name,
             label,
             location: source_reference(&source.entry),
+            alternate: source.entry.alternate.as_ref().map(location_reference),
         });
     }
 
@@ -1217,10 +1502,15 @@ fn normalized_patterns(patterns: Vec<String>) -> Vec<String> {
 }
 
 fn source_matches(source: &SourceEntry, selector: &str) -> bool {
-    let reference = source_reference(source);
-    [source.id.as_str(), source.name.as_str(), reference.as_str()]
+    if [source.id.as_str(), source.name.as_str()]
         .iter()
         .any(|value| fold(value) == fold(selector))
+    {
+        return true;
+    }
+    location_from_reference(selector, source.mode).is_ok_and(|location| {
+        source_location(source).is_ok_and(|active| locations_equal(&active, &location))
+    })
 }
 
 fn status_matches(
@@ -1621,6 +1911,7 @@ mod tests {
             action: SourceAction::Update(SourceUpdateArgs {
                 source: "Prompted Source".into(),
                 name: Some("renamed".into()),
+                location: None,
                 label: Some("Renamed Label".into()),
                 exclude: vec!["private-*".into(), "private-*".into()],
                 clear_exclude: true,
@@ -1633,6 +1924,7 @@ mod tests {
                 action: SourceAction::Update(SourceUpdateArgs {
                     source: "renamed".into(),
                     name: Some("second-source".into()),
+                    location: None,
                     label: None,
                     exclude: Vec::new(),
                     clear_exclude: false,
@@ -1646,6 +1938,7 @@ mod tests {
                 action: SourceAction::Update(SourceUpdateArgs {
                     source: "renamed".into(),
                     name: None,
+                    location: None,
                     label: None,
                     exclude: Vec::new(),
                     clear_exclude: false,
