@@ -29,10 +29,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install pinned Rust and advisory tools
+        shell: pwsh
+        run: pwsh -File tools/install-ci-tools.ps1 -Mode Advisory
       - name: Build current CLI
         shell: pwsh
         run: |
-          pwsh -File tools/install-ci-tools.ps1 -Mode Advisory
           pwsh -File tools/get-build-matrix.ps1 -ValidateOnly
           just release-build
       - name: Exercise GitHub source at an exact commit

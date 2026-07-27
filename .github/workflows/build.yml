@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_INSTALL_ROOT: ${{ github.workspace }}/.tools/cargo-install
+
 jobs:
   discover:
     name: Discover CLI build matrix
@@ -38,9 +42,36 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install pinned Rust
+        shell: pwsh
+        run: pwsh -File tools/install-ci-tools.ps1 -Mode Quality -Phase Toolchain
+      - name: Cache Cargo downloads
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-downloads-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('clis/*/Cargo.lock', 'clis/*/Cargo.toml', 'TOOL_VERSIONS') }}
+          restore-keys: |
+            cargo-downloads-${{ runner.os }}-${{ runner.arch }}-
+      - name: Cache pinned quality tools
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ github.workspace }}/.tools/cargo-install
+          key: cargo-tools-quality-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('TOOL_VERSIONS', 'tools/install-ci-tools.ps1', 'tools/get-tool-version.ps1') }}
+          restore-keys: |
+            cargo-tools-quality-${{ runner.os }}-${{ runner.arch }}-
+      - name: Cache Rust build outputs
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ github.workspace }}/clis/skill-manager/target
+          key: rust-target-quality-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('TOOL_VERSIONS', 'clis/skill-manager/Cargo.lock', 'clis/skill-manager/Cargo.toml') }}
+          restore-keys: |
+            rust-target-quality-${{ runner.os }}-${{ runner.arch }}-
       - name: Install pinned quality tools
         shell: pwsh
-        run: pwsh -File tools/install-ci-tools.ps1 -Mode Quality
+        run: pwsh -File tools/install-ci-tools.ps1 -Mode Quality -Phase Tools
       - run: just check
       - name: Audit GitHub workflows
         run: zizmor --pedantic .github/workflows
@@ -56,13 +87,41 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install pinned Rust and build host-side generator
+      - name: Install pinned Rust
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: pwsh -File tools/install-ci-tools.ps1 -Mode Base -Phase Toolchain -Target $env:TARGET
+      - name: Cache Cargo downloads
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-downloads-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('clis/*/Cargo.lock', 'clis/*/Cargo.toml', 'TOOL_VERSIONS') }}
+          restore-keys: |
+            cargo-downloads-${{ runner.os }}-${{ runner.arch }}-
+      - name: Cache cargo-zigbuild
+        if: matrix.zig
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ github.workspace }}/.tools/cargo-install
+          key: cargo-tools-zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('TOOL_VERSIONS', 'tools/install-ci-tools.ps1', 'tools/get-tool-version.ps1') }}
+          restore-keys: |
+            cargo-tools-zig-${{ runner.os }}-${{ runner.arch }}-
+      - name: Cache target-specific Rust build outputs
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ github.workspace }}/clis/${{ matrix.cli }}/target
+          key: rust-target-package-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cli }}-${{ matrix.target }}-${{ hashFiles('TOOL_VERSIONS', 'clis/*/Cargo.lock', 'clis/*/Cargo.toml') }}
+          restore-keys: |
+            rust-target-package-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cli }}-${{ matrix.target }}-
+      - name: Build host-side generator
         shell: pwsh
         env:
           CLI: ${{ matrix.cli }}
-          TARGET: ${{ matrix.target }}
         run: |
-          pwsh -File tools/install-ci-tools.ps1 -Mode Base -Target $env:TARGET
           cargo build --locked --release --manifest-path "clis/$env:CLI/Cargo.toml"
       - name: Install pinned cargo-zigbuild
         if: matrix.zig

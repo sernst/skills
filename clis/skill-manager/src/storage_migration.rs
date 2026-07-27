@@ -389,17 +389,18 @@ fn write_synced_file(path: &Path, bytes: &[u8]) -> Result<()> {
 
 // The cross-platform call contract stays fallible because Unix directory fsync can fail.
 #[allow(clippy::unnecessary_wraps)]
-fn sync_directory(_path: &Path) -> Result<()> {
+fn sync_directory(path: &Path) -> Result<()> {
     // Windows cannot open a directory as a regular file. The staged file was
     // still flushed before replacement; Unix additionally flushes the entry.
     #[cfg(unix)]
     {
-        let directory =
-            fs::File::open(_path).map_err(|error| SkillManagerError::io(_path, error))?;
+        let directory = fs::File::open(path).map_err(|error| SkillManagerError::io(path, error))?;
         directory
             .sync_all()
-            .map_err(|error| SkillManagerError::io(_path, error))?;
+            .map_err(|error| SkillManagerError::io(path, error))?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
