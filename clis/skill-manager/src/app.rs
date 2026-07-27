@@ -8,28 +8,34 @@ use serde_json::{Value, json};
 
 use crate::cache::{GitHubTransport, materialize_source};
 use crate::cli::{
-    Command, CopyArgs, RemoveArgs, ResolveArgs, SourceAction, SourceAddArgs, SourceAlternateArgs,
-    SourceLocateArgs, SourceModeArg, SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs,
-    TargetAction, TargetSelection,
+    Command, ConfigsAction, ConfigsArgs, CopyArgs, RemoveArgs, ResolveArgs, ScopeSelection,
+    SourceAction, SourceAddArgs, SourceAlternateArgs, SourceLocateArgs, SourceModeArg,
+    SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction, TargetSelection,
 };
 use crate::config::{
-    Config, ConfigRepository, FileConfigRepository, derive_salted_source_id, find_source_index,
-    fold, is_builtin_name, location_from_reference, location_identity, location_reference,
-    locations_equal, manager_home, resolved_targets, set_source_location, source_from_reference,
-    source_location, source_reference,
+    Config, ConfigBackup, ConfigRepository, FileConfigRepository, derive_salted_source_id,
+    find_source_index, fold, is_builtin_name, location_from_reference, location_identity,
+    location_reference, locations_equal, manager_home, normalize_target_template, resolved_targets,
+    resolved_targets_for_scope, set_source_location, source_from_reference, source_location,
+    source_reference,
 };
 use crate::domain::{
-    ResolvedSource, SkillCandidate, SourceEntry, SourceLocation, SourceMode, SourceType, Target,
-    TargetEntry,
+    ResolvedSource, Scope, ScopedTarget, SkillCandidate, SourceEntry, SourceLocation, SourceMode,
+    SourceType, Target, TargetEntry,
 };
 use crate::error::{Result, SkillManagerError};
 use crate::event::{Level, Reporter};
 use crate::prompt::Prompt;
 use crate::skills::{
-    deployed_skills, detect_skill_dirs, discover_skills, matches_patterns, skill_name, skill_state,
+    deployed_skills, detect_skill_dirs, directories_equal, discover_skills, expand_skill_patterns,
+    is_fnmatch_operand, matches_patterns, skill_name, skill_state, split_sync_operands,
     validate_skill_name,
 };
-use crate::status::{SkillRow, SourceRow, skill_table, source_table, status_summary};
+use crate::status::{
+    DeploymentDetail, SkillLocation, SkillRow, SourceRow, skill_table, source_table,
+    status_summary_counts, status_summary_with_counts,
+};
+use crate::storage_migration::LayoutMigrationResult;
 use crate::transaction::{TransactionHook, deploy_skill, remove_skill};
 
 /// Outcome converted to the executable exit code.
@@ -88,13 +94,12 @@ where
     /// Returns a typed error when command validation, persistence, transport,
     /// prompting, reporting, or a filesystem operation fails.
     pub fn run(&mut self, command: Command) -> Result<RunOutcome> {
+        if let Command::Configs(args) = command {
+            return self.run_configs(&args);
+        }
         let dry_run = command_dry_run(&command);
         let loaded = self.repository.load(dry_run)?;
-        if let Some(warning) = loaded.warning {
-            self.reporter.diagnostic(&format!("Warning: {warning}"))?;
-            self.reporter
-                .event("diagnostic", Level::Warning, json!({ "message": warning }))?;
-        }
+        self.emit_layout_migration(&loaded.layout_migration)?;
         let mut config = loaded.config;
         match command {
             Command::Load(args) => {
@@ -123,13 +128,253 @@ where
             Command::Target(args) => {
                 self.run_target(&mut config, &loaded.active_path, args.action)?;
             }
-            Command::GenerateCompletions(_) | Command::GenerateMan(_) => {
+            Command::Configs(_) | Command::GenerateCompletions(_) | Command::GenerateMan(_) => {
                 return Err(SkillManagerError::InvalidInput(
                     "generation commands must be handled at the executable boundary".into(),
                 ));
             }
         }
         Ok(RunOutcome::Success)
+    }
+
+    fn run_configs(&mut self, args: &ConfigsArgs) -> Result<RunOutcome> {
+        match &args.action {
+            None if args.raw => {
+                let migration = self.repository.migrate_layout()?;
+                self.emit_raw_layout_migration(&migration)?;
+                let bytes = self.repository.read_raw_or_create()?;
+                self.reporter.raw(&bytes)?;
+                Ok(RunOutcome::Success)
+            }
+            None => {
+                let loaded = self.repository.load(false)?;
+                self.emit_layout_migration(&loaded.layout_migration)?;
+                self.show_config(&loaded.config, loaded.persisted)?;
+                Ok(RunOutcome::Success)
+            }
+            Some(ConfigsAction::Reset(confirm)) => {
+                let migration = self.repository.migrate_layout()?;
+                self.emit_layout_migration(&migration)?;
+                if !self.confirm_destructive("reset", confirm.yes)? {
+                    return Ok(RunOutcome::Cancelled);
+                }
+                let backup = self.repository.reset_config()?;
+                self.reporter.human(&format!(
+                    "Reset configuration. Previous state saved as {}.",
+                    backup.metadata.id
+                ))?;
+                self.reporter.event(
+                    "config.reset",
+                    Level::Info,
+                    json!({
+                        "path": self.repository.config_path(),
+                        "backup_id": backup.metadata.id,
+                        "backup_path": backup.raw_path,
+                    }),
+                )?;
+                Ok(RunOutcome::Success)
+            }
+            Some(ConfigsAction::Restore(restore)) => {
+                let migration = self.repository.migrate_layout()?;
+                self.emit_layout_migration(&migration)?;
+                if !self.confirm_destructive("restore", restore.yes)? {
+                    return Ok(RunOutcome::Cancelled);
+                }
+                let outcome = self
+                    .repository
+                    .restore_config(restore.backup_id.as_deref())?;
+                self.reporter.human(&format!(
+                    "Restored configuration backup {}. Displaced state saved as {}.",
+                    outcome.restored.metadata.id, outcome.displaced.metadata.id
+                ))?;
+                self.reporter.event(
+                    "config.restored",
+                    Level::Info,
+                    json!({
+                        "path": self.repository.config_path(),
+                        "backup_id": outcome.restored.metadata.id,
+                        "backup_path": outcome.restored.raw_path,
+                        "displaced_backup_id": outcome.displaced.metadata.id,
+                        "displaced_backup_path": outcome.displaced.raw_path,
+                        "present": outcome.restored.metadata.present,
+                    }),
+                )?;
+                Ok(RunOutcome::Success)
+            }
+        }
+    }
+
+    fn confirm_destructive(&mut self, action: &str, confirmed: bool) -> Result<bool> {
+        if confirmed {
+            return Ok(true);
+        }
+        if self.no_input {
+            return Err(SkillManagerError::InteractionRequired(format!(
+                "configs {action} is destructive; pass --yes in noninteractive mode"
+            )));
+        }
+        let answer = self
+            .prompt
+            .exact_text(&format!("Type exactly 'yes' to {action} the configuration"))?;
+        if answer == "yes" {
+            return Ok(true);
+        }
+        self.reporter.human("Cancelled.")?;
+        self.reporter.event(
+            "command.cancelled",
+            Level::Info,
+            json!({ "action": format!("configs.{action}") }),
+        )?;
+        Ok(false)
+    }
+
+    // Configuration display deliberately coordinates every human and machine section here.
+    #[allow(clippy::too_many_lines)]
+    fn show_config(&mut self, config: &Config, persisted: bool) -> Result<()> {
+        let project_root = current_project_root()?;
+        let global = resolved_targets_for_scope(config, &self.home, &project_root, Scope::Global);
+        let project = resolved_targets_for_scope(config, &self.home, &project_root, Scope::Project);
+        let targets = global
+            .iter()
+            .filter_map(|(name, global_target)| {
+                project.get(name).map(|project_target| {
+                    json!({
+                        "name": name,
+                        "label": global_target.target.label,
+                        "template": global_target.template,
+                        "enabled": global_target.target.enabled,
+                        "builtin": global_target.target.builtin,
+                        "legacy_override": global_target.target.legacy_override,
+                        "global_path": global_target.target.path,
+                        "project_path": project_target.target.path,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let backups = self.repository.list_backups()?;
+        let backup_values = backups.iter().map(backup_data).collect::<Vec<_>>();
+
+        self.reporter.human(&format!(
+            "Configuration: {} ({})",
+            self.repository.config_path().display(),
+            if persisted {
+                "persisted"
+            } else {
+                "unpersisted default"
+            }
+        ))?;
+        self.reporter.human(&format!(
+            "Storage: {}",
+            self.repository.storage_root().display()
+        ))?;
+        self.reporter
+            .human(&format!("Home: {}", self.home.display()))?;
+        self.reporter
+            .human(&format!("Project: {}", project_root.display()))?;
+        self.reporter.human(&format!(
+            "Schema: {}  Sources: {}  Targets: {}  Backups: {}",
+            config.schema_version,
+            config.sources.len(),
+            targets.len(),
+            backups.len()
+        ))?;
+        self.reporter.human("")?;
+        self.reporter.human("Configuration document:")?;
+        let rendered = serde_json::to_string_pretty(config)
+            .map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
+        for line in rendered.lines() {
+            self.reporter.human(line)?;
+        }
+        self.reporter.human("")?;
+        self.reporter.human("Resolved targets:")?;
+        for target in &targets {
+            self.reporter.human(&format!(
+                "{}\t{}\tglobal={}\tproject={}\t{}",
+                target["name"].as_str().unwrap_or_default(),
+                target["template"].as_str().unwrap_or_default(),
+                target["global_path"].as_str().unwrap_or_default(),
+                target["project_path"].as_str().unwrap_or_default(),
+                if target["enabled"].as_bool().unwrap_or(false) {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ))?;
+        }
+        self.reporter.human("")?;
+        self.reporter.human("Backups:")?;
+        if backups.is_empty() {
+            self.reporter.human("none")?;
+        } else {
+            for backup in &backups {
+                self.reporter.human(&format!(
+                    "{}\t{}\t{}\t{}",
+                    backup.metadata.id,
+                    backup.metadata.created_at.to_rfc3339(),
+                    backup.metadata.reason,
+                    if backup.metadata.valid {
+                        "valid"
+                    } else {
+                        "invalid"
+                    }
+                ))?;
+            }
+        }
+        self.reporter.event(
+            "config.shown",
+            Level::Info,
+            json!({
+                "path": self.repository.config_path(),
+                "storage_root": self.repository.storage_root(),
+                "home": self.home,
+                "project_root": project_root,
+                "persisted": persisted,
+                "config": config,
+                "targets": targets,
+                "backups": backup_values,
+            }),
+        )
+    }
+
+    fn emit_layout_migration(&mut self, migration: &LayoutMigrationResult) -> Result<()> {
+        for item in &migration.migrated {
+            self.reporter.human(&format!(
+                "Migrated {} from {} to {}.",
+                item.component,
+                item.from.display(),
+                item.to.display()
+            ))?;
+            self.reporter.event(
+                "config.migrated",
+                Level::Info,
+                json!({
+                    "component": item.component,
+                    "from": item.from,
+                    "to": item.to,
+                }),
+            )?;
+        }
+        for warning in &migration.warnings {
+            self.reporter.diagnostic(&format!("Warning: {warning}"))?;
+            self.reporter
+                .event("diagnostic", Level::Warning, json!({ "message": warning }))?;
+        }
+        Ok(())
+    }
+
+    fn emit_raw_layout_migration(&mut self, migration: &LayoutMigrationResult) -> Result<()> {
+        for item in &migration.migrated {
+            self.reporter.diagnostic(&format!(
+                "Migrated {} from {} to {}.",
+                item.component,
+                item.from.display(),
+                item.to.display()
+            ))?;
+        }
+        for warning in &migration.warnings {
+            self.reporter.diagnostic(&format!("Warning: {warning}"))?;
+        }
+        Ok(())
     }
 
     fn run_source(
@@ -550,7 +795,7 @@ where
                 config.targets.insert(
                     name.clone(),
                     TargetEntry {
-                        path: absolute_path(args.path)?,
+                        path: normalize_target_template(&args.path.to_string_lossy())?,
                         label: title_case(&name),
                         enabled: true,
                         extra: IndexMap::new(),
@@ -570,7 +815,7 @@ where
                 self.emit_target_change(config, &args.name, "target.disabled", Level::Info)
             }
             TargetAction::SetPath(args) => {
-                let path = absolute_path(args.path)?;
+                let path = normalize_target_template(&args.path.to_string_lossy())?;
                 if let Some(entry) = find_named_mut(&mut config.targets, &args.name) {
                     entry.path = path;
                 } else if let Some(entry) =
@@ -632,76 +877,137 @@ where
         self.reporter.event(event, level, target_data(target))
     }
 
+    // Sync is an orchestration boundary for discovery, scope inference, and transactional events.
+    #[allow(clippy::too_many_lines)]
     fn run_sync(&mut self, config: &Config, args: &SyncArgs, update_only: bool) -> Result<()> {
+        let operands = split_sync_operands(&args.sources);
         let sources = self.resolve_sources(
             config,
-            &args.sources,
+            &operands.sources,
             &args.source_selection,
             args.refresh,
             args.dry_run,
         )?;
-        let discovery = discover_skills(&sources, &args.filters, &config.exclude)?;
+        let discovery = discover_skills(&sources, &[], &config.exclude)?;
         self.emit_collisions(&discovery.collisions)?;
-        let targets = self.select_targets(config, &args.targets, true, args.dry_run)?;
+        let target_templates =
+            self.select_target_templates(config, &args.targets, true, args.dry_run)?;
+        let project_root = current_project_root()?;
+        let load_scope = if update_only {
+            None
+        } else {
+            Some(self.load_scope(config, &target_templates, &args.scope, &project_root)?)
+        };
+
+        let eligible_names = discovery
+            .winners
+            .values()
+            .filter(|candidate| {
+                if !update_only {
+                    return true;
+                }
+                target_templates.iter().any(|template| {
+                    !update_scopes(template, candidate, &args.scope, &self.home, &project_root)
+                        .is_empty()
+                })
+            })
+            .map(|candidate| candidate.name.as_str())
+            .collect::<Vec<_>>();
+        let expansion = expand_skill_patterns(&operands.skill_patterns, eligible_names)?;
+        self.emit_unmatched_patterns(&expansion.unmatched_patterns)?;
+        let selected = expansion
+            .matched
+            .iter()
+            .map(|name| fold(name))
+            .collect::<BTreeSet<_>>();
+
         let mut changed = 0_usize;
         let mut skipped = 0_usize;
         for candidate in discovery.winners.values() {
-            for target in &targets {
-                let destination = target.path.join(&candidate.name);
-                let destination_existed = destination.is_dir();
-                if update_only && !destination_existed {
-                    skipped += 1;
-                    self.reporter.event(
-                        "skill.skipped",
-                        Level::Info,
-                        skill_action_data(candidate, target, &destination, args.dry_run, "skipped"),
-                    )?;
-                    continue;
-                }
-                let same = destination_existed
-                    && crate::skills::directories_equal(&candidate.path, &destination)?;
-                if same {
-                    skipped += 1;
-                    self.reporter.event(
-                        "skill.skipped",
-                        Level::Info,
-                        skill_action_data(candidate, target, &destination, args.dry_run, "skipped"),
-                    )?;
-                    continue;
-                }
-                if !args.dry_run {
-                    deploy_skill(
-                        &candidate.path,
-                        &target.path,
-                        self.repository.cache_root(),
-                        self.hook,
-                    )?;
-                }
-                changed += 1;
-                self.reporter.human(&format!(
-                    "{} {} -> {}{}",
-                    if update_only { "Updated" } else { "Loaded" },
-                    candidate.name,
-                    target.name,
-                    if args.dry_run { " (dry-run)" } else { "" }
-                ))?;
-                let action = if update_only {
-                    "updated"
-                } else if destination_existed {
-                    "overwritten"
-                } else {
-                    "loaded"
-                };
-                self.reporter.event(
-                    if update_only {
-                        "skill.updated"
-                    } else {
-                        "skill.loaded"
-                    },
-                    Level::Info,
-                    skill_action_data(candidate, target, &destination, args.dry_run, action),
-                )?;
+            if !selected.contains(&fold(&candidate.name))
+                || !matches_patterns(&candidate.name, &args.filters)?
+            {
+                continue;
             }
+            for template in &target_templates {
+                let scopes = if let Some(scope) = load_scope {
+                    vec![scope]
+                } else {
+                    update_scopes(template, candidate, &args.scope, &self.home, &project_root)
+                };
+                for scope in scopes {
+                    let target = scoped_target(template, scope, &self.home, &project_root);
+                    let destination = target.target.path.join(&candidate.name);
+                    let destination_existed = destination.is_dir();
+                    if update_only && !destination_existed {
+                        continue;
+                    }
+                    let same =
+                        destination_existed && directories_equal(&candidate.path, &destination)?;
+                    if same {
+                        skipped += 1;
+                        self.reporter.event(
+                            "skill.skipped",
+                            Level::Info,
+                            skill_action_data(
+                                candidate,
+                                &target.target,
+                                Some(scope),
+                                &destination,
+                                args.dry_run,
+                                "skipped",
+                            ),
+                        )?;
+                        continue;
+                    }
+                    if !args.dry_run {
+                        deploy_skill(
+                            &candidate.path,
+                            &target.target.path,
+                            self.repository.cache_root(),
+                            self.hook,
+                        )?;
+                    }
+                    changed += 1;
+                    self.reporter.human(&format!(
+                        "{} {} -> {} ({}){}",
+                        if update_only { "Updated" } else { "Loaded" },
+                        candidate.name,
+                        target.target.name,
+                        scope.as_str(),
+                        if args.dry_run { " (dry-run)" } else { "" }
+                    ))?;
+                    let action = if update_only {
+                        "updated"
+                    } else if destination_existed {
+                        "overwritten"
+                    } else {
+                        "loaded"
+                    };
+                    self.reporter.event(
+                        if update_only {
+                            "skill.updated"
+                        } else {
+                            "skill.loaded"
+                        },
+                        Level::Info,
+                        skill_action_data(
+                            candidate,
+                            &target.target,
+                            Some(scope),
+                            &destination,
+                            args.dry_run,
+                            action,
+                        ),
+                    )?;
+                }
+            }
+        }
+        if !operands.skill_patterns.is_empty() && changed + skipped == 0 {
+            return Err(SkillManagerError::NotFound {
+                kind: "skill matching positional pattern",
+                reference: operands.skill_patterns.join(", "),
+            });
         }
         self.reporter.event(
             "summary",
@@ -761,7 +1067,7 @@ where
             self.reporter.event(
                 "skill.copied",
                 Level::Info,
-                skill_action_data(candidate, &target, &output, args.dry_run, action),
+                skill_action_data(candidate, &target, None, &output, args.dry_run, action),
             )?;
         }
         self.reporter.event(
@@ -775,8 +1081,22 @@ where
     // partial-commit operation and are therefore deliberately colocated.
     #[allow(clippy::too_many_lines)]
     fn run_remove(&mut self, config: &Config, args: &RemoveArgs) -> Result<bool> {
-        let targets = self.select_targets(config, &args.targets, false, args.dry_run)?;
+        let target_templates =
+            self.select_target_templates(config, &args.targets, false, args.dry_run)?;
+        let project_root = current_project_root()?;
+        let inspected_scopes = explicit_scope(&args.scope)
+            .map_or_else(|| vec![Scope::Global, Scope::Project], |scope| vec![scope]);
+        let mut deployed_names = BTreeMap::<String, String>::new();
+        for template in &target_templates {
+            for scope in &inspected_scopes {
+                let scoped = scoped_target(template, *scope, &self.home, &project_root);
+                for (identity, name) in deployed_skills(&scoped.target.path)? {
+                    deployed_names.entry(identity).or_insert(name);
+                }
+            }
+        }
         let mut names = BTreeMap::<String, String>::new();
+        let mut positional_patterns = Vec::new();
         if args.skills.is_empty() {
             let sources = self.resolve_sources(
                 config,
@@ -791,6 +1111,10 @@ where
             }
         } else {
             for raw in &args.skills {
+                if is_fnmatch_operand(raw) {
+                    positional_patterns.push(raw.clone());
+                    continue;
+                }
                 let path = PathBuf::from(raw);
                 if path.join("SKILL.md").is_file() {
                     let name = skill_name(&path)?;
@@ -823,15 +1147,74 @@ where
                 }
             }
         }
-        let mut plan = Vec::new();
+        let expansion = expand_skill_patterns(
+            &positional_patterns,
+            deployed_names.values().map(String::as_str),
+        )?;
+        self.emit_unmatched_patterns(&expansion.unmatched_patterns)?;
+        for name in expansion.matched {
+            if matches_patterns(&name, &args.filters)? {
+                names.insert(fold(&name), name);
+            }
+        }
+
+        let mut plan = Vec::<(String, Target, Scope)>::new();
+        let mut dual = Vec::<(String, ScopedTarget)>::new();
         for name in names.values() {
-            for target in &targets {
-                if target.path.join(name).is_dir() {
-                    plan.push((name.clone(), target.clone()));
+            for template in &target_templates {
+                if let Some(scope) = explicit_scope(&args.scope) {
+                    let target = scoped_target(template, scope, &self.home, &project_root);
+                    if target.target.path.join(name).is_dir() {
+                        plan.push((name.clone(), target.target, scope));
+                    }
+                    continue;
+                }
+                let global = scoped_target(template, Scope::Global, &self.home, &project_root);
+                let project = scoped_target(template, Scope::Project, &self.home, &project_root);
+                let global_exists = global.target.path.join(name).is_dir();
+                let project_exists = project.target.path.join(name).is_dir();
+                match (global_exists, project_exists) {
+                    (true, false) => plan.push((name.clone(), global.target, Scope::Global)),
+                    (false, true) => plan.push((name.clone(), project.target, Scope::Project)),
+                    (true, true) => dual.push((name.clone(), template.clone())),
+                    (false, false) => {}
+                }
+            }
+        }
+        if !dual.is_empty() {
+            if self.no_input {
+                return Err(SkillManagerError::InteractionRequired(
+                    "one or more skills are installed globally and in the project; pass --global or --project"
+                        .into(),
+                ));
+            }
+            let choices = vec!["project".to_owned(), "global".to_owned(), "both".to_owned()];
+            let selected = self.prompt.choose(
+                &format!(
+                    "{} selected deployment(s) exist in both scopes; choose which copies to remove",
+                    dual.len()
+                ),
+                &choices,
+            )?;
+            let scopes = match selected {
+                0 => vec![Scope::Project],
+                1 => vec![Scope::Global],
+                _ => vec![Scope::Global, Scope::Project],
+            };
+            for (name, template) in dual {
+                for scope in &scopes {
+                    let target = scoped_target(&template, *scope, &self.home, &project_root);
+                    plan.push((name.clone(), target.target, *scope));
                 }
             }
         }
         if plan.is_empty() {
+            if !positional_patterns.is_empty() {
+                return Err(SkillManagerError::NotFound {
+                    kind: "deployed skill matching positional pattern",
+                    reference: positional_patterns.join(", "),
+                });
+            }
             self.reporter.human("No deployed skills matched.")?;
             self.reporter.event(
                 "summary",
@@ -860,7 +1243,7 @@ where
             }
         }
         let mut removed = 0_usize;
-        for (name, target) in plan {
+        for (name, target, scope) in plan {
             let destination = target.path.join(&name);
             if !args.dry_run {
                 let _did_remove =
@@ -868,9 +1251,10 @@ where
             }
             removed += 1;
             self.reporter.human(&format!(
-                "Removed {} from {}{}",
+                "Removed {} from {} ({}){}",
                 name,
                 target.name,
+                scope.as_str(),
                 if args.dry_run { " (dry-run)" } else { "" }
             ))?;
             self.reporter.event(
@@ -879,6 +1263,7 @@ where
                 json!({
                     "skill": name,
                     "target": target.name,
+                    "scope": scope,
                     "target_path": target.path,
                     "path": destination,
                     "action": "removed",
@@ -909,45 +1294,125 @@ where
         self.reporter.human("")?;
         let discovery = discover_skills(&sources, &[], &config.exclude)?;
         self.emit_collisions(&discovery.collisions)?;
-        let targets = self.select_targets(config, &args.targets, false, false)?;
+        let target_templates = self.select_target_templates(config, &args.targets, false, false)?;
+        let project_root = current_project_root()?;
+        let inspected_scopes = explicit_scope(&args.scope)
+            .map_or_else(|| vec![Scope::Global, Scope::Project], |scope| vec![scope]);
         let mut names = BTreeMap::<String, String>::new();
         for (identity, candidate) in &discovery.winners {
             names.insert(identity.clone(), candidate.name.clone());
         }
-        for target in &targets {
-            for (identity, name) in deployed_skills(&target.path)? {
-                names.entry(identity).or_insert(name);
+        for template in &target_templates {
+            for scope in &inspected_scopes {
+                let target = scoped_target(template, *scope, &self.home, &project_root);
+                for (identity, name) in deployed_skills(&target.target.path)? {
+                    names.entry(identity).or_insert(name);
+                }
             }
         }
-        let mut filters = args.filters.clone();
-        filters.extend(args.option_filters.clone());
         let has_any_skills = !names.is_empty();
-        let mut counts = BTreeMap::from([
-            ("up-to-date", 0_usize),
-            ("needs-update", 0),
-            ("not-loaded", 0),
-            ("no-connection", 0),
-        ]);
+        let mut unmatched = Vec::new();
+        for pattern in &args.filters {
+            let one = std::slice::from_ref(pattern);
+            let matched = names.iter().any(|(identity, name)| {
+                status_matches(name, discovery.winners.get(identity), one).unwrap_or(false)
+            });
+            if !matched {
+                unmatched.push(pattern.clone());
+            }
+        }
+        self.emit_unmatched_patterns(&unmatched)?;
         let mut status_rows = Vec::new();
         for (identity, name) in names {
             let candidate = discovery.winners.get(&identity);
-            if !status_matches(&name, candidate, &filters)? {
+            if !status_matches(&name, candidate, &args.filters)?
+                || !status_matches(&name, candidate, &args.option_filters)?
+            {
                 continue;
             }
             let mut states = IndexMap::new();
-            let mut rendered_states = Vec::with_capacity(targets.len());
-            for target in &targets {
-                let state = skill_state(
-                    candidate.map(|value| value.path.as_path()),
-                    &target.path,
-                    &name,
-                )?;
-                if let Some(count) = counts.get_mut(state.as_str()) {
-                    *count += 1;
+            let mut rendered_states = Vec::with_capacity(target_templates.len());
+            let mut deployments = Vec::new();
+            let mut target_scope_sets = Vec::<BTreeSet<Scope>>::new();
+            let mut installed_global = false;
+            let mut installed_project = false;
+            let mut shadowed_global_divergent = false;
+            for template in &target_templates {
+                let observations = inspected_scopes
+                    .iter()
+                    .map(|scope| {
+                        let target = scoped_target(template, *scope, &self.home, &project_root);
+                        let installed = target.target.path.join(&name).is_dir();
+                        let state = skill_state(
+                            candidate.map(|value| value.path.as_path()),
+                            &target.target.path,
+                            &name,
+                        )?;
+                        Ok((target, installed, state))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let mut installed_scopes = BTreeSet::new();
+                for (target, installed, _) in &observations {
+                    if *installed {
+                        installed_scopes.insert(target.scope);
+                        match target.scope {
+                            Scope::Global => installed_global = true,
+                            Scope::Project => installed_project = true,
+                        }
+                    }
                 }
-                states.insert(target.name.clone(), state.as_str());
-                rendered_states.push((target.name.clone(), state));
+                if !installed_scopes.is_empty() {
+                    target_scope_sets.push(installed_scopes);
+                }
+                let effective_index = observations
+                    .iter()
+                    .position(|(target, installed, _)| target.scope == Scope::Project && *installed)
+                    .or_else(|| {
+                        observations.iter().position(|(target, installed, _)| {
+                            target.scope == Scope::Global && *installed
+                        })
+                    });
+                let state_index = effective_index
+                    .or_else(|| (!observations.is_empty()).then_some(observations.len() - 1));
+                if let (Some(global), Some(project)) = (
+                    observations
+                        .iter()
+                        .find(|(target, installed, _)| target.scope == Scope::Global && *installed),
+                    observations.iter().find(|(target, installed, _)| {
+                        target.scope == Scope::Project && *installed
+                    }),
+                ) {
+                    let global_path = global.0.target.path.join(&name);
+                    let project_path = project.0.target.path.join(&name);
+                    if !directories_equal(&global_path, &project_path)? {
+                        shadowed_global_divergent = true;
+                    }
+                }
+                let effective_state = state_index
+                    .and_then(|index| observations.get(index).map(|value| value.2))
+                    .unwrap_or(crate::domain::SkillState::NotLoaded);
+                states.insert(template.target.name.clone(), effective_state.as_str());
+                rendered_states.push((template.target.name.clone(), effective_state));
+                for (index, (target, installed, state)) in observations.into_iter().enumerate() {
+                    deployments.push(DeploymentDetail {
+                        target: target.target.name,
+                        scope: target.scope,
+                        path: target.target.path.join(&name),
+                        installed,
+                        state,
+                        effective: Some(index) == effective_index,
+                    });
+                }
             }
+            let location = match (installed_global, installed_project) {
+                (true, false) => SkillLocation::Global,
+                (false, true) => SkillLocation::Project,
+                (true, true) => SkillLocation::Both,
+                (false, false) => SkillLocation::None,
+            };
+            let mixed = target_scope_sets
+                .first()
+                .is_some_and(|first| target_scope_sets.iter().skip(1).any(|set| set != first));
             let source = candidate.map(|value| source_data(&value.source.entry));
             let source_name = candidate
                 .and_then(|value| source_names.get(&value.source.entry.id))
@@ -958,15 +1423,19 @@ where
                     skill: name,
                     source: source_name,
                     targets: rendered_states,
+                    location,
+                    mixed,
+                    shadowed_global_divergent,
+                    deployments,
                 },
                 source,
                 states,
             ));
         }
         if has_any_skills {
-            let target_names = targets
+            let target_names = target_templates
                 .iter()
-                .map(|target| target.name.clone())
+                .map(|target| target.target.name.clone())
                 .collect::<Vec<_>>();
             let rendered = status_rows
                 .iter()
@@ -984,20 +1453,35 @@ where
             self.reporter
                 .human("No skills found in sources or deployed targets.")?;
         }
+        if !args.filters.is_empty() && status_rows.is_empty() {
+            return Err(SkillManagerError::NotFound {
+                kind: "skill matching positional pattern",
+                reference: args.filters.join(", "),
+            });
+        }
         for (row, source, states) in &status_rows {
             self.reporter.event(
                 "status.row",
                 Level::Info,
-                json!({ "skill": row.skill, "source": source, "targets": states }),
+                json!({
+                    "skill": row.skill,
+                    "source": source,
+                    "targets": states,
+                    "location": row.location,
+                    "mixed": row.mixed,
+                    "shadowed_global_divergent": row.shadowed_global_divergent,
+                    "deployments": row.deployments,
+                }),
             )?;
         }
         if !status_rows.is_empty() {
             self.reporter.human("")?;
-            self.reporter.human(&status_summary(
-                counts["up-to-date"],
-                counts["needs-update"],
-                counts["not-loaded"],
-                counts["no-connection"],
+            let rendered = status_rows
+                .iter()
+                .map(|(row, _, _)| row.clone())
+                .collect::<Vec<_>>();
+            self.reporter.human(&status_summary_with_counts(
+                &status_summary_counts(&rendered),
                 self.reporter.is_interactive(),
                 self.reporter.color_enabled(),
             ))?;
@@ -1009,6 +1493,8 @@ where
         )
     }
 
+    // Resolve coordinates collision presentation, prompting, persistence, and event emission.
+    #[allow(clippy::too_many_lines)]
     fn run_resolve(
         &mut self,
         config: &mut Config,
@@ -1021,7 +1507,26 @@ where
         let sources =
             self.resolve_sources(config, &[], &args.source_selection, args.refresh, false)?;
         let discovery = discover_skills(&sources, &[], &config.exclude)?;
-        let selected: BTreeSet<String> = args.skills.iter().map(|value| fold(value)).collect();
+        let positional_patterns = args
+            .skills
+            .iter()
+            .filter(|value| is_fnmatch_operand(value))
+            .cloned()
+            .collect::<Vec<_>>();
+        let expansion = expand_skill_patterns(
+            &positional_patterns,
+            discovery.collisions.values().filter_map(|candidates| {
+                candidates.first().map(|candidate| candidate.name.as_str())
+            }),
+        )?;
+        self.emit_unmatched_patterns(&expansion.unmatched_patterns)?;
+        let mut selected: BTreeSet<String> = args
+            .skills
+            .iter()
+            .filter(|value| !is_fnmatch_operand(value))
+            .map(|value| fold(value))
+            .collect();
+        selected.extend(expansion.matched.iter().map(|value| fold(value)));
         let mut resolved_count = 0_usize;
         for (identity, candidates) in discovery.collisions {
             if !selected.is_empty() && !selected.contains(&identity) {
@@ -1090,6 +1595,12 @@ where
             )?;
             resolved_count += 1;
         }
+        if !positional_patterns.is_empty() && resolved_count == 0 {
+            return Err(SkillManagerError::NotFound {
+                kind: "collision matching positional pattern",
+                reference: positional_patterns.join(", "),
+            });
+        }
         if resolved_count > 0 {
             self.repository.save(active_path, config)?;
         }
@@ -1149,24 +1660,25 @@ where
         Ok(resolved)
     }
 
-    fn select_targets(
+    fn select_target_templates(
         &mut self,
         config: &Config,
         selection: &TargetSelection,
         prompt_for_implicit: bool,
         dry_run: bool,
-    ) -> Result<Vec<Target>> {
-        let all = resolved_targets(config, &self.home);
+    ) -> Result<Vec<ScopedTarget>> {
+        let project_root = current_project_root()?;
+        let all = resolved_targets_for_scope(config, &self.home, &project_root, Scope::Global);
         let mut explicit_names = BTreeSet::new();
         for requested in &selection.target_names {
             let target = all
                 .values()
-                .find(|target| fold(&target.name) == fold(requested))
+                .find(|target| fold(&target.target.name) == fold(requested))
                 .ok_or_else(|| SkillManagerError::NotFound {
                     kind: "target",
                     reference: requested.clone(),
                 })?;
-            explicit_names.insert(fold(&target.name));
+            explicit_names.insert(fold(&target.target.name));
         }
         for (requested, enabled) in [
             ("claude", selection.claude),
@@ -1175,7 +1687,9 @@ where
         ] {
             if enabled
                 && !explicit_names.contains(requested)
-                && all.get(requested).is_some_and(|target| !target.enabled)
+                && all
+                    .get(requested)
+                    .is_some_and(|target| !target.target.enabled)
             {
                 return Err(SkillManagerError::InvalidInput(format!(
                     "target '{requested}' is disabled; use --target {requested} to override"
@@ -1184,11 +1698,11 @@ where
         }
         let mut selected = Vec::new();
         for target in all.values() {
-            let wanted = explicit_names.contains(&fold(&target.name))
-                || selection.all_targets && target.enabled
-                || selection.claude && target.name == "claude"
-                || selection.shared && target.name == "shared"
-                || selection.antigravity && target.name == "antigravity";
+            let wanted = explicit_names.contains(&fold(&target.target.name))
+                || selection.all_targets && target.target.enabled
+                || selection.claude && target.target.name == "claude"
+                || selection.shared && target.target.name == "shared"
+                || selection.antigravity && target.target.name == "antigravity";
             if wanted {
                 selected.push(target.clone());
             }
@@ -1196,7 +1710,7 @@ where
         if selection.is_explicit() {
             return Ok(selected);
         }
-        selected.extend(all.values().filter(|target| target.enabled).cloned());
+        selected.extend(all.values().filter(|target| target.target.enabled).cloned());
         if prompt_for_implicit && !dry_run {
             if self.no_input {
                 return Err(SkillManagerError::InteractionRequired(
@@ -1212,6 +1726,51 @@ where
             }
         }
         Ok(selected)
+    }
+
+    fn load_scope(
+        &mut self,
+        _config: &Config,
+        targets: &[ScopedTarget],
+        selection: &ScopeSelection,
+        project_root: &Path,
+    ) -> Result<Scope> {
+        if let Some(scope) = explicit_scope(selection) {
+            return Ok(scope);
+        }
+        if self.no_input {
+            return Err(SkillManagerError::InteractionRequired(
+                "load scope is required in noninteractive mode; pass --global or --project".into(),
+            ));
+        }
+        let project_default = targets.iter().any(|target| {
+            target
+                .template
+                .components()
+                .next()
+                .is_some_and(|component| project_root.join(component.as_os_str()).is_dir())
+        });
+        let project = self
+            .prompt
+            .confirm("Install skills at project scope?", project_default)?;
+        Ok(if project {
+            Scope::Project
+        } else {
+            Scope::Global
+        })
+    }
+
+    fn emit_unmatched_patterns(&mut self, patterns: &[String]) -> Result<()> {
+        for pattern in patterns {
+            let message = format!("skill pattern matched nothing: {pattern}");
+            self.reporter.diagnostic(&format!("Warning: {message}"))?;
+            self.reporter.event(
+                "diagnostic",
+                Level::Warning,
+                json!({ "message": message, "pattern": pattern }),
+            )?;
+        }
+        Ok(())
     }
 
     fn emit_collisions(
@@ -1250,6 +1809,81 @@ fn command_dry_run(command: &Command) -> bool {
         Command::Remove(args) => args.dry_run,
         _ => false,
     }
+}
+
+fn current_project_root() -> Result<PathBuf> {
+    std::env::current_dir().map_err(|error| SkillManagerError::io(".", error))
+}
+
+fn explicit_scope(selection: &ScopeSelection) -> Option<Scope> {
+    if selection.project {
+        Some(Scope::Project)
+    } else if selection.global {
+        Some(Scope::Global)
+    } else {
+        None
+    }
+}
+
+fn scoped_target(
+    template: &ScopedTarget,
+    scope: Scope,
+    home: &Path,
+    project_root: &Path,
+) -> ScopedTarget {
+    let mut target = template.target.clone();
+    target.path = scope.root(home, project_root).join(&template.template);
+    ScopedTarget {
+        target,
+        template: template.template.clone(),
+        scope,
+    }
+}
+
+fn update_scopes(
+    template: &ScopedTarget,
+    candidate: &SkillCandidate,
+    selection: &ScopeSelection,
+    home: &Path,
+    project_root: &Path,
+) -> Vec<Scope> {
+    if let Some(scope) = explicit_scope(selection) {
+        let target = scoped_target(template, scope, home, project_root);
+        return target
+            .target
+            .path
+            .join(&candidate.name)
+            .is_dir()
+            .then_some(scope)
+            .into_iter()
+            .collect();
+    }
+    let project = scoped_target(template, Scope::Project, home, project_root);
+    if project.target.path.join(&candidate.name).is_dir() {
+        return vec![Scope::Project];
+    }
+    let global = scoped_target(template, Scope::Global, home, project_root);
+    global
+        .target
+        .path
+        .join(&candidate.name)
+        .is_dir()
+        .then_some(Scope::Global)
+        .into_iter()
+        .collect()
+}
+
+fn backup_data(backup: &ConfigBackup) -> Value {
+    json!({
+        "id": backup.metadata.id,
+        "created_at": backup.metadata.created_at,
+        "reason": backup.metadata.reason,
+        "original_path": backup.metadata.original_path,
+        "present": backup.metadata.present,
+        "schema_version": backup.metadata.schema_version,
+        "valid": backup.metadata.valid,
+        "raw_path": backup.raw_path,
+    })
 }
 
 fn source_data(source: &SourceEntry) -> Value {
@@ -1446,6 +2080,7 @@ fn target_data(target: &Target) -> Value {
 fn skill_action_data(
     candidate: &SkillCandidate,
     target: &Target,
+    scope: Option<Scope>,
     destination: &Path,
     dry_run: bool,
     action: &str,
@@ -1459,6 +2094,9 @@ fn skill_action_data(
         object.insert("destination".into(), json!(destination));
         object.insert("dry_run".into(), json!(dry_run));
         object.insert("action".into(), json!(action));
+        if let Some(scope) = scope {
+            object.insert("scope".into(), json!(scope));
+        }
     }
     data
 }
@@ -1584,7 +2222,7 @@ mod tests {
         TargetNameArgs, TargetPathArgs,
     };
     use crate::config::{Config, FileConfigRepository, resolved_targets, source_from_reference};
-    use crate::domain::{ResolvedSource, SkillCandidate, TargetEntry};
+    use crate::domain::{ResolvedSource, Scope, SkillCandidate, TargetEntry};
     use crate::error::{Result, SkillManagerError};
     use crate::event::{Level, Reporter};
     use crate::prompt::Prompt;
@@ -1805,12 +2443,20 @@ mod tests {
         assert_eq!(target_payload["builtin"], true);
         assert_eq!(target_payload["legacy_override"], false);
         let destination = target.path.join("demo");
-        let action = skill_action_data(&candidate, &target, &destination, true, "loaded");
+        let action = skill_action_data(
+            &candidate,
+            &target,
+            Some(Scope::Global),
+            &destination,
+            true,
+            "loaded",
+        );
         assert_eq!(action["skill"], "demo");
         assert_eq!(action["target"], "claude");
         assert_eq!(action["destination"], serde_json::json!(destination));
         assert_eq!(action["dry_run"], true);
         assert_eq!(action["action"], "loaded");
+        assert_eq!(action["scope"], "global");
     }
 
     #[test]
@@ -1992,7 +2638,7 @@ mod tests {
         app.run(Command::Target(TargetArgs {
             action: TargetAction::Add(TargetPathArgs {
                 name: "custom-target".into(),
-                path: home.path().join("custom"),
+                path: PathBuf::from(".custom").join("skills"),
             }),
         }))
         .unwrap_or_else(|error| unreachable!("{error}"));
@@ -2000,7 +2646,7 @@ mod tests {
             app.run(Command::Target(TargetArgs {
                 action: TargetAction::Add(TargetPathArgs {
                     name: "CUSTOM-TARGET".into(),
-                    path: home.path().join("duplicate"),
+                    path: PathBuf::from(".duplicate").join("skills"),
                 }),
             }))
             .is_err()
@@ -2019,7 +2665,7 @@ mod tests {
         app.run(Command::Target(TargetArgs {
             action: TargetAction::SetPath(TargetPathArgs {
                 name: "custom-target".into(),
-                path: home.path().join("custom-new"),
+                path: PathBuf::from(".custom-new").join("skills"),
             }),
         }))
         .unwrap_or_else(|error| unreachable!("{error}"));

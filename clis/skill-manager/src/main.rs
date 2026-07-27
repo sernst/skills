@@ -20,6 +20,23 @@ fn main() -> ExitCode {
     let mut cli = Cli::parse();
     let machine_mode = cli.machine_mode();
     let mut reporter = ConsoleReporter::with_color_policy(machine_mode, cli.color);
+    if machine_mode
+        && matches!(
+            cli.command.as_ref(),
+            Some(Command::Configs(skill_manager::cli::ConfigsArgs {
+                raw: true,
+                ..
+            }))
+        )
+    {
+        report_error(
+            &mut reporter,
+            &SkillManagerError::InvalidInput(
+                "configs --raw cannot be combined with JSON or recipe input".into(),
+            ),
+        );
+        return ExitCode::FAILURE;
+    }
     if let Err(error) = apply_recipe(&mut cli) {
         report_error(&mut reporter, &error);
         return ExitCode::FAILURE;

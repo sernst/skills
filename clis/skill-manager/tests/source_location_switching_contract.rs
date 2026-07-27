@@ -27,7 +27,7 @@ fn cli(home: &Path) -> Command {
 }
 
 fn read_config(home: &Path) -> Value {
-    serde_json::from_slice(&fs::read(home.join(".skill-manager.config.json")).expect("read config"))
+    serde_json::from_slice(&fs::read(home.join(".skill-manager/config.json")).expect("read config"))
         .expect("parse config")
 }
 
@@ -112,7 +112,7 @@ fn alternate_swap_noops_events_metadata_and_aligned_display_are_stable() {
     config["sources"][0]["source_extension"] = Value::String("preserved".into());
     config["root_extension"] = Value::String("also-preserved".into());
     fs::write(
-        home.path().join(".skill-manager.config.json"),
+        home.path().join(".skill-manager/config.json"),
         serde_json::to_vec_pretty(&config).expect("serialize config"),
     )
     .expect("inject extensions");
@@ -132,7 +132,7 @@ fn alternate_swap_noops_events_metadata_and_aligned_display_are_stable() {
     assert!(event["data"]["previous"]["alternate"].is_null());
 
     let before_noop =
-        fs::read(home.path().join(".skill-manager.config.json")).expect("read config before no-op");
+        fs::read(home.path().join(".skill-manager/config.json")).expect("read config before no-op");
     let repeated = events(
         cli(home.path())
             .args(["--json", "source", "alternate", "personal", "SERNST/skills"])
@@ -145,7 +145,7 @@ fn alternate_swap_noops_events_metadata_and_aligned_display_are_stable() {
         repeated[0]["data"]["alternate"]
     );
     assert_eq!(
-        fs::read(home.path().join(".skill-manager.config.json")).expect("read no-op config"),
+        fs::read(home.path().join(".skill-manager/config.json")).expect("read no-op config"),
         before_noop,
         "a no-op must not rewrite configuration"
     );

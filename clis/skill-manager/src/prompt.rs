@@ -18,6 +18,18 @@ pub trait Prompt {
     ///
     /// Returns an error when input/output fails or no value is supplied.
     fn text(&mut self, message: &str, default: Option<&str>) -> Result<String>;
+    /// Request one line without normalizing or requiring a non-empty value.
+    ///
+    /// The default keeps test implementations source-compatible. Interactive
+    /// implementations should override this to avoid presenting an empty
+    /// bracketed default.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when input/output fails.
+    fn exact_text(&mut self, message: &str) -> Result<String> {
+        self.text(message, Some(""))
+    }
     /// Choose an item by one-based index.
     ///
     /// # Errors
@@ -31,7 +43,7 @@ pub trait Prompt {
 pub struct StdioPrompt;
 
 impl StdioPrompt {
-    fn read_line(message: &str) -> Result<String> {
+    fn read_line_exact(message: &str) -> Result<String> {
         write!(io::stderr().lock(), "{message}")
             .and_then(|()| io::stderr().flush())
             .map_err(|error| SkillManagerError::io("<stderr>", error))?;
@@ -39,7 +51,14 @@ impl StdioPrompt {
         io::stdin()
             .read_line(&mut line)
             .map_err(|error| SkillManagerError::io("<stdin>", error))?;
-        Ok(line.trim().to_owned())
+        while line.ends_with('\r') || line.ends_with('\n') {
+            line.pop();
+        }
+        Ok(line)
+    }
+
+    fn read_line(message: &str) -> Result<String> {
+        Self::read_line_exact(message).map(|line| line.trim().to_owned())
     }
 }
 
@@ -91,6 +110,10 @@ impl Prompt for StdioPrompt {
         );
         let answer = Self::read_line(&prompt)?;
         resolve_text(answer, message, default)
+    }
+
+    fn exact_text(&mut self, message: &str) -> Result<String> {
+        Self::read_line_exact(&format!("{message}: "))
     }
 
     fn choose(&mut self, message: &str, choices: &[String]) -> Result<usize> {

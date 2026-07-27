@@ -356,6 +356,102 @@ pub fn matches_patterns(value: &str, patterns: &[String]) -> Result<bool> {
         .any(|pattern| pattern.matches(&folded)))
 }
 
+/// Return whether an operand uses Python-fnmatch metacharacters.
+///
+/// A bare `[` deliberately counts as a pattern. Python fnmatch treats an
+/// unmatched opening bracket literally, but at the command boundary it still
+/// means the operand is intended to select skills rather than name a source.
+#[must_use]
+pub fn is_fnmatch_operand(operand: &str) -> bool {
+    operand.contains(['*', '?', '['])
+}
+
+/// Split `load`/`update` positional operands by their command-boundary role.
+///
+/// Literal values retain the historical source-reference meaning. Values with
+/// fnmatch metacharacters are skill selection patterns and must not be treated
+/// as filesystem paths or GitHub references.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SyncOperandSelection {
+    /// Literal source references.
+    pub sources: Vec<String>,
+    /// Skill-name fnmatch patterns.
+    pub skill_patterns: Vec<String>,
+}
+
+/// Split positional operands into literal source references and skill patterns.
+#[must_use]
+pub fn split_sync_operands(operands: &[String]) -> SyncOperandSelection {
+    let mut selection = SyncOperandSelection::default();
+    for operand in operands {
+        if is_fnmatch_operand(operand) {
+            selection.skill_patterns.push(operand.clone());
+        } else {
+            selection.sources.push(operand.clone());
+        }
+    }
+    selection
+}
+
+/// The result of expanding positional fnmatch patterns over a candidate universe.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PatternExpansion {
+    /// Candidate names selected by at least one supplied pattern, in universe order.
+    pub matched: Vec<String>,
+    /// Patterns that selected no candidate, in argument order.
+    pub unmatched_patterns: Vec<String>,
+}
+
+/// Expand positional patterns against a supplied candidate universe.
+///
+/// Pattern operands are OR-combined. The caller can then AND [`PatternExpansion::matched`]
+/// with its existing filter selection. An empty pattern set selects all candidates.
+/// This helper intentionally does not interpret a candidate as a path or source.
+///
+/// # Errors
+///
+/// Returns an error only when the existing fnmatch matcher rejects a pattern.
+pub fn expand_skill_patterns<'a>(
+    patterns: &[String],
+    universe: impl IntoIterator<Item = &'a str>,
+) -> Result<PatternExpansion> {
+    let candidates = universe
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if patterns.is_empty() {
+        return Ok(PatternExpansion {
+            matched: candidates,
+            unmatched_patterns: Vec::new(),
+        });
+    }
+
+    let mut matched = Vec::new();
+    for candidate in &candidates {
+        if matches_patterns(candidate, patterns)? {
+            matched.push(candidate.clone());
+        }
+    }
+    let mut unmatched_patterns = Vec::new();
+    for pattern in patterns {
+        let one_pattern = std::slice::from_ref(pattern);
+        let mut any_match = false;
+        for candidate in &candidates {
+            if matches_patterns(candidate, one_pattern)? {
+                any_match = true;
+                break;
+            }
+        }
+        if !any_match {
+            unmatched_patterns.push(pattern.clone());
+        }
+    }
+    Ok(PatternExpansion {
+        matched,
+        unmatched_patterns,
+    })
+}
+
 fn compile_patterns(patterns: &[String]) -> Vec<FnPattern> {
     patterns
         .iter()
@@ -517,7 +613,10 @@ fn token_matches(token: &PatternToken, character: char) -> bool {
 mod tests {
     #[cfg(unix)]
     use super::detect_skill_dirs;
-    use super::{directories_equal, matches_patterns, validate_skill_name};
+    use super::{
+        directories_equal, expand_skill_patterns, is_fnmatch_operand, matches_patterns,
+        split_sync_operands, validate_skill_name,
+    };
     #[cfg(unix)]
     use crate::config::source_from_reference;
     #[cfg(unix)]
@@ -569,6 +668,36 @@ mod tests {
             matches_patterns("STRASSE-α", &["straße-?".into()])
                 .unwrap_or_else(|error| unreachable!("{error}"))
         );
+    }
+
+    #[test]
+    fn sync_operands_keep_literal_source_references_and_extract_patterns() {
+        let selection = split_sync_operands(&[
+            "owner/repo".into(),
+            "./local".into(),
+            "grill-*".into(),
+            "[ab]eta".into(),
+            "one?".into(),
+        ]);
+        assert_eq!(selection.sources, ["owner/repo", "./local"]);
+        assert_eq!(selection.skill_patterns, ["grill-*", "[ab]eta", "one?"]);
+        assert!(!is_fnmatch_operand("owner/repo"));
+        assert!(is_fnmatch_operand("[literal"));
+    }
+
+    #[test]
+    fn expanding_patterns_is_or_combined_and_accounts_for_unmatched_patterns() {
+        let patterns = vec!["grill-*".into(), "beta".into(), "missing-*".into()];
+        let universe = ["alpha", "grill-me", "beta", "grill-plan"];
+        let expanded = expand_skill_patterns(&patterns, universe)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(expanded.matched, ["grill-me", "beta", "grill-plan"]);
+        assert_eq!(expanded.unmatched_patterns, ["missing-*"]);
+
+        let all = expand_skill_patterns(&[], ["alpha", "beta"])
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(all.matched, ["alpha", "beta"]);
+        assert!(all.unmatched_patterns.is_empty());
     }
 
     #[cfg(unix)]

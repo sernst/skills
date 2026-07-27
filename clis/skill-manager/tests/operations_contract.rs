@@ -13,7 +13,7 @@ use std::time::Duration;
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
-use skill_manager::config::acquire_lock;
+use skill_manager::config::{acquire_lock, canonical_config_bytes};
 use tempfile::TempDir;
 
 fn sandbox() -> TempDir {
@@ -41,8 +41,8 @@ fn create_skill(collection: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 fn read_config(home: &Path) -> Value {
-    let bytes =
-        fs::read(home.join(".skill-manager.config.json")).expect("read generated config file");
+    let bytes = fs::read(home.join(".skill-manager").join("config.json"))
+        .expect("read generated config file");
     serde_json::from_slice(&bytes).expect("parse generated config")
 }
 
@@ -113,7 +113,7 @@ fn source_lifecycle_persists_updates_and_removal() {
         .as_str()
         .expect("generated source ID")
         .to_owned();
-    assert_eq!(added["schema_version"], 1);
+    assert_eq!(added["schema_version"], 2);
     assert_eq!(added["sources"][0]["name"], "team");
     assert_eq!(added["sources"][0]["label"], "Team Skills");
     assert_eq!(added["sources"][0]["exclude"][0], "draft-*");
@@ -230,7 +230,7 @@ fn source_list_machine_and_empty_cases() {
         }]
     });
     fs::write(
-        home.path().join(".skill-manager.config.json"),
+        home.path().join(".skill-manager").join("config.json"),
         config.to_string(),
     )
     .expect("write configured missing source");
@@ -246,17 +246,8 @@ fn source_list_machine_and_empty_cases() {
 #[test]
 fn target_lifecycle_enforces_builtin_and_custom_semantics() {
     let home = sandbox();
-    let first = home.path().join("first-target");
-    let second = home.path().join("second-target");
-
     cli(home.path())
-        .args([
-            "--json",
-            "target",
-            "add",
-            "custom",
-            first.to_str().expect("utf8 path"),
-        ])
+        .args(["--json", "target", "add", "custom", "first-target"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"event\":\"target.added\""));
@@ -275,18 +266,12 @@ fn target_lifecycle_enforces_builtin_and_custom_semantics() {
         .assert()
         .success();
     cli(home.path())
-        .args([
-            "--json",
-            "target",
-            "set-path",
-            "custom",
-            second.to_str().expect("utf8 path"),
-        ])
+        .args(["--json", "target", "set-path", "custom", "second-target"])
         .assert()
         .success();
     assert_eq!(
         read_config(home.path())["targets"]["custom"]["path"],
-        second.to_str().expect("utf8 path")
+        "second-target"
     );
 
     cli(home.path())
@@ -341,6 +326,7 @@ fn disabled_builtin_flags_fail_but_explicit_target_name_opts_in() {
             source.to_str().expect("utf8 path"),
             "--target",
             "claude",
+            "--global",
         ])
         .assert()
         .success();
@@ -351,16 +337,9 @@ fn disabled_builtin_flags_fail_but_explicit_target_name_opts_in() {
 fn explicit_named_and_builtin_target_selectors_form_a_deduplicated_union() {
     let home = sandbox();
     let source = home.path().join("source");
-    let custom = home.path().join("custom");
     create_skill(&source, "alpha", "# Alpha");
     cli(home.path())
-        .args([
-            "--json",
-            "target",
-            "add",
-            "custom",
-            custom.to_str().expect("utf8 path"),
-        ])
+        .args(["--json", "target", "add", "custom", "custom"])
         .assert()
         .success();
     cli(home.path())
@@ -380,6 +359,7 @@ fn explicit_named_and_builtin_target_selectors_form_a_deduplicated_union() {
             "--claude",
             "--shared",
             "--ag",
+            "--global",
             "--dry-run",
         ])
         .output()
@@ -408,6 +388,7 @@ fn explicit_named_and_builtin_target_selectors_form_a_deduplicated_union() {
             "--target",
             "custom",
             "--all",
+            "--global",
             "--dry-run",
         ])
         .output()
@@ -442,13 +423,7 @@ fn copy_load_update_status_and_remove_mutate_expected_trees() {
         .assert()
         .success();
     cli(home.path())
-        .args([
-            "--json",
-            "target",
-            "add",
-            "test-target",
-            managed_target.to_str().expect("utf8 path"),
-        ])
+        .args(["--json", "target", "add", "test-target", "managed"])
         .assert()
         .success();
 
@@ -468,7 +443,14 @@ fn copy_load_update_status_and_remove_mutate_expected_trees() {
     );
 
     cli(home.path())
-        .args(["--json", "load", "--target", "test-target", "--no-input"])
+        .args([
+            "--json",
+            "load",
+            "--target",
+            "test-target",
+            "--global",
+            "--no-input",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"event\":\"skill.loaded\""));
@@ -500,6 +482,7 @@ fn copy_load_update_status_and_remove_mutate_expected_trees() {
             "alpha",
             "--target",
             "test-target",
+            "--global",
             "--yes",
         ])
         .assert()
@@ -526,19 +509,13 @@ fn skill_action_events_preserve_loaded_overwritten_updated_copied_and_removed_pr
         .assert()
         .success();
     cli(home.path())
-        .args([
-            "--json",
-            "target",
-            "add",
-            "custom",
-            target.to_str().expect("utf8 path"),
-        ])
+        .args(["--json", "target", "add", "custom", "target"])
         .assert()
         .success();
 
     let loaded = json_events(
         cli(home.path())
-            .args(["--json", "load", "--target", "custom"])
+            .args(["--json", "load", "--target", "custom", "--global"])
             .output()
             .expect("load"),
     );
@@ -551,7 +528,7 @@ fn skill_action_events_preserve_loaded_overwritten_updated_copied_and_removed_pr
     fs::write(source.join("alpha/SKILL.md"), "# Two").expect("change source");
     let overwritten = json_events(
         cli(home.path())
-            .args(["--json", "load", "--target", "custom"])
+            .args(["--json", "load", "--target", "custom", "--global"])
             .output()
             .expect("overwrite"),
     );
@@ -570,11 +547,7 @@ fn skill_action_events_preserve_loaded_overwritten_updated_copied_and_removed_pr
     assert!(updated.iter().any(|event| {
         event["event"] == "skill.updated" && event["data"]["action"] == "updated"
     }));
-    assert!(updated.iter().any(|event| {
-        event["event"] == "skill.skipped"
-            && event["data"]["skill"] == "beta"
-            && event["data"]["action"] == "skipped"
-    }));
+    assert!(!target.join("beta").exists());
 
     let copied = json_events(
         cli(home.path())
@@ -595,7 +568,9 @@ fn skill_action_events_preserve_loaded_overwritten_updated_copied_and_removed_pr
 
     let removed = json_events(
         cli(home.path())
-            .args(["--json", "remove", "alpha", "--target", "custom", "--yes"])
+            .args([
+                "--json", "remove", "alpha", "--target", "custom", "--global", "--yes",
+            ])
             .output()
             .expect("remove"),
     );
@@ -631,13 +606,15 @@ fn status_filter_sorting_and_target_scoping_are_deterministic() {
                 "target",
                 "add",
                 name,
-                path.to_str().expect("utf8 path"),
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .expect("utf8 path"),
             ])
             .assert()
             .success();
     }
     cli(home.path())
-        .args(["--json", "load", "--target", "one"])
+        .args(["--json", "load", "--target", "one", "--global"])
         .assert()
         .success();
     create_skill(&target_one, "orphan", "# Orphan");
@@ -667,11 +644,15 @@ fn status_filter_sorting_and_target_scoping_are_deterministic() {
     }));
 
     cli(home.path())
-        .args(["status", "--target", "one"])
+        .args(["status", "--target", "one", "--global"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("orphan  unknown  no-connection"))
-        .stdout(predicate::str::contains("up-to-date: 2, no-connection: 1"))
+        .stdout(predicate::str::contains(
+            "orphan  unknown  global    no-connection",
+        ))
+        .stdout(predicate::str::contains(
+            "up-to-date: 2, no-connection: 1, global: 3",
+        ))
         .stdout(predicate::str::contains("~").not())
         .stdout(predicate::str::contains("\u{1b}[").not());
 
@@ -687,7 +668,6 @@ fn status_filter_sorting_and_target_scoping_are_deterministic() {
 fn status_json_preserves_stable_and_human_source_provenance() {
     let home = sandbox();
     let source = home.path().join("source");
-    let target = home.path().join("target");
     create_skill(&source, "alpha", "# Alpha");
     cli(home.path())
         .args([
@@ -702,13 +682,7 @@ fn status_json_preserves_stable_and_human_source_provenance() {
         .assert()
         .success();
     cli(home.path())
-        .args([
-            "--json",
-            "target",
-            "add",
-            "custom",
-            target.to_str().expect("utf8 path"),
-        ])
+        .args(["--json", "target", "add", "custom", "target"])
         .assert()
         .success();
     let source_id = read_config(home.path())["sources"][0]["id"]
@@ -744,7 +718,6 @@ fn human_status_renders_compact_source_legend_table_and_plain_summary() {
     let home = sandbox();
     let source = home.path().join("source with spaces");
     let second_source = home.path().join("second source");
-    let target = home.path().join("target");
     create_skill(&source, "alpha", "# Alpha");
     create_skill(&source, "skill-with-long-name", "# Long");
     create_skill(&second_source, "zeta", "# Zeta");
@@ -773,13 +746,7 @@ fn human_status_renders_compact_source_legend_table_and_plain_summary() {
         .assert()
         .success();
     cli(home.path())
-        .args([
-            "--json",
-            "target",
-            "add",
-            "custom",
-            target.to_str().expect("utf8 path"),
-        ])
+        .args(["--json", "target", "add", "custom", "target"])
         .assert()
         .success();
 
@@ -798,13 +765,13 @@ fn human_status_renders_compact_source_legend_table_and_plain_summary() {
         .stdout(predicate::str::contains("custom"))
         .stdout(predicate::str::contains("--------------------"))
         .stdout(predicate::str::contains(
-            "alpha                 primary                 not-loaded",
+            "alpha                 primary                 none      not-loaded",
         ))
         .stdout(predicate::str::contains(
-            "skill-with-long-name  primary                 not-loaded",
+            "skill-with-long-name  primary                 none      not-loaded",
         ))
         .stdout(predicate::str::contains(
-            "zeta                  very-long-source-alias  not-loaded",
+            "zeta                  very-long-source-alias  none      not-loaded",
         ))
         .stdout(predicate::str::contains("source with spaces"))
         .stdout(predicate::str::contains("\t").not())
@@ -859,13 +826,7 @@ fn dry_run_never_writes_deployments_or_configuration() {
     create_skill(&source, "alpha", "# Alpha");
 
     cli(home.path())
-        .args([
-            "--json",
-            "target",
-            "add",
-            "custom",
-            target.to_str().expect("utf8 path"),
-        ])
+        .args(["--json", "target", "add", "custom", "target"])
         .assert()
         .success();
     cli(home.path())
@@ -878,18 +839,25 @@ fn dry_run_never_writes_deployments_or_configuration() {
         ])
         .assert()
         .success();
-    let config_before =
-        fs::read(home.path().join(".skill-manager.config.json")).expect("read config");
+    let config_path = home.path().join(".skill-manager/config.json");
+    let config_before = fs::read(&config_path).expect("read config");
 
     cli(home.path())
-        .args(["--json", "load", "--target", "custom", "--dry-run"])
+        .args([
+            "--json",
+            "load",
+            "--target",
+            "custom",
+            "--global",
+            "--dry-run",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"dry_run\":true"));
 
     assert!(!target.exists());
     assert_eq!(
-        fs::read(home.path().join(".skill-manager.config.json")).expect("read config again"),
+        fs::read(config_path).expect("read config again"),
         config_before
     );
 }
@@ -912,13 +880,7 @@ fn cwd_source_selectors_change_discovery_without_reordering_configured_sources()
         .assert()
         .success();
     cli(home.path())
-        .args([
-            "--json",
-            "target",
-            "add",
-            "custom",
-            target.to_str().expect("utf8 path"),
-        ])
+        .args(["--json", "target", "add", "custom", "target"])
         .assert()
         .success();
 
@@ -928,6 +890,7 @@ fn cwd_source_selectors_change_discovery_without_reordering_configured_sources()
             "load",
             "--target",
             "custom",
+            "--global",
             "--cd-only",
             "--filter",
             "beta",
@@ -939,7 +902,7 @@ fn cwd_source_selectors_change_discovery_without_reordering_configured_sources()
 
     cli(home.path())
         .args([
-            "--json", "load", "--target", "custom", "--no-cd", "--filter", "alpha",
+            "--json", "load", "--target", "custom", "--global", "--no-cd", "--filter", "alpha",
         ])
         .assert()
         .success();
@@ -992,13 +955,7 @@ fn filters_update_only_and_remove_confirmation_preserve_unselected_content() {
         .assert()
         .success();
     cli(home.path())
-        .args([
-            "--json",
-            "target",
-            "add",
-            "custom",
-            managed_target.to_str().expect("utf8 path"),
-        ])
+        .args(["--json", "target", "add", "custom", "managed"])
         .assert()
         .success();
 
@@ -1012,7 +969,7 @@ fn filters_update_only_and_remove_confirmation_preserve_unselected_content() {
     );
 
     cli(home.path())
-        .args(["--json", "load", "--target", "custom"])
+        .args(["--json", "load", "--target", "custom", "--global"])
         .assert()
         .success();
     cli(home.path())
@@ -1022,6 +979,7 @@ fn filters_update_only_and_remove_confirmation_preserve_unselected_content() {
             "alpha",
             "--target",
             "custom",
+            "--global",
             "--yes",
             "--dry-run",
         ])
@@ -1030,7 +988,14 @@ fn filters_update_only_and_remove_confirmation_preserve_unselected_content() {
         .stdout(predicate::str::contains("\"dry_run\":true"));
     assert!(managed_target.join("alpha/SKILL.md").is_file());
     cli(home.path())
-        .args(["remove", "alpha", "--target", "custom", "--no-input"])
+        .args([
+            "remove",
+            "alpha",
+            "--target",
+            "custom",
+            "--global",
+            "--no-input",
+        ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("--yes"));
@@ -1056,28 +1021,19 @@ fn legacy_config_migrates_with_backup_and_dry_run_stays_in_memory() {
         .success()
         .stdout(predicate::str::contains("\"event\":\"source.listed\""));
     assert!(!legacy.exists());
-    assert!(home.path().join(".skill-manager.config.json").exists());
-    assert!(
-        home.path()
-            .join(".skill-manager.config.json.v0.bak")
-            .exists()
-    );
+    assert!(home.path().join(".skill-manager/config.json").exists());
+    assert!(home.path().join(".skill-manager/backups").is_dir());
 
     let dry_home = sandbox();
     let dry_legacy = dry_home.path().join(".skills-syncer.config.json");
     fs::write(&dry_legacy, "{}").expect("write dry-run legacy config");
     cli(dry_home.path())
-        .args(["--json", "load", "--all", "--dry-run"])
+        .args(["--json", "load", "--all", "--global", "--dry-run"])
         .assert()
         .success();
-    assert!(dry_legacy.exists());
-    assert!(!dry_home.path().join(".skill-manager.config.json").exists());
-    assert!(
-        !dry_home
-            .path()
-            .join(".skill-manager.config.json.v0.bak")
-            .exists()
-    );
+    assert!(!dry_legacy.exists());
+    assert!(dry_home.path().join(".skill-manager/config.json").exists());
+    assert!(dry_home.path().join(".skill-manager/backups").is_dir());
 }
 
 #[test]
@@ -1196,7 +1152,7 @@ fn recipe_validation_and_config_failures_use_documented_streams() {
         .stderr(predicate::str::contains("Error: invalid configuration"))
         .stdout(predicate::str::is_empty());
     assert_eq!(
-        fs::read_to_string(home.path().join(".skill-manager.config.json"))
+        fs::read_to_string(home.path().join(".skill-manager/config.json"))
             .expect("read malformed config"),
         "{broken"
     );
@@ -1243,13 +1199,13 @@ fn nested_v0_type_errors_fail_without_rewriting_or_creating_a_backup() {
             .failure()
             .stdout(predicate::str::contains("\"event\":\"command.failed\""))
             .stderr(predicate::str::is_empty());
-        assert_eq!(fs::read(&path).expect("read unchanged config"), raw);
-        assert!(
-            !home
-                .path()
-                .join(".skill-manager.config.json.v0.bak")
-                .exists()
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read(home.path().join(".skill-manager/config.json"))
+                .expect("read migrated unchanged config"),
+            raw
         );
+        assert!(!home.path().join(".skill-manager/backups").exists());
     }
 }
 
@@ -1307,15 +1263,8 @@ fn completion_and_man_generation_hooks_produce_installable_assets() {
 #[test]
 fn human_output_honors_color_policy_and_diagnostic_streams() {
     let home = sandbox();
-    let target = home.path().join("target");
     cli(home.path())
-        .args([
-            "--json",
-            "target",
-            "add",
-            "custom",
-            target.to_str().expect("utf8 path"),
-        ])
+        .args(["--json", "target", "add", "custom", "target"])
         .assert()
         .success();
 
@@ -1347,7 +1296,9 @@ fn human_output_honors_color_policy_and_diagnostic_streams() {
         .success()
         .stdout(predicate::str::contains("\u{1b}[36m").not())
         .stdout(predicate::str::contains("\u{1b}[").not())
-        .stdout(predicate::str::contains("alpha  primary  not-loaded"));
+        .stdout(predicate::str::contains(
+            "alpha  primary  none      not-loaded",
+        ));
 
     let mut no_color = cli(home.path());
     no_color
@@ -1357,7 +1308,7 @@ fn human_output_honors_color_policy_and_diagnostic_streams() {
         .success()
         .stdout(predicate::str::contains("\u{1b}[").not());
 
-    fs::write(home.path().join(".skill-manager.config.json"), "{broken")
+    fs::write(home.path().join(".skill-manager/config.json"), "{broken")
         .expect("write malformed config");
     let mut diagnostic = cli(home.path());
     diagnostic.env_remove("NO_COLOR");
@@ -1386,7 +1337,9 @@ fn later_target_failure_preserves_prior_commits_and_orders_failure_last() {
                 "target",
                 "add",
                 name,
-                path.to_str().expect("utf8 path"),
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .expect("utf8 path"),
             ])
             .assert()
             .success();
@@ -1400,6 +1353,7 @@ fn later_target_failure_preserves_prior_commits_and_orders_failure_last() {
             "good",
             "--target",
             "bad",
+            "--global",
         ])
         .output()
         .expect("run partial load");
@@ -1424,7 +1378,7 @@ fn later_target_failure_preserves_prior_commits_and_orders_failure_last() {
 #[test]
 fn cross_process_configuration_lock_times_out_cleanly() {
     let home = sandbox();
-    let lock_path = home.path().join(".skill-manager-cache/.locks/config.lock");
+    let lock_path = home.path().join(".skill-manager/locks/config.lock");
     let _held = acquire_lock(&lock_path, "test-holder", Duration::from_secs(1))
         .expect("hold config lock in test process");
     cli(home.path())
@@ -1435,7 +1389,7 @@ fn cross_process_configuration_lock_times_out_cleanly() {
         .stdout(predicate::str::contains(
             "timed out waiting for configuration lock",
         ));
-    assert!(!home.path().join(".skill-manager.config.json").exists());
+    assert!(!home.path().join(".skill-manager/config.json").exists());
 }
 
 #[test]
@@ -1468,21 +1422,14 @@ fn v0_migration_preserves_disabled_builtin_target_state() {
     );
     assert!(config["targets"]["claude"].is_null());
 
-    let changed = home.path().join("legacy-claude");
     cli(home.path())
-        .args([
-            "--json",
-            "target",
-            "set-path",
-            "claude",
-            changed.to_str().expect("utf8 path"),
-        ])
+        .args(["--json", "target", "set-path", "claude", "legacy-claude"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"event\":\"target.path-set\""));
     assert_eq!(
         read_config(home.path())["legacy_target_overrides"]["claude"]["path"],
-        changed.to_str().expect("utf8 path")
+        "legacy-claude"
     );
 
     cli(home.path())
@@ -1528,26 +1475,28 @@ fn v0_migration_canonicalizes_mixed_case_builtin_target_for_lifecycle() {
 
     let migrated = read_config(home.path());
     assert!(migrated["legacy_target_overrides"]["Claude"].is_null());
-    assert_eq!(
-        migrated["legacy_target_overrides"]["claude"]["path"],
-        legacy_path.to_str().expect("utf8 path")
+    let migrated_template = PathBuf::from(
+        migrated["legacy_target_overrides"]["claude"]["path"]
+            .as_str()
+            .expect("migrated target template"),
     );
+    assert!(migrated_template.is_relative());
+    assert!(migrated_template.ends_with("mixed-case-claude"));
 
-    let changed_path = home.path().join("changed-mixed-case-claude");
     cli(home.path())
         .args([
             "--json",
             "target",
             "set-path",
             "CLAUDE",
-            changed_path.to_str().expect("utf8 path"),
+            "changed-mixed-case-claude",
         ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"event\":\"target.path-set\""));
     assert_eq!(
         read_config(home.path())["legacy_target_overrides"]["claude"]["path"],
-        changed_path.to_str().expect("utf8 path")
+        "changed-mixed-case-claude"
     );
 }
 
@@ -1576,7 +1525,7 @@ fn collisions_are_first_source_wins_and_resolve_persists_exclude() {
         .args([
             "--json",
             "resolve",
-            "common",
+            "com*",
             "--prefer-source",
             "second",
             "--no-input",
@@ -1646,7 +1595,8 @@ fn human_prompts_cover_text_confirmation_cancellation_and_invalid_answers() {
     cli(home.path())
         .args(["load", "--filter", "alpha", "--no-input", "--dry-run"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("--global or --project"));
 
     cli(home.path())
         .args(["load", "--filter", "alpha"])
@@ -1657,22 +1607,16 @@ fn human_prompts_cover_text_confirmation_cancellation_and_invalid_answers() {
 
     let target = home.path().join("prompt-target");
     cli(home.path())
-        .args([
-            "--json",
-            "target",
-            "add",
-            "prompt-target",
-            target.to_str().expect("utf8 path"),
-        ])
+        .args(["--json", "target", "add", "prompt-target", "prompt-target"])
         .assert()
         .success();
     cli(home.path())
-        .args(["--json", "load", "--target", "prompt-target"])
+        .args(["--json", "load", "--target", "prompt-target", "--global"])
         .assert()
         .success();
 
     cli(home.path())
-        .args(["remove", "alpha", "--target", "prompt-target"])
+        .args(["remove", "alpha", "--target", "prompt-target", "--global"])
         .write_stdin("n\n")
         .assert()
         .success()
@@ -1680,7 +1624,7 @@ fn human_prompts_cover_text_confirmation_cancellation_and_invalid_answers() {
     assert!(target.join("alpha/SKILL.md").is_file());
 
     cli(home.path())
-        .args(["remove", "alpha", "--target", "prompt-target"])
+        .args(["remove", "alpha", "--target", "prompt-target", "--global"])
         .write_stdin("y\n")
         .assert()
         .success()
@@ -1762,13 +1706,7 @@ fn no_work_paths_succeed_without_creating_destination_content() {
     assert!(!destination.exists());
 
     cli(home.path())
-        .args([
-            "--json",
-            "target",
-            "add",
-            "managed",
-            managed.to_str().expect("utf8 path"),
-        ])
+        .args(["--json", "target", "add", "managed", "managed"])
         .assert()
         .success();
     cli(home.path())
@@ -1871,25 +1809,12 @@ fn source_validation_rejects_duplicates_unknowns_and_invalid_values() {
 #[test]
 fn target_validation_rejects_duplicates_and_unknown_lifecycle_references() {
     let home = sandbox();
-    let target = home.path().join("target");
     cli(home.path())
-        .args([
-            "--json",
-            "target",
-            "add",
-            "custom",
-            target.to_str().expect("utf8 path"),
-        ])
+        .args(["--json", "target", "add", "custom", "target"])
         .assert()
         .success();
     cli(home.path())
-        .args([
-            "--json",
-            "target",
-            "add",
-            "custom",
-            home.path().to_str().expect("utf8 path"),
-        ])
+        .args(["--json", "target", "add", "custom", "duplicate"])
         .assert()
         .failure()
         .stdout(predicate::str::contains("already exists"));
@@ -1945,4 +1870,347 @@ fn machine_input_carriers_are_exclusive_and_noninteractive() {
         .stdout(predicate::str::contains(
             "source name is required in noninteractive mode",
         ));
+}
+
+#[test]
+// This end-to-end contract intentionally exercises the complete cross-scope lifecycle.
+#[allow(clippy::too_many_lines)]
+fn project_scope_overrides_global_and_update_remove_infer_existing_scope() {
+    let home = sandbox();
+    let project = home.path().join("project");
+    let source = home.path().join("source");
+    fs::create_dir_all(&project).expect("create project");
+    create_skill(&source, "alpha", "# Global");
+
+    cli(home.path())
+        .args(["--json", "target", "add", "custom", ".custom/skills"])
+        .assert()
+        .success();
+    cli(home.path())
+        .args([
+            "--json",
+            "load",
+            source.to_str().expect("utf8 source"),
+            "--target",
+            "custom",
+            "--global",
+        ])
+        .assert()
+        .success();
+    let global_skill = home.path().join(".custom/skills/alpha/SKILL.md");
+    assert_eq!(
+        fs::read_to_string(&global_skill).expect("global skill"),
+        "# Global"
+    );
+
+    fs::write(source.join("alpha/SKILL.md"), "# Project").expect("change source");
+    let mut project_load = cli(home.path());
+    project_load.current_dir(&project);
+    project_load
+        .args([
+            "--json",
+            "load",
+            source.to_str().expect("utf8 source"),
+            "--target",
+            "custom",
+            "--project",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"scope\":\"project\""));
+    let project_skill = project.join(".custom/skills/alpha/SKILL.md");
+    assert_eq!(
+        fs::read_to_string(&project_skill).expect("project skill"),
+        "# Project"
+    );
+
+    fs::write(source.join("alpha/SKILL.md"), "# Updated Project").expect("change source again");
+    let mut inferred_update = cli(home.path());
+    inferred_update.current_dir(&project);
+    inferred_update
+        .args([
+            "--json",
+            "update",
+            source.to_str().expect("utf8 source"),
+            "--target",
+            "custom",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"scope\":\"project\""));
+    assert_eq!(
+        fs::read_to_string(&project_skill).expect("updated project skill"),
+        "# Updated Project"
+    );
+    assert_eq!(
+        fs::read_to_string(&global_skill).expect("unchanged global skill"),
+        "# Global"
+    );
+
+    let mut status = cli(home.path());
+    status.current_dir(&project);
+    let events = json_events(
+        status
+            .args(["--json", "status", "--target", "custom"])
+            .output()
+            .expect("scoped status"),
+    );
+    let row = events
+        .iter()
+        .find(|event| event["event"] == "status.row")
+        .expect("status row");
+    assert_eq!(row["data"]["location"], "both");
+    assert_eq!(row["data"]["shadowed_global_divergent"], true);
+    let deployments = row["data"]["deployments"]
+        .as_array()
+        .expect("deployment details");
+    let expected_global_deployment = home.path().join(".custom").join("skills").join("alpha");
+    let expected_project_deployment = project.join(".custom").join("skills").join("alpha");
+    assert_eq!(deployments.len(), 2);
+    assert_eq!(deployments[0]["scope"], "global");
+    assert_eq!(deployments[0]["effective"], false);
+    assert_eq!(
+        deployments[0]["path"].as_str(),
+        Some(expected_global_deployment.to_string_lossy().as_ref())
+    );
+    assert_eq!(deployments[1]["scope"], "project");
+    assert_eq!(deployments[1]["effective"], true);
+    assert_eq!(
+        deployments[1]["path"].as_str(),
+        Some(expected_project_deployment.to_string_lossy().as_ref())
+    );
+
+    let mut ambiguous_remove = cli(home.path());
+    ambiguous_remove.current_dir(&project);
+    ambiguous_remove
+        .args(["--json", "remove", "alpha", "--target", "custom", "--yes"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("--global or --project"));
+
+    let mut project_remove = cli(home.path());
+    project_remove.current_dir(&project);
+    project_remove
+        .args([
+            "--json",
+            "remove",
+            "alpha",
+            "--target",
+            "custom",
+            "--project",
+            "--yes",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"scope\":\"project\""));
+    assert!(!project_skill.exists());
+    assert!(global_skill.exists());
+}
+
+#[test]
+fn load_scope_prompt_uses_exact_cwd_vendor_directory_as_its_default() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    let project = home.path().join("project");
+    let other_project = home.path().join("other-project");
+    create_skill(&source, "alpha", "# Alpha");
+    fs::create_dir_all(project.join(".agents")).expect("create project vendor directory");
+    fs::create_dir_all(&other_project).expect("create other project");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+        ])
+        .assert()
+        .success();
+
+    let mut project_load = cli(home.path());
+    project_load.current_dir(&project);
+    project_load
+        .args(["load", "--shared", "--filter", "alpha"])
+        .write_stdin("\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Install skills at project scope? [Y/n]",
+        ));
+    assert!(project.join(".agents/skills/alpha/SKILL.md").is_file());
+
+    let mut global_load = cli(home.path());
+    global_load.current_dir(&other_project);
+    global_load
+        .args(["load", "--shared", "--filter", "alpha"])
+        .write_stdin("\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Install skills at project scope? [y/N]",
+        ));
+    assert!(home.path().join(".agents/skills/alpha/SKILL.md").is_file());
+    assert!(!other_project.join(".agents/skills/alpha").exists());
+}
+
+#[test]
+// This end-to-end contract keeps pattern operations and byte-safe recovery in one workflow.
+#[allow(clippy::too_many_lines)]
+fn positional_fnmatch_and_config_recovery_contracts_are_end_to_end() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "grill-one", "# One");
+    create_skill(&source, "grill-two", "# Two");
+    create_skill(&source, "other", "# Other");
+    cli(home.path())
+        .args(["--json", "target", "add", "custom", ".custom/skills"])
+        .assert()
+        .success();
+    cli(home.path())
+        .args([
+            "--json",
+            "load",
+            source.to_str().expect("utf8 source"),
+            "grill-*",
+            "--filter",
+            "*two",
+            "--target",
+            "custom",
+            "--global",
+        ])
+        .assert()
+        .success();
+    assert!(!home.path().join(".custom/skills/grill-one").exists());
+    assert!(
+        home.path()
+            .join(".custom/skills/grill-two/SKILL.md")
+            .is_file()
+    );
+    assert!(!home.path().join(".custom/skills/other").exists());
+
+    fs::write(source.join("grill-two/SKILL.md"), "# Two Updated").expect("update patterned source");
+    cli(home.path())
+        .args([
+            "--json",
+            "update",
+            source.to_str().expect("utf8 source"),
+            "grill-*",
+            "--target",
+            "custom",
+            "--global",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"event\":\"skill.updated\""));
+    assert_eq!(
+        fs::read_to_string(home.path().join(".custom/skills/grill-two/SKILL.md"))
+            .expect("updated patterned deployment"),
+        "# Two Updated"
+    );
+    cli(home.path())
+        .args([
+            "--json", "status", "grill-*", "--target", "custom", "--global",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"skill\":\"grill-two\""))
+        .stdout(predicate::str::contains("\"skill\":\"other\"").not());
+    cli(home.path())
+        .args([
+            "--json", "remove", "grill-*", "--target", "custom", "--global", "--yes",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"event\":\"skill.removed\""));
+    assert!(!home.path().join(".custom/skills/grill-two").exists());
+
+    cli(home.path())
+        .args([
+            "--json",
+            "load",
+            source.to_str().expect("utf8 source"),
+            "missing-*",
+            "--target",
+            "custom",
+            "--global",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("skill pattern matched nothing"));
+
+    let raw_home = sandbox();
+    let expected = canonical_config_bytes().expect("canonical config");
+    let output = cli(raw_home.path())
+        .args(["configs", "--raw"])
+        .output()
+        .expect("raw config");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, expected);
+    assert_eq!(
+        fs::read(raw_home.path().join(".skill-manager/config.json")).expect("stored config"),
+        expected
+    );
+
+    let malformed = b"{ definitely malformed\n";
+    fs::write(
+        raw_home.path().join(".skill-manager/config.json"),
+        malformed,
+    )
+    .expect("write malformed config");
+    let reset_events = json_events(
+        cli(raw_home.path())
+            .args(["--json", "configs", "reset", "--yes"])
+            .output()
+            .expect("reset malformed config"),
+    );
+    let backup_id = reset_events
+        .iter()
+        .find(|event| event["event"] == "config.reset")
+        .and_then(|event| event["data"]["backup_id"].as_str())
+        .expect("reset backup ID")
+        .to_owned();
+    assert_eq!(
+        fs::read(
+            raw_home
+                .path()
+                .join(".skill-manager/backups")
+                .join(&backup_id)
+                .join("config.raw")
+        )
+        .expect("backup raw bytes"),
+        malformed
+    );
+    cli(raw_home.path())
+        .args(["--json", "configs", "restore", &backup_id, "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"event\":\"config.restored\""));
+    assert_eq!(
+        fs::read(raw_home.path().join(".skill-manager/config.json")).expect("restored config"),
+        malformed
+    );
+    for rejected in [" yes \n", "yes \n", "YES\n", "Yes\n", "y\n"] {
+        cli(raw_home.path())
+            .args(["configs", "reset"])
+            .write_stdin(rejected)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Cancelled."));
+        assert_eq!(
+            fs::read(raw_home.path().join(".skill-manager/config.json"))
+                .expect("cancelled reset preserves config"),
+            malformed
+        );
+    }
+    cli(raw_home.path())
+        .args(["configs", "reset"])
+        .write_stdin("yes\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Reset configuration."));
+    assert_eq!(
+        fs::read(raw_home.path().join(".skill-manager/config.json"))
+            .expect("exact confirmation resets config"),
+        expected
+    );
 }

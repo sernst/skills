@@ -60,6 +60,19 @@ fn status_aliases_are_accepted() {
     }
 }
 
+/// Positional operand help distinguishes literal sources/skills from patterns.
+#[test]
+fn skill_operand_help_mentions_patterns() {
+    for command in ["load", "update", "remove", "resolve"] {
+        let mut invocation = Command::cargo_bin("skill-manager").expect("test binary");
+        invocation
+            .args([command, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("PATTERN"));
+    }
+}
+
 /// Machine output requests must not send structured records to stderr.
 #[test]
 fn json_errors_are_machine_readable_on_stdout() {

@@ -1,10 +1,43 @@
 //! Core domain types independent of user interface and persistence.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+
+/// Installation scope for a deployment target.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    /// A target rooted below the current user's manager home.
+    #[default]
+    Global,
+    /// A target rooted below the exact process working directory.
+    Project,
+}
+
+impl Scope {
+    /// Stable command- and event-facing label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Project => "project",
+        }
+    }
+
+    /// Select the filesystem root for this scope.
+    #[must_use]
+    pub fn root<'a>(self, user_home: &'a Path, project_root: &'a Path) -> &'a Path {
+        match self {
+            Self::Global => user_home,
+            Self::Project => project_root,
+        }
+    }
+}
 
 /// Stable source identifier.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -175,6 +208,17 @@ pub struct Target {
     pub builtin: bool,
     /// Whether a migrated legacy definition overrides a built-in.
     pub legacy_override: bool,
+}
+
+/// Runtime target together with the template and scope used to resolve it.
+#[derive(Clone, Debug)]
+pub struct ScopedTarget {
+    /// Fully resolved target consumed by deployment operations.
+    pub target: Target,
+    /// Normalized root-relative target template.
+    pub template: PathBuf,
+    /// Root against which the template was resolved.
+    pub scope: Scope,
 }
 
 /// State of a source skill relative to a deployment target.

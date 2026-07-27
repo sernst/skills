@@ -12,6 +12,7 @@ use std::{
     os::windows::ffi::{OsStrExt, OsStringExt},
 };
 
+use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -21,11 +22,14 @@ use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 use url::Url;
 
-use crate::domain::{SourceEntry, SourceLocation, SourceMode, SourceType, Target, TargetEntry};
+use crate::domain::{
+    Scope, ScopedTarget, SourceEntry, SourceLocation, SourceMode, SourceType, Target, TargetEntry,
+};
 use crate::error::{Result, SkillManagerError};
+use crate::storage_migration::{self, LayoutMigrationResult, LayoutPaths};
 
 /// Current configuration schema.
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 /// Default remote cache lifetime.
 pub const DEFAULT_CACHE_TTL_HOURS: i64 = 24;
 #[cfg(windows)]
@@ -48,7 +52,7 @@ const fn default_true() -> bool {
     true
 }
 
-/// Persisted version-one configuration.
+/// Persisted version-two configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     /// On-disk schema.
@@ -96,11 +100,59 @@ pub struct LoadedConfig {
     pub active_path: PathBuf,
     /// Compatibility warning generated while selecting the path.
     pub warning: Option<String>,
+    /// Whether an on-disk configuration existed when loading began.
+    pub persisted: bool,
+    /// Startup layout migration details for diagnostic event emission.
+    pub layout_migration: LayoutMigrationResult,
+}
+
+/// Immutable backup metadata persisted beside exact configuration bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BackupMetadata {
+    /// Stable path-safe identifier.
+    pub id: String,
+    /// UTC creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Operation that created the backup.
+    pub reason: String,
+    /// Configuration path represented by the record.
+    pub original_path: PathBuf,
+    /// Whether the represented state had a configuration file.
+    pub present: bool,
+    /// Best-effort schema discovered from the raw bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u64>,
+    /// Whether the bytes are syntactically valid JSON.
+    pub valid: bool,
+}
+
+/// Backup record returned by repository operations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigBackup {
+    /// Persisted metadata.
+    pub metadata: BackupMetadata,
+    /// Exact-byte payload location. Absent-state records do not create it.
+    pub raw_path: PathBuf,
+}
+
+/// Outcome of restoring a configuration backup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestoreOutcome {
+    /// Backup whose state was restored.
+    pub restored: ConfigBackup,
+    /// Backup of the state displaced by the restore.
+    pub displaced: ConfigBackup,
 }
 
 /// Persistence port used by the application service.
 pub trait ConfigRepository {
-    /// Load and, unless dry-running, migrate configuration.
+    /// Run the isolated startup layout migration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when legacy data cannot be migrated safely.
+    fn migrate_layout(&self) -> Result<LayoutMigrationResult>;
+    /// Load and migrate configuration.
     ///
     /// # Errors
     ///
@@ -114,14 +166,52 @@ pub trait ConfigRepository {
     fn save(&self, active_path: &Path, config: &Config) -> Result<()>;
     /// Return the cache root.
     fn cache_root(&self) -> &Path;
+    /// Return the consolidated storage root.
+    fn storage_root(&self) -> &Path;
+    /// Return the canonical configuration path.
+    fn config_path(&self) -> &Path;
+    /// Read exact active bytes without parsing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the active configuration cannot be read.
+    fn read_raw(&self) -> Result<Option<Vec<u8>>>;
+    /// Read exact active bytes, creating canonical empty v2 when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when configuration storage cannot be read or initialized.
+    fn read_raw_or_create(&self) -> Result<Vec<u8>>;
+    /// Return backup records ordered oldest to newest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when backup storage cannot be inspected safely.
+    fn list_backups(&self) -> Result<Vec<ConfigBackup>>;
+    /// Archive the current state and install canonical empty v2 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the state cannot be locked, archived, or replaced.
+    fn reset_config(&self) -> Result<ConfigBackup>;
+    /// Restore a selected or latest immutable backup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backup is unavailable or the state cannot be replaced safely.
+    fn restore_config(&self, backup_id: Option<&str>) -> Result<RestoreOutcome>;
 }
 
 /// User-home-backed configuration repository.
 #[derive(Clone, Debug)]
 pub struct FileConfigRepository {
-    current_path: PathBuf,
-    legacy_path: PathBuf,
+    user_home: PathBuf,
+    storage_root: PathBuf,
+    config_path: PathBuf,
     cache_root: PathBuf,
+    backups_root: PathBuf,
+    locks_root: PathBuf,
+    layout_paths: LayoutPaths,
 }
 
 impl FileConfigRepository {
@@ -137,59 +227,270 @@ impl FileConfigRepository {
     /// Build a repository rooted at an explicit home, primarily for tests.
     #[must_use]
     pub fn new(home: impl AsRef<Path>) -> Self {
-        let home = home.as_ref();
+        let user_home = home.as_ref().to_path_buf();
+        let layout_paths = LayoutPaths::new(&user_home);
         Self {
-            current_path: home.join(".skill-manager.config.json"),
-            legacy_path: home.join(".skills-syncer.config.json"),
-            cache_root: home.join(".skill-manager-cache"),
+            user_home,
+            storage_root: layout_paths.storage_root.clone(),
+            config_path: layout_paths.config.clone(),
+            cache_root: layout_paths.cache.clone(),
+            backups_root: layout_paths.backups.clone(),
+            locks_root: layout_paths.storage_root.join("locks"),
+            layout_paths,
         }
     }
 
-    fn select_active_path(&self, dry_run: bool) -> (PathBuf, Option<String>) {
-        if self.current_path.exists() || !self.legacy_path.exists() {
-            return (self.current_path.clone(), None);
-        }
-        if dry_run {
-            return (
-                self.legacy_path.clone(),
-                Some(format!(
-                    "would migrate legacy configuration {} to {}",
-                    self.legacy_path.display(),
-                    self.current_path.display()
-                )),
-            );
-        }
-        let mut last_error = None;
-        for _ in 0..3 {
-            match fs::rename(&self.legacy_path, &self.current_path) {
-                Ok(()) => return (self.current_path.clone(), None),
-                Err(error) => last_error = Some(error),
-            }
-        }
-        let detail = last_error.map_or_else(|| "unknown error".into(), |error| error.to_string());
-        (
-            self.legacy_path.clone(),
-            Some(format!(
-                "could not rename {} to {} ({detail}); using the legacy path",
-                self.legacy_path.display(),
-                self.current_path.display()
-            )),
-        )
+    /// Manager/user home used for global targets and `~/` expansion.
+    #[must_use]
+    pub fn user_home(&self) -> &Path {
+        &self.user_home
     }
 
     fn lock_path(&self) -> PathBuf {
-        self.cache_root.join(".locks").join("config.lock")
+        self.locks_root.join("config.lock")
+    }
+
+    fn save_unlocked(active_path: &Path, config: &Config) -> Result<()> {
+        let mut normalized = config.clone();
+        normalize_config_locations(&mut normalized)?;
+        normalize_config_targets(&mut normalized)?;
+        validate_config(&normalized, active_path)?;
+        let mut bytes = serde_json::to_vec_pretty(&normalized)
+            .map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
+        bytes.push(b'\n');
+        atomic_write(active_path, &bytes)
+    }
+
+    fn backup_unlocked(&self, reason: &str) -> Result<ConfigBackup> {
+        let bytes = match fs::read(&self.config_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(SkillManagerError::io(&self.config_path, error)),
+        };
+        self.create_backup_unlocked(reason, bytes.as_deref())
+    }
+
+    fn create_backup_unlocked(&self, reason: &str, bytes: Option<&[u8]>) -> Result<ConfigBackup> {
+        fs::create_dir_all(&self.backups_root)
+            .map_err(|error| SkillManagerError::io(&self.backups_root, error))?;
+        let now = Utc::now();
+        let safe_reason = reason
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '-' {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_owned();
+        let prefix = format!(
+            "{}-{}",
+            now.format("%Y%m%dT%H%M%S%.3fZ"),
+            if safe_reason.is_empty() {
+                "backup"
+            } else {
+                &safe_reason
+            }
+        );
+        let mut id = prefix.clone();
+        let mut suffix = 2_u32;
+        while self.backups_root.join(&id).exists() {
+            id = format!("{prefix}-{suffix}");
+            suffix += 1;
+        }
+        let final_directory = self.backups_root.join(&id);
+        let staging = tempfile::Builder::new()
+            .prefix(".backup-")
+            .tempdir_in(&self.backups_root)
+            .map_err(|error| SkillManagerError::io(&self.backups_root, error))?;
+        let raw_path = final_directory.join("config.raw");
+        if let Some(raw) = bytes {
+            let staged_raw = staging.path().join("config.raw");
+            fs::write(&staged_raw, raw)
+                .and_then(|()| {
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&staged_raw)?
+                        .sync_all()
+                })
+                .map_err(|error| SkillManagerError::io(&staged_raw, error))?;
+        }
+        let parsed = bytes.and_then(|raw| serde_json::from_slice::<Value>(raw).ok());
+        let metadata = BackupMetadata {
+            id,
+            created_at: now,
+            reason: reason.to_owned(),
+            original_path: self.config_path.clone(),
+            present: bytes.is_some(),
+            schema_version: parsed
+                .as_ref()
+                .and_then(|value| value.get("schema_version"))
+                .and_then(Value::as_u64),
+            valid: bytes.is_none() || parsed.is_some(),
+        };
+        let metadata_bytes = serde_json::to_vec_pretty(&metadata)
+            .map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
+        let staged_metadata = staging.path().join("metadata.json");
+        fs::write(&staged_metadata, metadata_bytes)
+            .and_then(|()| {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&staged_metadata)?
+                    .sync_all()
+            })
+            .map_err(|error| SkillManagerError::io(&staged_metadata, error))?;
+        fs::rename(staging.keep(), &final_directory)
+            .map_err(|error| SkillManagerError::io(&final_directory, error))?;
+        Ok(ConfigBackup { metadata, raw_path })
+    }
+
+    fn list_backups_unlocked(&self) -> Result<Vec<ConfigBackup>> {
+        if !self.backups_root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut records = Vec::new();
+        let entries = fs::read_dir(&self.backups_root)
+            .map_err(|error| SkillManagerError::io(&self.backups_root, error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| SkillManagerError::io(&self.backups_root, error))?;
+            let directory = entry.path();
+            let entry_kind = entry
+                .file_type()
+                .map_err(|error| SkillManagerError::io(&directory, error))?;
+            if !entry_kind.is_dir() || entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let metadata_path = directory.join("metadata.json");
+            if !metadata_path.exists() {
+                continue;
+            }
+            let metadata_kind = fs::symlink_metadata(&metadata_path)
+                .map_err(|error| SkillManagerError::io(&metadata_path, error))?
+                .file_type();
+            if !metadata_kind.is_file() {
+                continue;
+            }
+            let bytes = fs::read(&metadata_path)
+                .map_err(|error| SkillManagerError::io(&metadata_path, error))?;
+            let Ok(metadata) = serde_json::from_slice::<BackupMetadata>(&bytes) else {
+                continue;
+            };
+            let directory_name = entry.file_name();
+            if !safe_backup_id(&metadata.id)
+                || directory_name.to_str() != Some(metadata.id.as_str())
+            {
+                continue;
+            }
+            let raw_path = directory.join("config.raw");
+            match fs::symlink_metadata(&raw_path) {
+                Ok(raw_metadata) if metadata.present && raw_metadata.file_type().is_file() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && !metadata.present => {
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(SkillManagerError::io(&raw_path, error)),
+            }
+            records.push(ConfigBackup { metadata, raw_path });
+        }
+        records.sort_by(|left, right| {
+            left.metadata
+                .created_at
+                .cmp(&right.metadata.created_at)
+                .then_with(|| left.metadata.id.cmp(&right.metadata.id))
+        });
+        Ok(records)
+    }
+
+    fn prune_backups_unlocked(&self, preserve_id: Option<&str>) -> Result<()> {
+        let records = self.list_backups_unlocked()?;
+        let canonical_root = if records.is_empty() {
+            None
+        } else {
+            Some(
+                fs::canonicalize(&self.backups_root)
+                    .map_err(|error| SkillManagerError::io(&self.backups_root, error))?,
+            )
+        };
+        let newest = records.last().map(|record| record.metadata.id.clone());
+        let cutoff = Utc::now() - chrono::Duration::days(30);
+        for record in records {
+            if record.metadata.created_at >= cutoff
+                || Some(record.metadata.id.as_str()) == newest.as_deref()
+                || Some(record.metadata.id.as_str()) == preserve_id
+            {
+                continue;
+            }
+            let directory = record.raw_path.parent().ok_or_else(|| {
+                invalid_backup_record(&record.raw_path, "backup payload has no parent directory")
+            })?;
+            let expected = self.backups_root.join(&record.metadata.id);
+            if directory != expected || directory.parent() != Some(self.backups_root.as_path()) {
+                return Err(invalid_backup_record(
+                    directory,
+                    "backup directory is outside the configured backup root",
+                ));
+            }
+            let directory_kind = fs::symlink_metadata(directory)
+                .map_err(|error| SkillManagerError::io(directory, error))?
+                .file_type();
+            if !directory_kind.is_dir() {
+                return Err(invalid_backup_record(
+                    directory,
+                    "backup directory must be a regular directory",
+                ));
+            }
+            let canonical_directory = fs::canonicalize(directory)
+                .map_err(|error| SkillManagerError::io(directory, error))?;
+            if canonical_directory.parent() != canonical_root.as_deref() {
+                return Err(invalid_backup_record(
+                    directory,
+                    "backup directory resolves outside the configured backup root",
+                ));
+            }
+            fs::remove_dir_all(directory)
+                .map_err(|error| SkillManagerError::io(directory, error))?;
+        }
+        Ok(())
+    }
+}
+
+fn safe_backup_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('.')
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+}
+
+fn invalid_backup_record(path: &Path, message: &str) -> SkillManagerError {
+    SkillManagerError::InvalidConfig {
+        path: path.to_path_buf(),
+        message: message.into(),
     }
 }
 
 impl ConfigRepository for FileConfigRepository {
-    fn load(&self, dry_run: bool) -> Result<LoadedConfig> {
-        let (active_path, warning) = self.select_active_path(dry_run);
+    fn migrate_layout(&self) -> Result<LayoutMigrationResult> {
+        let _lock = acquire_lock(&self.lock_path(), "configuration", Duration::from_secs(10))?;
+        storage_migration::migrate(&self.layout_paths)
+    }
+
+    fn load(&self, _dry_run: bool) -> Result<LoadedConfig> {
+        let _lock = acquire_lock(&self.lock_path(), "configuration", Duration::from_secs(10))?;
+        let layout_migration = storage_migration::migrate(&self.layout_paths)?;
+        let active_path = self.config_path.clone();
         if !active_path.exists() {
             return Ok(LoadedConfig {
                 config: Config::default(),
                 active_path,
-                warning,
+                warning: layout_migration.warnings.first().cloned(),
+                persisted: false,
+                layout_migration,
             });
         }
         let raw = fs::read(&active_path)
@@ -208,9 +509,16 @@ impl ConfigRepository for FileConfigRepository {
                 ),
             });
         }
-        let migrated = schema == 0;
-        if migrated {
+        let migrated = schema < u64::from(CONFIG_SCHEMA_VERSION);
+        if schema == 0 {
             value = migrate_v0(&value)?;
+        }
+        if value
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            .is_some_and(|schema| schema == 1)
+        {
+            value = migrate_v1(&value)?;
         }
         let mut config: Config =
             serde_json::from_value(value).map_err(|error| SkillManagerError::InvalidConfig {
@@ -218,47 +526,125 @@ impl ConfigRepository for FileConfigRepository {
                 message: error.to_string(),
             })?;
         normalize_config_locations(&mut config)?;
+        normalize_config_targets(&mut config)?;
         validate_config(&config, &active_path)?;
-        if migrated && !dry_run {
-            ensure_v0_backup(&active_path, &raw)?;
-            self.save(&active_path, &config)?;
+        if migrated {
+            self.create_backup_unlocked(
+                if schema == 0 {
+                    "schema-v0-migration"
+                } else {
+                    "schema-v1-migration"
+                },
+                Some(&raw),
+            )?;
+            Self::save_unlocked(&active_path, &config)?;
+            self.prune_backups_unlocked(None)?;
         }
         Ok(LoadedConfig {
             config,
             active_path,
-            warning,
+            warning: layout_migration.warnings.first().cloned(),
+            persisted: true,
+            layout_migration,
         })
     }
 
     fn save(&self, active_path: &Path, config: &Config) -> Result<()> {
-        let mut normalized = config.clone();
-        normalize_config_locations(&mut normalized)?;
-        validate_config(&normalized, active_path)?;
         let _lock = acquire_lock(&self.lock_path(), "configuration", Duration::from_secs(10))?;
-        let parent = active_path.parent().ok_or_else(|| {
-            SkillManagerError::InvalidInput(format!(
-                "configuration path has no parent: {}",
-                active_path.display()
-            ))
-        })?;
-        fs::create_dir_all(parent).map_err(|error| SkillManagerError::io(parent, error))?;
-        let mut bytes = serde_json::to_vec_pretty(&normalized)
-            .map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
-        bytes.push(b'\n');
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|error| SkillManagerError::io(parent, error))?;
-        temporary
-            .write_all(&bytes)
-            .and_then(|()| temporary.as_file().sync_all())
-            .map_err(|error| SkillManagerError::io(temporary.path(), error))?;
-        temporary
-            .persist(active_path)
-            .map_err(|error| SkillManagerError::io(active_path, error.error))?;
-        Ok(())
+        Self::save_unlocked(active_path, config)?;
+        self.prune_backups_unlocked(None)
     }
 
     fn cache_root(&self) -> &Path {
         &self.cache_root
+    }
+
+    fn storage_root(&self) -> &Path {
+        &self.storage_root
+    }
+
+    fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
+    fn read_raw(&self) -> Result<Option<Vec<u8>>> {
+        let _lock = acquire_lock(&self.lock_path(), "configuration", Duration::from_secs(10))?;
+        storage_migration::migrate(&self.layout_paths)?;
+        match fs::read(&self.config_path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(SkillManagerError::io(&self.config_path, error)),
+        }
+    }
+
+    fn read_raw_or_create(&self) -> Result<Vec<u8>> {
+        let _lock = acquire_lock(&self.lock_path(), "configuration", Duration::from_secs(10))?;
+        storage_migration::migrate(&self.layout_paths)?;
+        match fs::read(&self.config_path) {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let bytes = canonical_config_bytes()?;
+                atomic_write(&self.config_path, &bytes)?;
+                Ok(bytes)
+            }
+            Err(error) => Err(SkillManagerError::io(&self.config_path, error)),
+        }
+    }
+
+    fn list_backups(&self) -> Result<Vec<ConfigBackup>> {
+        let _lock = acquire_lock(&self.lock_path(), "configuration", Duration::from_secs(10))?;
+        self.list_backups_unlocked()
+    }
+
+    fn reset_config(&self) -> Result<ConfigBackup> {
+        let _lock = acquire_lock(&self.lock_path(), "configuration", Duration::from_secs(10))?;
+        storage_migration::migrate(&self.layout_paths)?;
+        let backup = self.backup_unlocked("reset")?;
+        atomic_write(&self.config_path, &canonical_config_bytes()?)?;
+        self.prune_backups_unlocked(Some(&backup.metadata.id))?;
+        Ok(backup)
+    }
+
+    fn restore_config(&self, backup_id: Option<&str>) -> Result<RestoreOutcome> {
+        let _lock = acquire_lock(&self.lock_path(), "configuration", Duration::from_secs(10))?;
+        storage_migration::migrate(&self.layout_paths)?;
+        let records = self.list_backups_unlocked()?;
+        let selected = match backup_id {
+            Some(id) => records
+                .iter()
+                .find(|record| record.metadata.id == id)
+                .cloned(),
+            None => records.last().cloned(),
+        }
+        .ok_or_else(|| {
+            SkillManagerError::InvalidInput(match backup_id {
+                Some(id) => format!("configuration backup '{id}' was not found"),
+                None => "no configuration backups are available".into(),
+            })
+        })?;
+        let selected_bytes = if selected.metadata.present {
+            Some(
+                fs::read(&selected.raw_path)
+                    .map_err(|error| SkillManagerError::io(&selected.raw_path, error))?,
+            )
+        } else {
+            None
+        };
+        let displaced = self.backup_unlocked("restore-displaced")?;
+        if let Some(bytes) = selected_bytes {
+            atomic_write(&self.config_path, &bytes)?;
+        } else {
+            match fs::remove_file(&self.config_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(SkillManagerError::io(&self.config_path, error)),
+            }
+        }
+        self.prune_backups_unlocked(Some(&selected.metadata.id))?;
+        Ok(RestoreOutcome {
+            restored: selected,
+            displaced,
+        })
     }
 }
 
@@ -278,6 +664,35 @@ fn parse_schema_version(value: &Value, path: &Path) -> Result<u64> {
             message: "schema_version must be a non-negative integer".into(),
         }),
     }
+}
+
+/// Serialize the canonical empty schema-v2 document.
+///
+/// # Errors
+///
+/// Returns an error only when the in-memory canonical value cannot serialize.
+pub fn canonical_config_bytes() -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(&Config::default())
+        .map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        SkillManagerError::InvalidInput(format!("path has no parent: {}", path.display()))
+    })?;
+    fs::create_dir_all(parent).map_err(|error| SkillManagerError::io(parent, error))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| SkillManagerError::io(parent, error))?;
+    temporary
+        .write_all(bytes)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| SkillManagerError::io(temporary.path(), error))?;
+    temporary
+        .persist(path)
+        .map_err(|error| SkillManagerError::io(path, error.error))?;
+    Ok(())
 }
 
 /// Advisory lock held for one resource.
@@ -340,46 +755,68 @@ fn lock_is_contended(error: &std::io::Error) -> bool {
     false
 }
 
-fn ensure_v0_backup(path: &Path, expected: &[u8]) -> Result<()> {
-    let backup = PathBuf::from(format!("{}.v0.bak", path.display()));
-    match OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&backup)
-    {
-        Ok(mut file) => {
-            file.write_all(expected)
-                .and_then(|()| file.sync_all())
-                .map_err(|error| SkillManagerError::io(&backup, error))?;
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing = fs::read(&backup)
-                .map_err(|read_error| SkillManagerError::io(&backup, read_error))?;
-            if existing == expected {
-                Ok(())
-            } else {
-                Err(SkillManagerError::InvalidConfig {
-                    path: backup,
-                    message: "existing migration backup does not match pre-migration bytes".into(),
-                })
-            }
-        }
-        Err(error) => Err(SkillManagerError::io(backup, error)),
-    }
-}
-
 fn migrate_v0(value: &Value) -> Result<Value> {
     let mut root = value.as_object().cloned().ok_or_else(|| {
         SkillManagerError::InvalidInput("configuration root must be a JSON object".into())
     })?;
     migrate_v0_sources(&mut root)?;
     migrate_v0_targets(&mut root)?;
+    root.insert("schema_version".into(), Value::Number(1_u32.into()));
+    migrate_v1(&Value::Object(root))
+}
+
+fn migrate_v1(value: &Value) -> Result<Value> {
+    let mut root = value.as_object().cloned().ok_or_else(|| {
+        SkillManagerError::InvalidInput("configuration root must be a JSON object".into())
+    })?;
+    for field in ["targets", "legacy_target_overrides"] {
+        let targets = root
+            .entry(field)
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                SkillManagerError::InvalidInput(format!(
+                    "configuration '{field}' must be an object"
+                ))
+            })?;
+        for (name, target) in targets {
+            let object = target.as_object_mut().ok_or_else(|| {
+                SkillManagerError::InvalidInput(format!("target '{name}' must be an object"))
+            })?;
+            let raw = object.get("path").and_then(Value::as_str).ok_or_else(|| {
+                SkillManagerError::InvalidInput(format!("target '{name}' requires path"))
+            })?;
+            let template = migrate_v1_target_template(raw)?;
+            object.insert(
+                "path".into(),
+                Value::String(template.to_string_lossy().replace('\\', "/")),
+            );
+        }
+    }
+    root.entry("sources")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    root.entry("builtins")
+        .or_insert_with(|| Value::Object(Map::new()));
+    root.entry("exclude")
+        .or_insert_with(|| Value::Array(Vec::new()));
     root.insert(
         "schema_version".into(),
         Value::Number(CONFIG_SCHEMA_VERSION.into()),
     );
     Ok(Value::Object(root))
+}
+
+fn migrate_v1_target_template(raw: &str) -> Result<PathBuf> {
+    let normalized = raw.replace('\\', "/");
+    let segments = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect::<Vec<_>>();
+    let start = segments
+        .iter()
+        .rposition(|segment| segment.starts_with('.') && segment.len() > 1)
+        .unwrap_or_else(|| segments.len().saturating_sub(1));
+    normalize_target_template(&segments[start..].join("/"))
 }
 
 fn migrate_v0_sources(root: &mut Map<String, Value>) -> Result<()> {
@@ -661,6 +1098,78 @@ fn normalize_config_locations(config: &mut Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn normalize_config_targets(config: &mut Config) -> Result<()> {
+    for (name, target) in config
+        .targets
+        .iter_mut()
+        .chain(config.legacy_target_overrides.iter_mut())
+    {
+        target.path =
+            normalize_target_template(&target.path.to_string_lossy()).map_err(|error| {
+                SkillManagerError::InvalidInput(format!(
+                    "target '{name}' has invalid path template: {error}"
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+/// Normalize a target path into a safe scope-root-relative template.
+///
+/// A single leading `~/` is accepted for compatibility and stripped. Absolute
+/// paths, named-home forms, blank values, and parent traversal are rejected.
+///
+/// # Errors
+///
+/// Returns an invalid-input error when the value cannot remain below a scope
+/// root after lexical normalization.
+pub fn normalize_target_template(raw: &str) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(SkillManagerError::InvalidInput(
+            "target path template must not be empty".into(),
+        ));
+    }
+    let unified = trimmed.replace('\\', "/");
+    let without_home = unified.strip_prefix("~/").unwrap_or(unified.as_str());
+    if without_home.starts_with('~') {
+        return Err(SkillManagerError::InvalidInput(
+            "named-home target paths are not supported".into(),
+        ));
+    }
+    if without_home.starts_with('/')
+        || without_home.starts_with("//")
+        || without_home
+            .as_bytes()
+            .get(1)
+            .is_some_and(|character| *character == b':')
+    {
+        return Err(SkillManagerError::InvalidInput(
+            "target path template must be relative".into(),
+        ));
+    }
+    let mut segments = Vec::new();
+    for segment in without_home.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if segments.pop().is_none() {
+                    return Err(SkillManagerError::InvalidInput(
+                        "target path template escapes its scope root".into(),
+                    ));
+                }
+            }
+            value => segments.push(value),
+        }
+    }
+    if segments.is_empty() {
+        return Err(SkillManagerError::InvalidInput(
+            "target path template must not be empty".into(),
+        ));
+    }
+    Ok(segments.iter().collect())
 }
 
 fn validate_source(source: &SourceEntry) -> Result<()> {
@@ -1270,7 +1779,59 @@ pub fn source_reference(source: &SourceEntry) -> String {
 /// Resolve built-in, custom, and legacy override targets in deterministic order.
 #[must_use]
 pub fn resolved_targets(config: &Config, home: &Path) -> IndexMap<String, Target> {
-    let defaults = builtin_targets(home);
+    resolved_targets_for_scope(config, home, home, Scope::Global)
+        .into_iter()
+        .map(|(name, scoped)| (name, scoped.target))
+        .collect()
+}
+
+/// Resolve every target against one explicit installation scope.
+#[must_use]
+pub fn resolved_targets_for_scope(
+    config: &Config,
+    user_home: &Path,
+    project_root: &Path,
+    scope: Scope,
+) -> IndexMap<String, ScopedTarget> {
+    let root = scope.root(user_home, project_root);
+    target_templates(config)
+        .into_iter()
+        .map(|(name, mut target)| {
+            let template = target.path.clone();
+            target.path = root.join(&template);
+            (
+                name,
+                ScopedTarget {
+                    target,
+                    template,
+                    scope,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Resolve every target in both scopes, global first and project second.
+#[must_use]
+pub fn resolved_targets_by_scope(
+    config: &Config,
+    user_home: &Path,
+    project_root: &Path,
+) -> IndexMap<Scope, IndexMap<String, ScopedTarget>> {
+    IndexMap::from([
+        (
+            Scope::Global,
+            resolved_targets_for_scope(config, user_home, project_root, Scope::Global),
+        ),
+        (
+            Scope::Project,
+            resolved_targets_for_scope(config, user_home, project_root, Scope::Project),
+        ),
+    ])
+}
+
+fn target_templates(config: &Config) -> IndexMap<String, Target> {
+    let defaults = builtin_targets();
     let mut result = IndexMap::new();
     for (name, mut target) in defaults {
         if let Some(settings) = config.builtins.get(&name) {
@@ -1321,14 +1882,14 @@ fn canonical_builtin_name(name: &str) -> Option<&'static str> {
     }
 }
 
-fn builtin_targets(home: &Path) -> IndexMap<String, Target> {
+fn builtin_targets() -> IndexMap<String, Target> {
     IndexMap::from([
         (
             "claude".into(),
             Target {
                 name: "claude".into(),
                 label: "Claude Code".into(),
-                path: home.join(".claude").join("skills"),
+                path: PathBuf::from(".claude").join("skills"),
                 enabled: true,
                 builtin: true,
                 legacy_override: false,
@@ -1339,7 +1900,7 @@ fn builtin_targets(home: &Path) -> IndexMap<String, Target> {
             Target {
                 name: "shared".into(),
                 label: "Shared (VS Code / Gemini / Copilot / Codex)".into(),
-                path: home.join(".agents").join("skills"),
+                path: PathBuf::from(".agents").join("skills"),
                 enabled: true,
                 builtin: true,
                 legacy_override: false,
@@ -1350,7 +1911,7 @@ fn builtin_targets(home: &Path) -> IndexMap<String, Target> {
             Target {
                 name: "antigravity".into(),
                 label: "Google Antigravity".into(),
-                path: home.join(".gemini").join("antigravity").join("skills"),
+                path: PathBuf::from(".gemini").join("antigravity").join("skills"),
                 enabled: true,
                 builtin: true,
                 legacy_override: false,
@@ -1387,10 +1948,297 @@ mod tests {
     use super::{
         BuiltinTargetSettings, Config, ConfigRepository, FileConfigRepository,
         derive_salted_source_id, derive_source_id, ensure_ascii, find_source_index,
-        is_builtin_name, locations_equal, migrate_v0, resolved_targets, source_from_reference,
-        source_location, source_reference, validate_config, validate_source,
+        is_builtin_name, locations_equal, migrate_v0, normalize_target_template, resolved_targets,
+        resolved_targets_for_scope, source_from_reference, source_location, source_reference,
+        validate_config, validate_source,
     };
-    use crate::domain::{SourceEntry, SourceLocation, SourceMode, SourceType, TargetEntry};
+    use crate::domain::{Scope, SourceEntry, SourceLocation, SourceMode, SourceType, TargetEntry};
+
+    fn write_absent_backup_record(
+        repository: &FileConfigRepository,
+        directory_name: &str,
+        metadata_id: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let directory = repository.backups_root.join(directory_name);
+        std::fs::create_dir_all(&directory).unwrap_or_else(|error| unreachable!("{error}"));
+        let metadata = super::BackupMetadata {
+            id: metadata_id.into(),
+            created_at,
+            reason: "test".into(),
+            original_path: repository.config_path.clone(),
+            present: false,
+            schema_version: None,
+            valid: true,
+        };
+        std::fs::write(
+            directory.join("metadata.json"),
+            serde_json::to_vec(&metadata).unwrap_or_else(|error| unreachable!("{error}")),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+    }
+
+    #[test]
+    fn target_templates_are_safe_and_resolve_from_exact_scope_roots() {
+        assert_eq!(
+            normalize_target_template("~/.claude/./skills")
+                .unwrap_or_else(|error| unreachable!("{error}")),
+            std::path::PathBuf::from(".claude").join("skills")
+        );
+        assert!(normalize_target_template("").is_err());
+        assert!(normalize_target_template("~other/skills").is_err());
+        assert!(normalize_target_template("../skills").is_err());
+        assert!(normalize_target_template("one/../../skills").is_err());
+        assert!(normalize_target_template("C:\\absolute\\skills").is_err());
+
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let project = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let config = Config::default();
+        let global =
+            resolved_targets_for_scope(&config, home.path(), project.path(), Scope::Global);
+        let local =
+            resolved_targets_for_scope(&config, home.path(), project.path(), Scope::Project);
+        assert_eq!(
+            global
+                .get("claude")
+                .unwrap_or_else(|| unreachable!())
+                .target
+                .path,
+            home.path().join(".claude").join("skills")
+        );
+        assert_eq!(
+            local
+                .get("antigravity")
+                .unwrap_or_else(|| unreachable!())
+                .target
+                .path,
+            project
+                .path()
+                .join(".gemini")
+                .join("antigravity")
+                .join("skills")
+        );
+    }
+
+    #[test]
+    fn schema_one_targets_migrate_to_templates_with_raw_backup() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let legacy = home.path().join(".skill-manager.config.json");
+        let bytes = br#"{"schema_version":1,"sources":[],"targets":{"custom":{"path":"C:\\Users\\me\\.custom\\skills","future":true}},"legacy_target_overrides":{},"builtins":{},"exclude":[],"root_future":42}"#;
+        std::fs::write(&legacy, bytes).unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+
+        let loaded = repository
+            .load(true)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(loaded.config.schema_version, 2);
+        assert_eq!(
+            loaded
+                .config
+                .targets
+                .get("custom")
+                .unwrap_or_else(|| unreachable!())
+                .path,
+            std::path::PathBuf::from(".custom").join("skills")
+        );
+        assert_eq!(loaded.config.extra.get("root_future"), Some(&json!(42)));
+        assert_eq!(
+            loaded
+                .config
+                .targets
+                .get("custom")
+                .and_then(|target| target.extra.get("future")),
+            Some(&json!(true))
+        );
+        let backups = repository
+            .list_backups()
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read(&backups[0].raw_path).unwrap_or_else(|error| unreachable!("{error}")),
+            bytes
+        );
+        assert!(!legacy.exists());
+        assert!(repository.config_path().exists());
+    }
+
+    #[test]
+    fn reset_and_restore_preserve_malformed_bytes_and_absent_state() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+        let absent = repository
+            .reset_config()
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(!absent.metadata.present);
+
+        let malformed = b"{ definitely not json";
+        std::fs::write(repository.config_path(), malformed)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let invalid = repository
+            .reset_config()
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(invalid.metadata.present);
+        assert!(!invalid.metadata.valid);
+
+        repository
+            .restore_config(Some(&invalid.metadata.id))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            repository
+                .read_raw()
+                .unwrap_or_else(|error| unreachable!("{error}")),
+            Some(malformed.to_vec())
+        );
+
+        repository
+            .restore_config(Some(&absent.metadata.id))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(
+            repository
+                .read_raw()
+                .unwrap_or_else(|error| unreachable!("{error}"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn absent_restore_does_not_reimport_stale_legacy_config_and_cache_still_migrates() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+        let absent = repository
+            .reset_config()
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        std::fs::write(
+            &repository.layout_paths.python_flat_config,
+            br#"{"schema_version":2,"exclude":["stale"]}"#,
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        std::fs::create_dir_all(&repository.layout_paths.legacy_cache)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        std::fs::write(
+            repository.layout_paths.legacy_cache.join("entry"),
+            b"cached",
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+
+        repository
+            .restore_config(Some(&absent.metadata.id))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let loaded = repository
+            .load(false)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(!loaded.persisted);
+        assert!(loaded.config.exclude.is_empty());
+        assert!(repository.layout_paths.python_flat_config.exists());
+        assert_eq!(
+            std::fs::read(repository.cache_root.join("entry"))
+                .unwrap_or_else(|error| unreachable!("{error}")),
+            b"cached"
+        );
+    }
+
+    #[test]
+    fn backup_metadata_cannot_redirect_pruning_outside_the_backup_root() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+        let outside = repository.storage_root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap_or_else(|error| unreachable!("{error}"));
+        std::fs::write(outside.join("sentinel"), b"keep")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let old = chrono::Utc::now() - chrono::Duration::days(31);
+        for (directory, id) in [
+            ("traversal", "../../outside"),
+            ("windows-traversal", r"..\..\outside"),
+            ("mismatch", "different"),
+            ("root", ".."),
+        ] {
+            write_absent_backup_record(&repository, directory, id, old);
+        }
+        write_absent_backup_record(&repository, "old-valid", "old-valid", old);
+        write_absent_backup_record(&repository, "new-valid", "new-valid", chrono::Utc::now());
+
+        let records = repository
+            .list_backups_unlocked()
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(records.len(), 2);
+        repository
+            .prune_backups_unlocked(None)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            std::fs::read(outside.join("sentinel")).unwrap_or_else(|error| unreachable!("{error}")),
+            b"keep"
+        );
+        assert!(!repository.backups_root.join("old-valid").exists());
+        assert!(repository.backups_root.join("new-valid").exists());
+        assert!(repository.backups_root.is_dir());
+        for directory in ["traversal", "windows-traversal", "mismatch", "root"] {
+            assert!(repository.backups_root.join(directory).exists());
+        }
+    }
+
+    #[test]
+    fn ordinary_save_prunes_expired_backups_only_after_persistence_succeeds() {
+        let successful_home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let successful = FileConfigRepository::new(successful_home.path());
+        let expired = chrono::Utc::now() - chrono::Duration::days(31);
+        write_absent_backup_record(&successful, "old-valid", "old-valid", expired);
+        write_absent_backup_record(&successful, "new-valid", "new-valid", chrono::Utc::now());
+
+        ConfigRepository::save(&successful, successful.config_path(), &Config::default())
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(!successful.backups_root.join("old-valid").exists());
+        assert!(successful.backups_root.join("new-valid").exists());
+        assert!(successful.config_path().is_file());
+
+        let failed_home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let failed = FileConfigRepository::new(failed_home.path());
+        write_absent_backup_record(&failed, "old-valid", "old-valid", expired);
+        write_absent_backup_record(&failed, "new-valid", "new-valid", chrono::Utc::now());
+        let mut invalid = Config::default();
+        invalid.targets.insert(
+            "custom".into(),
+            TargetEntry {
+                path: "../outside".into(),
+                label: "Invalid".into(),
+                enabled: true,
+                extra: IndexMap::new(),
+            },
+        );
+
+        assert!(ConfigRepository::save(&failed, failed.config_path(), &invalid).is_err());
+        assert!(failed.backups_root.join("old-valid").exists());
+        assert!(failed.backups_root.join("new-valid").exists());
+        assert!(!failed.config_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_listing_does_not_follow_directory_or_metadata_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+        let outside = home.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap_or_else(|error| unreachable!("{error}"));
+        write_absent_backup_record(&repository, "real", "real", chrono::Utc::now());
+        symlink(&outside, repository.backups_root.join("linked-directory"))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let linked_metadata = repository.backups_root.join("linked-metadata");
+        std::fs::create_dir_all(&linked_metadata).unwrap_or_else(|error| unreachable!("{error}"));
+        symlink(
+            repository.backups_root.join("real/metadata.json"),
+            linked_metadata.join("metadata.json"),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+
+        let records = repository
+            .list_backups_unlocked()
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].metadata.id, "real");
+        assert!(outside.exists());
+        assert!(linked_metadata.exists());
+    }
 
     #[test]
     fn source_id_is_stable() {
@@ -1429,12 +2277,16 @@ mod tests {
         let loaded = repository
             .load(false)
             .unwrap_or_else(|error| unreachable!("{error}"));
-        assert_eq!(loaded.config.schema_version, 1);
+        assert_eq!(loaded.config.schema_version, 2);
         assert_eq!(loaded.config.sources.len(), 1);
-        assert!(
-            home.path()
-                .join(".skill-manager.config.json.v0.bak")
-                .exists()
+        assert!(!legacy.exists());
+        assert!(repository.config_path().exists());
+        assert_eq!(
+            repository
+                .list_backups()
+                .unwrap_or_else(|error| unreachable!("{error}"))
+                .len(),
+            1
         );
     }
 
@@ -1445,7 +2297,7 @@ mod tests {
             serde_json::json!(-1),
             serde_json::json!(0.5),
             serde_json::Value::Null,
-            serde_json::json!(2),
+            serde_json::json!(3),
         ] {
             let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
             let path = home.path().join(".skill-manager.config.json");
@@ -1455,14 +2307,16 @@ mod tests {
             let repository = FileConfigRepository::new(home.path());
             assert!(repository.load(false).is_err());
             assert_eq!(
-                std::fs::read(&path).unwrap_or_else(|error| unreachable!("{error}")),
+                std::fs::read(repository.config_path())
+                    .unwrap_or_else(|error| unreachable!("{error}")),
                 bytes
             );
+            assert!(!path.exists());
             assert!(
-                !home
-                    .path()
-                    .join(".skill-manager.config.json.v0.bak")
-                    .exists()
+                repository
+                    .list_backups()
+                    .unwrap_or_else(|error| unreachable!("{error}"))
+                    .is_empty()
             );
         }
     }
@@ -1487,8 +2341,10 @@ mod tests {
             .unwrap_or_else(|| unreachable!("migrated target"));
         assert!(!custom.enabled);
         assert!(!custom.extra.contains_key("disabled"));
-        let saved = std::fs::read_to_string(path).unwrap_or_else(|error| unreachable!("{error}"));
+        let saved = std::fs::read_to_string(repository.config_path())
+            .unwrap_or_else(|error| unreachable!("{error}"));
         assert!(!saved.contains("\"disabled\""));
+        assert!(!path.exists());
     }
 
     #[test]
@@ -1507,8 +2363,8 @@ mod tests {
         let mut loaded = repository
             .load(false)
             .unwrap_or_else(|error| unreachable!("{error}"));
-        assert_eq!(loaded.active_path, current);
-        assert!(loaded.warning.is_none());
+        assert_eq!(loaded.active_path, repository.config_path());
+        assert!(loaded.warning.is_some());
         assert_eq!(
             loaded.config.extra.get("root_extension"),
             Some(&json!({"keep": true}))
@@ -1520,6 +2376,7 @@ mod tests {
         let bytes =
             std::fs::read(&loaded.active_path).unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(bytes.last(), Some(&b'\n'));
+        assert!(!current.exists());
         assert!(legacy.exists());
         let reloaded = repository
             .load(false)
@@ -1532,7 +2389,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_is_memory_only_in_dry_run_and_conflicting_backup_is_refused() {
+    fn startup_migration_persists_during_dry_run_and_is_idempotent() {
         let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
         let current = home.path().join(".skill-manager.config.json");
         let original = br#"{"schema_version":0,"sources":[]}"#;
@@ -1541,19 +2398,28 @@ mod tests {
         let loaded = repository
             .load(true)
             .unwrap_or_else(|error| unreachable!("{error}"));
-        assert_eq!(loaded.config.schema_version, 1);
+        assert_eq!(loaded.config.schema_version, 2);
+        assert!(!current.exists());
+        let backups = repository
+            .list_backups()
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(backups.len(), 1);
         assert_eq!(
-            std::fs::read(&current).unwrap_or_else(|error| unreachable!("{error}")),
+            std::fs::read(&backups[0].raw_path).unwrap_or_else(|error| unreachable!("{error}")),
             original
         );
-        let backup = home.path().join(".skill-manager.config.json.v0.bak");
-        assert!(!backup.exists());
-
-        std::fs::write(&backup, "different").unwrap_or_else(|error| unreachable!("{error}"));
-        assert!(repository.load(false).is_err());
+        let persisted =
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}"));
+        assert_ne!(persisted, original);
+        repository
+            .load(true)
+            .unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(
-            std::fs::read(&current).unwrap_or_else(|error| unreachable!("{error}")),
-            original
+            repository
+                .list_backups()
+                .unwrap_or_else(|error| unreachable!("{error}"))
+                .len(),
+            1
         );
     }
 
@@ -1893,23 +2759,23 @@ mod tests {
         );
         assert_eq!(dry_run.config.sources[1].name, "repo");
         assert_eq!(dry_run.config.sources[2].name, "legacy-only");
+        assert!(!config_path.exists());
+        let backups = repository
+            .list_backups()
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(backups.len(), 1);
         assert_eq!(
-            std::fs::read(&config_path).unwrap_or_else(|error| unreachable!("{error}")),
+            std::fs::read(&backups[0].raw_path).unwrap_or_else(|error| unreachable!("{error}")),
             original
         );
-        let backup = home.path().join(".skill-manager.config.json.v0.bak");
-        assert!(!backup.exists());
 
         let written = repository
             .load(false)
             .unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(written.config.sources.len(), 3);
-        assert_eq!(
-            std::fs::read(&backup).unwrap_or_else(|error| unreachable!("{error}")),
-            original
-        );
         let persisted: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&config_path).unwrap_or_else(|error| unreachable!("{error}")),
+            &std::fs::read(repository.config_path())
+                .unwrap_or_else(|error| unreachable!("{error}")),
         )
         .unwrap_or_else(|error| unreachable!("{error}"));
         assert!(persisted.get("skills_directories").is_none());
@@ -1992,14 +2858,16 @@ mod tests {
 
             assert!(repository.load(false).is_err(), "{value}");
             assert_eq!(
-                std::fs::read(&config_path).unwrap_or_else(|error| unreachable!("{error}")),
+                std::fs::read(repository.config_path())
+                    .unwrap_or_else(|error| unreachable!("{error}")),
                 original
             );
+            assert!(!config_path.exists());
             assert!(
-                !home
-                    .path()
-                    .join(".skill-manager.config.json.v0.bak")
-                    .exists()
+                repository
+                    .list_backups()
+                    .unwrap_or_else(|error| unreachable!("{error}"))
+                    .is_empty()
             );
         }
     }
@@ -2092,20 +2960,22 @@ mod tests {
             let repository = FileConfigRepository::new(home.path());
             assert!(repository.load(false).is_err(), "{value}");
             assert_eq!(
-                std::fs::read(&path).unwrap_or_else(|error| unreachable!("{error}")),
+                std::fs::read(repository.config_path())
+                    .unwrap_or_else(|error| unreachable!("{error}")),
                 bytes
             );
+            assert!(!path.exists());
             assert!(
-                !home
-                    .path()
-                    .join(".skill-manager.config.json.v0.bak")
-                    .exists()
+                repository
+                    .list_backups()
+                    .unwrap_or_else(|error| unreachable!("{error}"))
+                    .is_empty()
             );
         }
     }
 
     #[test]
-    fn alternate_locations_are_closed_typed_objects_and_round_trip_in_schema_one() {
+    fn alternate_locations_are_closed_typed_objects_and_round_trip_in_schema_two() {
         for invalid in [
             json!({"type":"local","path":"C:\\skills","owner":"forbidden"}),
             json!({"type":"github","owner":"o","repo":"r","path":"forbidden"}),
@@ -2134,7 +3004,7 @@ mod tests {
             ..Config::default()
         };
         let value = serde_json::to_value(&config).unwrap_or_else(|error| unreachable!("{error}"));
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["sources"][0]["alternate"]["type"], "local");
         let decoded: Config =
             serde_json::from_value(value).unwrap_or_else(|error| unreachable!("{error}"));

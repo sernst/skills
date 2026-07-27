@@ -47,6 +47,22 @@ pub trait Reporter {
     ///
     /// Returns an error when standard output cannot be written.
     fn human(&mut self, text: &str) -> Result<()>;
+    /// Emit bytes without modification.
+    ///
+    /// This is used only for recovery-oriented raw configuration output. The
+    /// default implementation supports UTF-8 test reporters; production
+    /// reporters override it so arbitrary bytes and trailing newlines are
+    /// preserved exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bytes are not UTF-8 or cannot be written.
+    fn raw(&mut self, bytes: &[u8]) -> Result<()> {
+        let text = std::str::from_utf8(bytes).map_err(|error| {
+            SkillManagerError::InvalidInput(format!("raw output is not valid UTF-8: {error}"))
+        })?;
+        self.human(text)
+    }
     /// Emit a human-readable diagnostic.
     ///
     /// # Errors
@@ -121,6 +137,18 @@ impl Reporter for ConsoleReporter {
             return Ok(());
         }
         writeln!(io::stdout().lock(), "{text}")
+            .map_err(|error| SkillManagerError::io("<stdout>", error))
+    }
+
+    fn raw(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.json {
+            return Err(SkillManagerError::InvalidInput(
+                "raw output cannot be combined with JSON output".into(),
+            ));
+        }
+        io::stdout()
+            .lock()
+            .write_all(bytes)
             .map_err(|error| SkillManagerError::io("<stdout>", error))
     }
 

@@ -10,6 +10,14 @@ Native executable tools live in [`clis`](./clis). The first is
 and deploying skills. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the Just-based
 quality workflow and [RELEASES.md](./RELEASES.md) for tagged release procedures.
 
+`skill-manager` can install skills globally or into the current project; a
+project installation takes precedence when both exist. Its configuration,
+cache, backups, and locks are stored together beneath `~/.skill-manager/`.
+The [command reference](./clis/skill-manager/docs/cli.md),
+[configuration guide](./clis/skill-manager/docs/configuration.md), and
+[JSON contract](./clis/skill-manager/docs/json.md) cover scope selection,
+wildcard skill selection, and safe configuration reset/restore workflows.
+
 # Manifest
 
 ## [drafting-commit-message](./skills/drafting-commit-message/SKILL.md)

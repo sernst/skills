@@ -7,12 +7,14 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::{Map, Value};
 
 use crate::cli::{
-    Cli, Command, CopyArgs, RemoveArgs, ResolveArgs, SourceAction, SourceAddArgs,
-    SourceAlternateArgs, SourceArgs, SourceLocateArgs, SourceModeArg, SourceRemoveArgs,
-    SourceSelection, SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction,
-    TargetArgs, TargetNameArgs, TargetPathArgs, TargetSelection,
+    Cli, Command, ConfigsAction, ConfigsArgs, ConfigsConfirmArgs, ConfigsRestoreArgs, CopyArgs,
+    RemoveArgs, ResolveArgs, ScopeSelection, SourceAction, SourceAddArgs, SourceAlternateArgs,
+    SourceArgs, SourceLocateArgs, SourceModeArg, SourceRemoveArgs, SourceSelection, SourceSwapArgs,
+    SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction, TargetArgs, TargetNameArgs,
+    TargetPathArgs, TargetSelection,
 };
 use crate::error::{Result, SkillManagerError};
+use crate::skills::is_fnmatch_operand;
 
 /// Apply one optional JSON recipe to parsed CLI arguments.
 ///
@@ -98,6 +100,7 @@ fn overlay_command(command: &mut Command, object: &Map<String, Value>, base: &Pa
         Command::Resolve(args) => overlay_resolve(args, object),
         Command::Source(args) => overlay_source(&mut args.action, object, base),
         Command::Target(args) => overlay_target(&mut args.action, object, base),
+        Command::Configs(args) => overlay_configs(args, object),
         Command::GenerateCompletions(_) | Command::GenerateMan(_) => Err(
             SkillManagerError::InvalidInput("generation commands do not accept recipes".into()),
         ),
@@ -127,12 +130,15 @@ fn overlay_sync(args: &mut SyncArgs, object: &Map<String, Value>, _base: &Path) 
             "no_cd",
             "dry_run",
             "refresh",
+            "global",
+            "project",
         ],
     )?;
     overlay_strings(&mut args.sources, object, &["sources", "source"])?;
     overlay_strings(&mut args.filters, object, &["filters", "filter"])?;
     overlay_source_selection(&mut args.source_selection, object)?;
     overlay_target_selection(&mut args.targets, object)?;
+    overlay_scope_selection(&mut args.scope, object)?;
     overlay_bool(&mut args.dry_run, object.get("dry_run"))?;
     overlay_bool(&mut args.refresh, object.get("refresh"))
 }
@@ -188,12 +194,15 @@ fn overlay_remove(args: &mut RemoveArgs, object: &Map<String, Value>, base: &Pat
             "dry_run",
             "refresh",
             "yes",
+            "global",
+            "project",
         ],
     )?;
     overlay_references(&mut args.skills, object, &["skills", "skill"], base)?;
     overlay_strings(&mut args.filters, object, &["filters", "filter"])?;
     overlay_source_selection(&mut args.source_selection, object)?;
     overlay_target_selection(&mut args.targets, object)?;
+    overlay_scope_selection(&mut args.scope, object)?;
     overlay_bool(&mut args.dry_run, object.get("dry_run"))?;
     overlay_bool(&mut args.refresh, object.get("refresh"))?;
     overlay_bool(&mut args.yes, object.get("yes"))
@@ -218,11 +227,14 @@ fn overlay_status(args: &mut StatusArgs, object: &Map<String, Value>) -> Result<
             "cd_only",
             "no_cd",
             "refresh",
+            "global",
+            "project",
         ],
     )?;
     overlay_strings(&mut args.filters, object, &["filters", "filter"])?;
     overlay_source_selection(&mut args.source_selection, object)?;
     overlay_target_selection(&mut args.targets, object)?;
+    overlay_scope_selection(&mut args.scope, object)?;
     overlay_bool(&mut args.refresh, object.get("refresh"))
 }
 
@@ -406,7 +418,7 @@ fn overlay_source(
 fn overlay_target(
     action: &mut TargetAction,
     object: &Map<String, Value>,
-    base: &Path,
+    _base: &Path,
 ) -> Result<()> {
     match action {
         TargetAction::List => reject_unknown(object, &["command", "no_input"]),
@@ -418,7 +430,9 @@ fn overlay_target(
             if args.path.as_os_str().is_empty()
                 && let Some(path) = object.get("path")
             {
-                args.path = resolve_path(Path::new(strict_string(path)?), base);
+                // Target paths are scope-relative templates, never paths relative
+                // to the recipe carrier file.
+                args.path = PathBuf::from(strict_string(path)?);
             }
             Ok(())
         }
@@ -428,6 +442,27 @@ fn overlay_target(
                 args.name = first_string(object, &["name"])?.unwrap_or_default();
             }
             Ok(())
+        }
+    }
+}
+
+fn overlay_configs(args: &mut ConfigsArgs, object: &Map<String, Value>) -> Result<()> {
+    match args.action.as_mut() {
+        None => reject_unknown(object, &["command", "no_input"]),
+        Some(ConfigsAction::Reset(confirm)) => {
+            reject_unknown(object, &["command", "no_input", "yes"])?;
+            overlay_bool(&mut confirm.yes, object.get("yes"))
+        }
+        Some(ConfigsAction::Restore(restore)) => {
+            reject_unknown(object, &["command", "no_input", "backup", "yes"])?;
+            if restore.backup_id.is_none() {
+                restore.backup_id = object
+                    .get("backup")
+                    .map(strict_string)
+                    .transpose()?
+                    .map(ToOwned::to_owned);
+            }
+            overlay_bool(&mut restore.yes, object.get("yes"))
         }
     }
 }
@@ -461,6 +496,28 @@ fn overlay_target_selection(
         object.get("all_targets").or_else(|| object.get("all")),
     )?;
     overlay_strings(&mut selection.target_names, object, &["targets", "target"])
+}
+
+fn overlay_scope_selection(
+    selection: &mut ScopeSelection,
+    object: &Map<String, Value>,
+) -> Result<()> {
+    // Scope is one logical choice rather than two independently overlaid
+    // booleans. Validate every supplied recipe value even when argv wins, then
+    // use the recipe pair only when argv did not explicitly select a scope.
+    let recipe_global = object.get("global").map(strict_bool).transpose()?;
+    let recipe_project = object.get("project").map(strict_bool).transpose()?;
+    if selection.is_explicit() {
+        return Ok(());
+    }
+    selection.global = recipe_global.unwrap_or(false);
+    selection.project = recipe_project.unwrap_or(false);
+    if selection.global && selection.project {
+        return Err(SkillManagerError::InvalidInput(
+            "global and project are mutually exclusive".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn overlay_bool(destination: &mut bool, value: Option<&Value>) -> Result<()> {
@@ -500,7 +557,13 @@ fn overlay_references(
         if let Some(value) = object.get(*key) {
             *destination = strict_strings(value)?
                 .into_iter()
-                .map(|reference| rebase_reference(&reference, base, false))
+                .map(|reference| {
+                    if is_fnmatch_operand(&reference) {
+                        reference
+                    } else {
+                        rebase_reference(&reference, base, false)
+                    }
+                })
                 .collect();
             break;
         }
@@ -586,6 +649,11 @@ fn command_name(command: &Command) -> &'static str {
             TargetAction::Remove(_) => "target.remove",
             TargetAction::SetPath(_) => "target.set-path",
         },
+        Command::Configs(args) => match args.action {
+            None => "configs",
+            Some(ConfigsAction::Reset(_)) => "configs.reset",
+            Some(ConfigsAction::Restore(_)) => "configs.restore",
+        },
         Command::GenerateCompletions(_) => "generate-completions",
         Command::GenerateMan(_) => "generate-man",
     }
@@ -612,6 +680,9 @@ fn canonical_command(value: &str) -> Result<&'static str> {
         "target.disable" => Ok("target.disable"),
         "target.remove" => Ok("target.remove"),
         "target.set-path" => Ok("target.set-path"),
+        "configs" => Ok("configs"),
+        "configs.reset" => Ok("configs.reset"),
+        "configs.restore" => Ok("configs.restore"),
         _ => Err(SkillManagerError::InvalidInput(format!(
             "unknown recipe command: {value}"
         ))),
@@ -625,6 +696,18 @@ fn default_command(name: &str) -> Result<Command> {
         "remove" => Ok(Command::Remove(RemoveArgs::default())),
         "status" => Ok(Command::Status(StatusArgs::default())),
         "resolve" => Ok(Command::Resolve(ResolveArgs::default())),
+        "configs" => Ok(Command::Configs(ConfigsArgs {
+            raw: false,
+            action: None,
+        })),
+        "configs.reset" => Ok(Command::Configs(ConfigsArgs {
+            raw: false,
+            action: Some(ConfigsAction::Reset(ConfigsConfirmArgs::default())),
+        })),
+        "configs.restore" => Ok(Command::Configs(ConfigsArgs {
+            raw: false,
+            action: Some(ConfigsAction::Restore(ConfigsRestoreArgs::default())),
+        })),
         "source.add" => Ok(Command::Source(SourceArgs {
             action: SourceAction::Add(SourceAddArgs {
                 source: None,
@@ -842,6 +925,7 @@ fn valid_github_segment(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::path::PathBuf;
 
     use clap::Parser;
     use serde_json::{Value, json};
@@ -851,7 +935,7 @@ mod tests {
         rebase_reference, resolve_path, strict_bool, strict_i64, strict_string, strict_strings,
         validate_required,
     };
-    use crate::cli::{Cli, Command, SourceAction, TargetAction};
+    use crate::cli::{Cli, Command, ConfigsAction, SourceAction, TargetAction};
 
     fn inline_recipe(payload: &Value) -> Cli {
         let argument = format!("--json={payload}");
@@ -987,6 +1071,7 @@ mod tests {
             "targets": ["disabled"],
             "dry_run": true,
             "refresh": true,
+            "project": true,
             "no_input": true
         }));
         let Some(Command::Load(args)) = cli.command else {
@@ -998,6 +1083,7 @@ mod tests {
         assert!(args.targets.claude);
         assert_eq!(args.targets.target_names, ["disabled"]);
         assert!(args.dry_run && args.refresh && cli.no_input);
+        assert!(args.scope.project && !args.scope.global);
 
         let cli = inline_recipe(&json!({
             "command": "remove",
@@ -1008,7 +1094,8 @@ mod tests {
             "all_targets": true,
             "yes": true,
             "dry_run": true,
-            "refresh": true
+            "refresh": true,
+            "global": true
         }));
         let Some(Command::Remove(args)) = cli.command else {
             unreachable!("remove command");
@@ -1018,19 +1105,22 @@ mod tests {
         assert!(args.source_selection.cd_only);
         assert!(args.targets.shared && args.targets.all_targets);
         assert!(args.yes && args.dry_run && args.refresh);
+        assert!(args.scope.global && !args.scope.project);
 
         let cli = inline_recipe(&json!({
             "command": "status",
             "filter": "demo",
             "no_cd": true,
             "antigravity": true,
-            "refresh": true
+            "refresh": true,
+            "project": true
         }));
         let Some(Command::Status(args)) = cli.command else {
             unreachable!("status command");
         };
         assert_eq!(args.filters, ["demo"]);
         assert!(args.source_selection.no_cd && args.targets.antigravity && args.refresh);
+        assert!(args.scope.project && !args.scope.global);
 
         let cli = inline_recipe(&json!({
             "command": "resolve",
@@ -1130,6 +1220,111 @@ mod tests {
                 TargetAction::List => assert_eq!(command, "target.list"),
             }
         }
+    }
+
+    #[test]
+    fn config_recipes_are_strict_and_target_templates_are_not_rebased() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let recipes = root.path().join("recipes");
+        std::fs::create_dir_all(&recipes).unwrap_or_else(|error| unreachable!("{error}"));
+        let recipe_path = recipes.join("target.json");
+        std::fs::write(
+            &recipe_path,
+            r#"{"command":"target.add","name":"custom","path":"./target"}"#,
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        let mut target =
+            Cli::try_parse_from(["skill-manager", "--input", &recipe_path.to_string_lossy()])
+                .unwrap_or_else(|error| unreachable!("{error}"));
+        apply_recipe(&mut target).unwrap_or_else(|error| unreachable!("{error}"));
+        let Some(Command::Target(target)) = target.command else {
+            unreachable!("target command");
+        };
+        let TargetAction::Add(args) = target.action else {
+            unreachable!("target add");
+        };
+        assert_eq!(args.path, PathBuf::from("./target"));
+
+        let reset = inline_recipe(&json!({"command": "configs.reset", "yes": true}));
+        assert!(matches!(
+            reset.command,
+            Some(Command::Configs(crate::cli::ConfigsArgs {
+                action: Some(ConfigsAction::Reset(crate::cli::ConfigsConfirmArgs {
+                    yes: true
+                })),
+                ..
+            }))
+        ));
+        let restore = inline_recipe(&json!({
+            "command": "configs.restore",
+            "backup": "20260726-reset",
+            "yes": true
+        }));
+        let Some(Command::Configs(configs)) = restore.command else {
+            unreachable!("configs command");
+        };
+        let Some(ConfigsAction::Restore(restore)) = configs.action else {
+            unreachable!("restore action");
+        };
+        assert_eq!(restore.backup_id.as_deref(), Some("20260726-reset"));
+        assert!(restore.yes);
+
+        let mut no_raw = Cli::try_parse_from([
+            "skill-manager",
+            "--json={\"command\":\"configs\",\"raw\":true}",
+        ])
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(apply_recipe(&mut no_raw).is_err());
+
+        let mut conflicting = Cli::try_parse_from([
+            "skill-manager",
+            "--json={\"command\":\"load\",\"global\":true,\"project\":true}",
+        ])
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(apply_recipe(&mut conflicting).is_err());
+
+        let remove = inline_recipe(&json!({
+            "command": "remove",
+            "skill": "./grill-*",
+            "global": true
+        }));
+        let Some(Command::Remove(remove)) = remove.command else {
+            unreachable!("remove command");
+        };
+        assert_eq!(remove.skills, ["./grill-*"]);
+    }
+
+    #[test]
+    fn argv_scope_wins_over_a_strictly_typed_recipe_scope_pair() {
+        let mut cli = Cli::try_parse_from([
+            "skill-manager",
+            r#"--json={"command":"load","global":true,"project":true}"#,
+            "load",
+            "--global",
+        ])
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        apply_recipe(&mut cli).unwrap_or_else(|error| unreachable!("{error}"));
+        let Some(Command::Load(args)) = cli.command else {
+            unreachable!("load command");
+        };
+        assert!(args.scope.global);
+        assert!(!args.scope.project);
+
+        let mut invalid_type = Cli::try_parse_from([
+            "skill-manager",
+            r#"--json={"command":"load","project":"true"}"#,
+            "load",
+            "--global",
+        ])
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(apply_recipe(&mut invalid_type).is_err());
+
+        let mut recipe_conflict = Cli::try_parse_from([
+            "skill-manager",
+            r#"--json={"command":"load","global":true,"project":true}"#,
+        ])
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(apply_recipe(&mut recipe_conflict).is_err());
     }
 
     #[test]

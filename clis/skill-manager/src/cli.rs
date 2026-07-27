@@ -74,6 +74,8 @@ pub enum Command {
     Source(SourceArgs),
     /// Manage deployment targets.
     Target(TargetArgs),
+    /// Display, reset, or restore the stored configuration.
+    Configs(ConfigsArgs),
     /// Generate a shell completion script.
     #[command(hide = true)]
     GenerateCompletions(GenerateCompletionsArgs),
@@ -117,6 +119,29 @@ pub struct TargetSelection {
     pub target_names: Vec<String>,
 }
 
+/// Installation scope shared by deployment and status commands.
+///
+/// The application resolves the selected scope against either its configured
+/// home directory or the process working directory. Keeping this selection at
+/// the CLI boundary makes the eventual scope policy independent of clap.
+#[derive(Clone, Debug, Default, Args)]
+pub struct ScopeSelection {
+    /// Use the global installation location.
+    #[arg(long, short = 'g', conflicts_with = "project")]
+    pub global: bool,
+    /// Use the current project's installation location.
+    #[arg(long, short = 'p', conflicts_with = "global")]
+    pub project: bool,
+}
+
+impl ScopeSelection {
+    /// Return whether a scope was explicitly selected.
+    #[must_use]
+    pub const fn is_explicit(&self) -> bool {
+        self.global || self.project
+    }
+}
+
 impl TargetSelection {
     /// Whether the user explicitly chose target behavior.
     #[must_use]
@@ -132,8 +157,8 @@ impl TargetSelection {
 /// Arguments shared by `load` and `update`.
 #[derive(Clone, Debug, Default, Args)]
 pub struct SyncArgs {
-    /// Source paths, GitHub references, source names, or source IDs.
-    #[arg(value_name = "SOURCE")]
+    /// Source paths/references/names/IDs, or skill-name patterns.
+    #[arg(value_name = "SOURCE_OR_PATTERN")]
     pub sources: Vec<String>,
     /// Include pattern; repeatable and combined with logical OR.
     #[arg(long = "filter", value_name = "PATTERN")]
@@ -144,6 +169,9 @@ pub struct SyncArgs {
     /// Target selection.
     #[command(flatten)]
     pub targets: TargetSelection,
+    /// Installation scope selection.
+    #[command(flatten)]
+    pub scope: ScopeSelection,
     /// Plan without changing persistent state.
     #[arg(long)]
     pub dry_run: bool,
@@ -173,8 +201,8 @@ pub struct CopyArgs {
 /// Arguments for `remove`.
 #[derive(Clone, Debug, Default, Args)]
 pub struct RemoveArgs {
-    /// Skill names, skill directories, or collection directories.
-    #[arg(value_name = "SKILL")]
+    /// Skill names/patterns, skill directories, or collection directories.
+    #[arg(value_name = "SKILL_OR_PATTERN")]
     pub skills: Vec<String>,
     /// Include pattern; repeatable and combined with logical OR.
     #[arg(long = "filter", value_name = "PATTERN")]
@@ -185,6 +213,9 @@ pub struct RemoveArgs {
     /// Target selection.
     #[command(flatten)]
     pub targets: TargetSelection,
+    /// Installation scope selection.
+    #[command(flatten)]
+    pub scope: ScopeSelection,
     /// Plan without changing persistent state.
     #[arg(long)]
     pub dry_run: bool,
@@ -211,6 +242,9 @@ pub struct StatusArgs {
     /// Target selection.
     #[command(flatten)]
     pub targets: TargetSelection,
+    /// Installation scope selection.
+    #[command(flatten)]
+    pub scope: ScopeSelection,
     /// Force remote cache refresh.
     #[arg(long)]
     pub refresh: bool,
@@ -219,8 +253,8 @@ pub struct StatusArgs {
 /// Arguments for `resolve`.
 #[derive(Clone, Debug, Default, Args)]
 pub struct ResolveArgs {
-    /// Exact collided skill names; omitted means every collision.
-    #[arg(value_name = "SKILL")]
+    /// Collided skill names or patterns; omitted means every collision.
+    #[arg(value_name = "SKILL_OR_PATTERN")]
     pub skills: Vec<String>,
     /// Source selection.
     #[command(flatten)]
@@ -398,6 +432,46 @@ pub struct TargetNameArgs {
     pub name: String,
 }
 
+/// Configuration-management command wrapper.
+#[derive(Clone, Debug, Args)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct ConfigsArgs {
+    /// Write the active configuration bytes exactly as stored.
+    #[arg(long, conflicts_with_all = ["json", "json_input", "input"])]
+    pub raw: bool,
+    /// Configuration lifecycle action; omitted displays the configuration.
+    #[command(subcommand)]
+    pub action: Option<ConfigsAction>,
+}
+
+/// Configuration lifecycle actions.
+#[derive(Clone, Debug, Subcommand)]
+pub enum ConfigsAction {
+    /// Replace the active configuration with an empty configuration.
+    Reset(ConfigsConfirmArgs),
+    /// Restore a previously archived configuration.
+    Restore(ConfigsRestoreArgs),
+}
+
+/// Destructive configuration action confirmation.
+#[derive(Clone, Debug, Default, Args)]
+pub struct ConfigsConfirmArgs {
+    /// Confirm a destructive non-interactive operation.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+/// Configuration restore arguments.
+#[derive(Clone, Debug, Default, Args)]
+pub struct ConfigsRestoreArgs {
+    /// Backup identifier; omitted selects the latest backup.
+    #[arg(value_name = "BACKUP_ID")]
+    pub backup_id: Option<String>,
+    /// Confirm a destructive non-interactive operation.
+    #[arg(long)]
+    pub yes: bool,
+}
+
 /// Shell completion generation arguments.
 #[derive(Clone, Debug, Args)]
 pub struct GenerateCompletionsArgs {
@@ -425,4 +499,90 @@ pub struct GenerateManArgs {
     /// Destination file.
     #[arg(long)]
     pub output: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command, ConfigsAction};
+
+    #[test]
+    fn scoped_commands_accept_each_short_and_long_scope_flag() {
+        for (command, flag, global) in [
+            ("load", "-g", true),
+            ("update", "--project", false),
+            ("remove", "-p", false),
+            ("status", "--global", true),
+        ] {
+            let cli = Cli::try_parse_from(["skill-manager", command, flag])
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            let selection = match cli.command {
+                Some(Command::Load(args) | Command::Update(args)) => args.scope,
+                Some(Command::Remove(args)) => args.scope,
+                Some(Command::Status(args)) => args.scope,
+                _ => unreachable!("expected scoped command"),
+            };
+            assert!(selection.is_explicit());
+            assert_eq!(selection.global, global);
+            assert_eq!(selection.project, !global);
+        }
+    }
+
+    #[test]
+    fn scoped_commands_reject_conflicting_scope_flags() {
+        for command in ["load", "update", "remove", "status"] {
+            assert!(
+                Cli::try_parse_from(["skill-manager", command, "--global", "--project"]).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn configs_parses_show_reset_restore_and_alias() {
+        let show = Cli::try_parse_from(["skill-manager", "configs", "--raw"])
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let Some(Command::Configs(show)) = show.command else {
+            unreachable!("configs command");
+        };
+        assert!(show.raw && show.action.is_none());
+
+        let reset = Cli::try_parse_from(["skill-manager", "configs", "reset", "--yes"])
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(matches!(
+            reset.command,
+            Some(Command::Configs(super::ConfigsArgs {
+                action: Some(ConfigsAction::Reset(super::ConfigsConfirmArgs {
+                    yes: true
+                })),
+                ..
+            }))
+        ));
+
+        let restore =
+            Cli::try_parse_from(["skill-manager", "configs", "restore", "backup-01", "--yes"])
+                .unwrap_or_else(|error| unreachable!("{error}"));
+        let Some(Command::Configs(restore)) = restore.command else {
+            unreachable!("configs command");
+        };
+        let Some(ConfigsAction::Restore(args)) = restore.action else {
+            unreachable!("restore action");
+        };
+        assert_eq!(args.backup_id.as_deref(), Some("backup-01"));
+        assert!(args.yes);
+    }
+
+    #[test]
+    fn raw_configs_conflicts_with_recipe_carriers() {
+        for carrier in ["--json={}", "--json-input", "--input=recipe.json"] {
+            let parsed = Cli::try_parse_from(["skill-manager", carrier, "configs", "--raw"])
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            assert!(parsed.machine_mode());
+            assert!(matches!(
+                parsed.command,
+                Some(Command::Configs(super::ConfigsArgs { raw: true, .. }))
+            ));
+        }
+        assert!(Cli::try_parse_from(["skill-manager", "configs", "--raw", "reset"]).is_err());
+    }
 }

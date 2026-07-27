@@ -23,5 +23,7 @@ pub mod recipe;
 pub mod skills;
 /// Human-readable status table rendering.
 pub mod status;
+/// Isolated migration from historical flat storage locations.
+pub mod storage_migration;
 /// Journaled filesystem transactions.
 pub mod transaction;
