@@ -1,3 +1,13 @@
+function Select-SmokeApplicationCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]] $Commands
+    )
+
+    $Commands | Select-Object -First 1
+}
+
 function Resolve-SmokeCanonicalExistingPath {
     param([Parameter(Mandatory = $true)] [string] $Path)
 
@@ -84,7 +94,9 @@ namespace SkillManagerSmoke
     }
 
     $resolved = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath
-    $realpath = Get-Command realpath -CommandType Application -ErrorAction SilentlyContinue
+    $realpath = Select-SmokeApplicationCommand -Commands @(
+        Get-Command realpath -CommandType Application -ErrorAction SilentlyContinue
+    )
     if (-not $realpath) {
         throw 'realpath is required to canonicalize live-smoke cleanup paths on this platform.'
     }

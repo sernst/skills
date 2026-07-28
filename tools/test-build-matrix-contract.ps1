@@ -112,6 +112,22 @@ $prNull = @(Copy-Targets -Targets $canonicalPr)
 $prNull[0]['target'] = $null
 Assert-Rejected { Assert-CanonicalPrBuildTargets -Targets $prNull } 'MATRIX_TYPE' 'Pr null value'
 
+$duplicateRealpathCommands = @(
+    [pscustomobject]@{ Source = '/usr/bin/realpath' },
+    [pscustomobject]@{ Source = '/bin/realpath' }
+)
+$selectedRealpathCommand = Select-SmokeApplicationCommand -Commands $duplicateRealpathCommands
+if (
+    $selectedRealpathCommand -is [array] -or
+    $selectedRealpathCommand.Source -is [array] -or
+    $selectedRealpathCommand.Source -cne '/usr/bin/realpath'
+) {
+    throw 'Duplicate realpath applications must resolve to one deterministic executable.'
+}
+if ($null -ne (Select-SmokeApplicationCommand -Commands @())) {
+    throw 'An absent realpath application must remain absent.'
+}
+
 $canonicalTempRoot = Resolve-SmokeCanonicalExistingPath -Path ([IO.Path]::GetTempPath())
 if ($IsWindows) {
     $providerTempRoot = (Resolve-Path -LiteralPath ([IO.Path]::GetTempPath())).ProviderPath
