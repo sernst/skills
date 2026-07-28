@@ -35,8 +35,7 @@ advisory:
     cargo deny --manifest-path Cargo.toml --config ../../deny.toml check advisories bans licenses sources
 
 live-smoke url:
-    target/release/skill-manager --json source add {{quote(url)}}
-    target/release/skill-manager --json status --refresh
+    pwsh -File ../../tools/live-github-smoke.ps1 -SourceUrl {{quote(url)}}
 
 check: format-check lint build test docs deny coverage
 

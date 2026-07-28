@@ -1,5 +1,6 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'build-matrix-contract.ps1')
+. (Join-Path $PSScriptRoot 'live-smoke-paths.ps1')
 
 function Copy-Targets {
     param([Parameter(Mandatory = $true)] [object[]] $Targets)
@@ -110,6 +111,377 @@ Assert-Rejected { Assert-CanonicalPrBuildTargets -Targets $prStringBoolean } 'MA
 $prNull = @(Copy-Targets -Targets $canonicalPr)
 $prNull[0]['target'] = $null
 Assert-Rejected { Assert-CanonicalPrBuildTargets -Targets $prNull } 'MATRIX_TYPE' 'Pr null value'
+
+$canonicalTempRoot = Resolve-SmokeCanonicalExistingPath -Path ([IO.Path]::GetTempPath())
+if ($IsWindows) {
+    $providerTempRoot = (Resolve-Path -LiteralPath ([IO.Path]::GetTempPath())).ProviderPath
+    $verbatimTempRoot = if ($providerTempRoot.StartsWith('\\', [StringComparison]::Ordinal)) {
+        '\\?\UNC\' + $providerTempRoot.Substring(2)
+    } else {
+        '\\?\' + $providerTempRoot
+    }
+    $canonicalVerbatimTempRoot = Resolve-SmokeCanonicalExistingPath -Path $verbatimTempRoot
+    if (-not $canonicalTempRoot.Equals($canonicalVerbatimTempRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Canonical cleanup paths differ between normal and Windows verbatim spellings.'
+    }
+} elseif ((Test-Path -LiteralPath '/var') -and (Test-Path -LiteralPath '/private/var')) {
+    $canonicalVar = Resolve-SmokeCanonicalExistingPath -Path '/var'
+    $canonicalPrivateVar = Resolve-SmokeCanonicalExistingPath -Path '/private/var'
+    if ($canonicalVar -cne $canonicalPrivateVar) {
+        throw 'Canonical cleanup paths differ between /var and /private/var.'
+    }
+}
+$validContainedSmoke = Join-Path $canonicalTempRoot 'skill-manager-live-smoke-fixture'
+Assert-SmokePathContained `
+    -CanonicalTempRoot $canonicalTempRoot `
+    -CanonicalSmokeRoot $validContainedSmoke
+$escapedSmoke = Join-Path (Split-Path -Parent $canonicalTempRoot) 'skill-manager-live-smoke-escape'
+Assert-Rejected {
+    Assert-SmokePathContained `
+        -CanonicalTempRoot $canonicalTempRoot `
+        -CanonicalSmokeRoot $escapedSmoke
+} 'SMOKE_PATH_ESCAPE' 'live-smoke cleanup lexical escape'
+$nestedSmoke = Join-Path $canonicalTempRoot 'nested/skill-manager-live-smoke-escape'
+Assert-Rejected {
+    Assert-SmokePathContained `
+        -CanonicalTempRoot $canonicalTempRoot `
+        -CanonicalSmokeRoot $nestedSmoke
+} 'SMOKE_PATH_ESCAPE' 'live-smoke cleanup must be a direct child'
+
+$validPrSmoke = @(
+    'jobs:',
+    '  preflight:',
+    '    steps:',
+    '      - name: Fixture host',
+    '        run: pwsh -File tools/run-build-matrix-entry.ps1 -Cli sample -Phase Host',
+    '      - name: Fixture target',
+    '        run: pwsh -File tools/run-build-matrix-entry.ps1 -Cli sample -Target sample -Native false -Zig true -Phase Target',
+    '      - name: Exercise fork head through a live GitHub source',
+    "        if: matrix.target == 'aarch64-unknown-linux-musl'",
+    '        shell: bash',
+    '        env:',
+    '          SMOKE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}',
+    '          SMOKE_REF: ${{ github.event.pull_request.head.sha }}',
+    '        run: |',
+    '          set -euo pipefail',
+    '          smoke_source_url="https://github.com/${SMOKE_REPOSITORY}/tree/${SMOKE_REF}/skills"',
+    '          sudo useradd --no-create-home --shell /bin/bash skill-manager-smoke',
+    "          trap 'sudo userdel skill-manager-smoke' EXIT",
+    '          sudo --user skill-manager-smoke --set-home /bin/bash \',
+    '            "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" \',
+    '            "${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" \',
+    '            "$smoke_source_url"'
+) -join [Environment]::NewLine
+$validMainSmoke = @(
+    'jobs:',
+    '  live-github-smoke:',
+    '    steps:',
+    '      - name: Exercise GitHub source at an exact commit',
+    '        run: |',
+    '          set -euo pipefail',
+    '          smoke_source_url="https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}/skills"',
+    '          sudo useradd --no-create-home --shell /bin/bash skill-manager-smoke',
+    "          trap 'sudo userdel skill-manager-smoke' EXIT",
+    '          sudo --user skill-manager-smoke --set-home /bin/bash \',
+    '            "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" \',
+    '            "${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" \',
+    '            "$smoke_source_url"'
+) -join [Environment]::NewLine
+Assert-LiveSmokeWorkflowContract -PrWorkflow $validPrSmoke -MainWorkflow $validMainSmoke
+$crlfContinuation = "sudo --user smoke /bin/bash \`r`n  `"/absolute/helper.sh`""
+if (
+    (ConvertTo-ExecutableShellScript -Script $crlfContinuation) -cne
+    'sudo --user smoke /bin/bash "/absolute/helper.sh"'
+) {
+    throw 'Guardrail did not preserve a bare terminal backslash continuation across CRLF.'
+}
+
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow ($validPrSmoke.Replace('/tools/live-github-smoke.sh', '/tools/not-live-smoke.sh')) `
+        -MainWorkflow $validMainSmoke
+} 'LIVE_SMOKE_COMMAND_SET' 'missing PR live smoke'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow ($validPrSmoke.Replace(
+            '          sudo --user skill-manager-smoke --set-home /bin/bash \',
+            '          # sudo --user skill-manager-smoke --set-home /bin/bash \'
+        )) `
+        -MainWorkflow $validMainSmoke
+} 'LIVE_SMOKE_COMMAND_SET' 'commented-out PR sudo boundary'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow ($validPrSmoke.Replace(
+            '          sudo --user skill-manager-smoke --set-home /bin/bash \',
+            '          echo ignored # sudo --user skill-manager-smoke --set-home /bin/bash \'
+        )) `
+        -MainWorkflow $validMainSmoke
+} 'LIVE_SMOKE_COMMAND_SET' 'inline-commented PR sudo boundary'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow ($validPrSmoke.Replace(
+            '          sudo --user skill-manager-smoke --set-home /bin/bash \',
+            '          sudo --user skill-manager-smoke --set-home /bin/bash \ # not a continuation'
+        )) `
+        -MainWorkflow $validMainSmoke
+} 'LIVE_SMOKE_COMMAND_SET' 'backslash before an inline comment is not a continuation'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow ($validPrSmoke.Replace(
+            '            "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" \',
+            '            # "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" \'
+        )) `
+        -MainWorkflow $validMainSmoke
+} 'LIVE_SMOKE_COMMAND_SET' 'commented-out PR helper path'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow ($validPrSmoke.Replace(
+            '            "${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" \',
+            '            # "${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" \'
+        )) `
+        -MainWorkflow $validMainSmoke
+} 'LIVE_SMOKE_COMMAND_SET' 'commented-out PR binary path'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow ($validPrSmoke.Replace(
+            '          SMOKE_REF: ${{ github.event.pull_request.head.sha }}',
+            '          # SMOKE_REF: ${{ github.event.pull_request.head.sha }}'
+        )) `
+        -MainWorkflow $validMainSmoke
+} 'PR_LIVE_SMOKE_SOURCE' 'commented-out PR source ref'
+$commentedSecretPrSmoke = $validPrSmoke.Replace(
+    '          SMOKE_REF: ${{ github.event.pull_request.head.sha }}',
+    "          SMOKE_REF: `${{ github.event.pull_request.head.sha }}`n          # GH_TOKEN: `${{ secrets.GITHUB_TOKEN }}"
+)
+Assert-LiveSmokeWorkflowContract -PrWorkflow $commentedSecretPrSmoke -MainWorkflow $validMainSmoke
+$commentedHelperPrSmoke = $validPrSmoke + [Environment]::NewLine + @(
+    '      # - run: bash tools/live-github-smoke.sh',
+    '      - run: echo ok # bash "${GITHUB_WORKSPACE}"/tools/live-github-smoke.sh'
+) -join [Environment]::NewLine
+Assert-LiveSmokeWorkflowContract -PrWorkflow $commentedHelperPrSmoke -MainWorkflow $validMainSmoke
+$commentedHelperMainSmoke = $validMainSmoke + [Environment]::NewLine + @(
+    '      # - run: bash tools/live-github-smoke.sh',
+    '      - run: echo ok # bash "${GITHUB_WORKSPACE}"/tools/live-github-smoke.sh'
+) -join [Environment]::NewLine
+Assert-LiveSmokeWorkflowContract -PrWorkflow $validPrSmoke -MainWorkflow $commentedHelperMainSmoke
+foreach ($alternateHelperCommand in @(
+    'bash tools/live-github-smoke.sh',
+    'bash "${GITHUB_WORKSPACE}"/tools/live-github-smoke.sh',
+    'HELPER=tools/live-github-smoke.sh; bash "$HELPER"',
+    'HELPER=tools/live-github-smoke.sh'
+)) {
+    Assert-Rejected {
+        Assert-LiveSmokeWorkflowContract `
+            -PrWorkflow ($validPrSmoke + [Environment]::NewLine + "      - run: $alternateHelperCommand") `
+            -MainWorkflow $validMainSmoke
+    } 'LIVE_SMOKE_COMMAND_SET' "alternate PR live-smoke helper reference: $alternateHelperCommand"
+    Assert-Rejected {
+        Assert-LiveSmokeWorkflowContract `
+            -PrWorkflow $validPrSmoke `
+            -MainWorkflow ($validMainSmoke + [Environment]::NewLine + "      - run: $alternateHelperCommand")
+    } 'LIVE_SMOKE_COMMAND_SET' "alternate main live-smoke helper reference: $alternateHelperCommand"
+}
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow ($validPrSmoke + [Environment]::NewLine + '      - run: "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh"') `
+        -MainWorkflow $validMainSmoke
+} 'LIVE_SMOKE_COMMAND_SET' 'duplicate PR live smoke'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow ($validPrSmoke.Replace("matrix.target == 'aarch64-unknown-linux-musl'", "matrix.target == 'x86_64-pc-windows-msvc'")) `
+        -MainWorkflow $validMainSmoke
+} 'PR_LIVE_SMOKE_CONDITION' 'wrong PR live-smoke matrix condition'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow ($validPrSmoke.Replace('github.event.pull_request.head.sha', 'github.sha')) `
+        -MainWorkflow $validMainSmoke
+} 'PR_LIVE_SMOKE_SOURCE' 'PR live smoke using merge SHA'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow ($validPrSmoke.Replace(' -Phase Target', ' -Phase Final')) `
+        -MainWorkflow $validMainSmoke
+} 'PR_LIVE_SMOKE_ORDER' 'PR live smoke without preceding Target phase'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow ($validPrSmoke.Replace(
+            '          sudo --user skill-manager-smoke --set-home /bin/bash \',
+            "          sudo --user skill-manager-smoke just live-smoke`n          sudo --user skill-manager-smoke --set-home /bin/bash \"
+        )) `
+        -MainWorkflow $validMainSmoke
+} 'LIVE_SMOKE_COMMAND_SET' 'bare sudo just in PR live smoke'
+foreach ($boundaryCommand in @(
+    'echo ok; sudo --user skill-manager-smoke just live-smoke',
+    'true && sudo --user skill-manager-smoke just live-smoke',
+    'false || sudo --user skill-manager-smoke just live-smoke',
+    'printf x | sudo --user skill-manager-smoke just live-smoke'
+)) {
+    Assert-Rejected {
+        Assert-LiveSmokeWorkflowContract `
+            -PrWorkflow ($validPrSmoke.Replace(
+                '          sudo --user skill-manager-smoke --set-home /bin/bash \',
+                "          $boundaryCommand`n          sudo --user skill-manager-smoke --set-home /bin/bash \"
+            )) `
+            -MainWorkflow $validMainSmoke
+    } 'LIVE_SMOKE_COMMAND_SET' "sudo just after shell boundary: $boundaryCommand"
+}
+$quotedSudoPrSmoke = $validPrSmoke.Replace(
+    '          sudo --user skill-manager-smoke --set-home /bin/bash \',
+    "          echo 'ok; sudo --user skill-manager-smoke just live-smoke'`n          sudo --user skill-manager-smoke --set-home /bin/bash \"
+)
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract -PrWorkflow $quotedSudoPrSmoke -MainWorkflow $validMainSmoke
+} 'LIVE_SMOKE_COMMAND_SET' 'quoted sudo text is an unapproved extra command'
+$parenthesizedSudoPrSmoke = $validPrSmoke.Replace(
+    '          sudo --user skill-manager-smoke --set-home /bin/bash \',
+    '          (sudo --user skill-manager-smoke --set-home /bin/bash \'
+).Replace(
+    '            "$smoke_source_url"',
+    '            "$smoke_source_url")'
+)
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract -PrWorkflow $parenthesizedSudoPrSmoke -MainWorkflow $validMainSmoke
+} 'LIVE_SMOKE_COMMAND_SET' 'parenthesized sudo invocation'
+$bracedSudoPrSmoke = $validPrSmoke.Replace(
+    '          sudo --user skill-manager-smoke --set-home /bin/bash \',
+    '          { sudo --user skill-manager-smoke --set-home /bin/bash \'
+).Replace(
+    '            "$smoke_source_url"',
+    '            "$smoke_source_url"; }'
+)
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract -PrWorkflow $bracedSudoPrSmoke -MainWorkflow $validMainSmoke
+} 'LIVE_SMOKE_COMMAND_SET' 'braced sudo invocation'
+foreach ($sudoPrefix in @('command sudo', "'sudo'")) {
+    $prefixedSudoPrSmoke = $validPrSmoke.Replace(
+        '          sudo --user skill-manager-smoke --set-home /bin/bash \',
+        "          $sudoPrefix --user skill-manager-smoke --set-home /bin/bash \"
+    )
+    Assert-Rejected {
+        Assert-LiveSmokeWorkflowContract -PrWorkflow $prefixedSudoPrSmoke -MainWorkflow $validMainSmoke
+    } 'LIVE_SMOKE_COMMAND_SET' "alternate sudo executable form: $sudoPrefix"
+}
+foreach ($extraCommand in @('echo unexpected', 'true')) {
+    $extraCommandPrSmoke = $validPrSmoke.Replace(
+        '          smoke_source_url=',
+        "          $extraCommand`n          smoke_source_url="
+    )
+    Assert-Rejected {
+        Assert-LiveSmokeWorkflowContract -PrWorkflow $extraCommandPrSmoke -MainWorkflow $validMainSmoke
+    } 'LIVE_SMOKE_COMMAND_SET' "unapproved extra command: $extraCommand"
+}
+foreach ($unsafeSudo in @(
+    'sudo -E --user skill-manager-smoke true',
+    'sudo --preserve-env=PATH --user skill-manager-smoke true',
+    'sudo --user skill-manager-smoke PATH=/workspace/bin true'
+)) {
+    Assert-Rejected {
+        Assert-LiveSmokeWorkflowContract `
+            -PrWorkflow ($validPrSmoke.Replace(
+                '          sudo --user skill-manager-smoke --set-home /bin/bash \',
+                "          $unsafeSudo`n          sudo --user skill-manager-smoke --set-home /bin/bash \"
+            )) `
+            -MainWorkflow $validMainSmoke
+    } 'LIVE_SMOKE_COMMAND_SET' "unsafe sudo environment: $unsafeSudo"
+}
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow ($validPrSmoke.Replace(
+            '          SMOKE_REF: ${{ github.event.pull_request.head.sha }}',
+            "          SMOKE_REF: `${{ github.event.pull_request.head.sha }}`n          GH_TOKEN: `${{ secrets.GITHUB_TOKEN }}"
+        )) `
+        -MainWorkflow $validMainSmoke
+} 'LIVE_SMOKE_TOKEN' 'secret token in PR live smoke'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow ($validPrSmoke.Replace(
+            '"${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager"',
+            '"clis/skill-manager/target/release/skill-manager"'
+        )) `
+        -MainWorkflow $validMainSmoke
+} 'LIVE_SMOKE_COMMAND_SET' 'relative PR smoke binary'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow $validPrSmoke `
+        -MainWorkflow ($validMainSmoke.Replace('/tools/live-github-smoke.sh', '/tools/not-live-smoke.sh'))
+} 'LIVE_SMOKE_COMMAND_SET' 'missing main live smoke'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow $validPrSmoke `
+        -MainWorkflow ($validMainSmoke + [Environment]::NewLine + '      - run: "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh"')
+} 'LIVE_SMOKE_COMMAND_SET' 'duplicate main live smoke'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow $validPrSmoke `
+        -MainWorkflow ($validMainSmoke.Replace('${GITHUB_SHA}', '${GITHUB_REF}'))
+} 'MAIN_LIVE_SMOKE_SOURCE' 'main live smoke using branch ref'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow $validPrSmoke `
+        -MainWorkflow ($validMainSmoke.Replace('--user skill-manager-smoke', '--user root'))
+} 'LIVE_SMOKE_COMMAND_SET' 'main live smoke running as root'
+
+$validLiveSmokeHelper = @'
+#!/usr/bin/env bash
+set -euo pipefail
+"$skill_manager" --json source add "$source_url" live-github-smoke
+"$skill_manager" --json status --refresh
+'@
+Assert-LiveSmokeHelperContract -Helper $validLiveSmokeHelper
+Assert-Rejected {
+    Assert-LiveSmokeHelperContract -Helper ($validLiveSmokeHelper.Replace(' live-github-smoke', ''))
+} 'LIVE_SMOKE_HELPER_SOURCE' 'live-smoke helper missing noninteractive source name'
+Assert-Rejected {
+    Assert-LiveSmokeHelperContract -Helper (
+        $validLiveSmokeHelper + [Environment]::NewLine + '"$skill_manager" --version'
+    )
+} 'LIVE_SMOKE_HELPER_CALLS' 'live-smoke helper with an extra CLI call'
+Assert-Rejected {
+    Assert-LiveSmokeHelperContract -Helper ($validLiveSmokeHelper.Replace(
+        '"$skill_manager" --json source add "$source_url" live-github-smoke',
+        'eval "$skill_manager --json source add $source_url live-github-smoke"'
+    ))
+} 'LIVE_SMOKE_HELPER_EVAL' 'live-smoke helper using eval'
+
+$validLocalJustfile = @'
+live-smoke url:
+    pwsh -File ../../tools/live-github-smoke.ps1 -SourceUrl {{quote(url)}}
+'@
+$validLocalWrapper = @'
+. (Join-Path $PSScriptRoot 'live-smoke-paths.ps1')
+$smokeRoot = Join-Path $root "skill-manager-live-smoke-$id"
+[Environment]::SetEnvironmentVariable('SKILL_MANAGER_HOME', $smokeRoot, 'Process')
+try {
+    & $resolvedBinary --json source add $SourceUrl live-github-smoke
+    & $resolvedBinary --json status --refresh
+} finally {
+    $canonicalTempRoot = Resolve-SmokeCanonicalExistingPath -Path $systemTempRoot
+    $canonicalSmokeRoot = Resolve-SmokeCanonicalExistingPath -Path $smokeRoot
+    Assert-SmokePathContained -CanonicalTempRoot $canonicalTempRoot -CanonicalSmokeRoot $canonicalSmokeRoot
+    Remove-Item -LiteralPath $canonicalSmokeRoot -Recurse -Force
+}
+'@
+Assert-LocalLiveSmokeContract -Justfile $validLocalJustfile -Wrapper $validLocalWrapper
+Assert-Rejected {
+    Assert-LocalLiveSmokeContract `
+        -Justfile ($validLocalJustfile.Replace(
+            'pwsh -File ../../tools/live-github-smoke.ps1 -SourceUrl {{quote(url)}}',
+            'bash ../../tools/live-github-smoke.sh "$PWD/target/release/skill-manager" {{quote(url)}}'
+        )) `
+        -Wrapper $validLocalWrapper
+} 'LOCAL_LIVE_SMOKE_RECIPE' 'Windows-incompatible local live-smoke recipe'
+Assert-Rejected {
+    Assert-LocalLiveSmokeContract `
+        -Justfile $validLocalJustfile `
+        -Wrapper ($validLocalWrapper.Replace(' live-github-smoke', ''))
+} 'LOCAL_LIVE_SMOKE_SOURCE' 'local wrapper missing source name'
+Assert-Rejected {
+    Assert-LocalLiveSmokeContract `
+        -Justfile $validLocalJustfile `
+        -Wrapper ($validLocalWrapper.Replace(
+            "    Remove-Item -LiteralPath `$canonicalSmokeRoot -Recurse -Force",
+            '    Write-Output skipped-cleanup'
+        ))
+} 'LOCAL_LIVE_SMOKE_ISOLATION' 'local wrapper missing cleanup'
 
 $setupCommands = @(
     'rustup target add sample-target',

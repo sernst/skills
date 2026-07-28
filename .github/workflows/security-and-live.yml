@@ -39,5 +39,11 @@ jobs:
           just release-build
       - name: Exercise GitHub source at an exact commit
         run: |
-          sudo useradd --create-home --shell /bin/bash skill-manager-smoke
-          sudo --user skill-manager-smoke --set-home just live-smoke "https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}/skills"
+          set -euo pipefail
+          smoke_source_url="https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}/skills"
+          sudo useradd --no-create-home --shell /bin/bash skill-manager-smoke
+          trap 'sudo userdel skill-manager-smoke' EXIT
+          sudo --user skill-manager-smoke --set-home /bin/bash \
+            "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" \
+            "${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" \
+            "$smoke_source_url"

@@ -127,6 +127,153 @@ function Get-StepRunText {
     $commands -join [Environment]::NewLine
 }
 
+function Remove-ShellInlineComment {
+    param([Parameter(Mandatory = $true)] [AllowEmptyString()] [string] $Line)
+
+    $singleQuoted = $false
+    $doubleQuoted = $false
+    $escaped = $false
+    for ($index = 0; $index -lt $Line.Length; $index++) {
+        $character = $Line[$index]
+        if ($escaped) {
+            $escaped = $false
+            continue
+        }
+        if ($character -eq '\' -and -not $singleQuoted) {
+            $escaped = $true
+            continue
+        }
+        if ($character -eq "'" -and -not $doubleQuoted) {
+            $singleQuoted = -not $singleQuoted
+            continue
+        }
+        if ($character -eq '"' -and -not $singleQuoted) {
+            $doubleQuoted = -not $doubleQuoted
+            continue
+        }
+        if ($character -eq '#' -and -not $singleQuoted -and -not $doubleQuoted) {
+            $startsComment = $index -eq 0 -or [char]::IsWhiteSpace($Line[$index - 1]) -or
+                $Line[$index - 1] -in @(';', '|', '&', '(', ')')
+            if ($startsComment) {
+                return $Line.Substring(0, $index).TrimEnd()
+            }
+        }
+    }
+    $Line
+}
+
+function Get-CommentFreeLines {
+    param([Parameter(Mandatory = $true)] [AllowEmptyString()] [string] $Text)
+
+    $lines = @()
+    foreach ($line in @([regex]::Split($Text, '\r?\n'))) {
+        $withoutComment = Remove-ShellInlineComment -Line $line
+        if ($withoutComment.Trim().Length -gt 0) {
+            $lines += $withoutComment
+        }
+    }
+    @($lines)
+}
+
+function ConvertTo-CommentFreeText {
+    param([Parameter(Mandatory = $true)] [AllowEmptyString()] [string] $Text)
+    @(Get-CommentFreeLines -Text $Text) -join [Environment]::NewLine
+}
+
+function ConvertTo-ExecutableShellScript {
+    param([Parameter(Mandatory = $true)] [AllowEmptyString()] [string] $Script)
+
+    $commands = @()
+    $pending = ''
+    foreach ($physicalLine in @([regex]::Split($Script, '\r?\n'))) {
+        $physical = $physicalLine.TrimEnd()
+        $continued = $physical.EndsWith('\', [StringComparison]::Ordinal) -or
+            $physical.EndsWith('`', [StringComparison]::Ordinal)
+        $command = (Remove-ShellInlineComment -Line $physical).Trim()
+        if ($command.Length -eq 0) {
+            if ($pending.Length -gt 0) {
+                $commands += $pending
+                $pending = ''
+            }
+            continue
+        }
+        if ($continued) {
+            if ($command.EndsWith('\', [StringComparison]::Ordinal) -or $command.EndsWith('`', [StringComparison]::Ordinal)) {
+                $command = $command.Substring(0, $command.Length - 1).TrimEnd()
+            } else {
+                $continued = $false
+            }
+        }
+        $pending = if ($pending.Length -gt 0) { "$pending $command" } else { $command }
+        if (-not $continued) {
+            $commands += $pending
+            $pending = ''
+        }
+    }
+    if ($pending.Length -gt 0) {
+        $commands += $pending
+    }
+    $commands -join [Environment]::NewLine
+}
+
+function Split-ExecutableShellCommands {
+    param([Parameter(Mandatory = $true)] [AllowEmptyString()] [string] $Script)
+
+    $commands = [Collections.Generic.List[string]]::new()
+    $current = [Text.StringBuilder]::new()
+    $singleQuoted = $false
+    $doubleQuoted = $false
+    $escaped = $false
+
+    $addCurrentShellCommand = {
+        $command = $current.ToString().Trim()
+        if ($command.Length -gt 0) {
+            $commands.Add($command)
+        }
+        [void]$current.Clear()
+    }
+
+    for ($index = 0; $index -lt $Script.Length; $index++) {
+        $character = $Script[$index]
+        if ($escaped) {
+            [void]$current.Append($character)
+            $escaped = $false
+            continue
+        }
+        if ($character -eq '\' -and -not $singleQuoted) {
+            [void]$current.Append($character)
+            $escaped = $true
+            continue
+        }
+        if ($character -eq "'" -and -not $doubleQuoted) {
+            $singleQuoted = -not $singleQuoted
+            [void]$current.Append($character)
+            continue
+        }
+        if ($character -eq '"' -and -not $singleQuoted) {
+            $doubleQuoted = -not $doubleQuoted
+            [void]$current.Append($character)
+            continue
+        }
+        if (-not $singleQuoted -and -not $doubleQuoted) {
+            if ($character -eq "`n" -or $character -eq "`r" -or $character -eq ';') {
+                . $addCurrentShellCommand
+                continue
+            }
+            if ($character -eq '&' -or $character -eq '|') {
+                . $addCurrentShellCommand
+                if ($index + 1 -lt $Script.Length -and $Script[$index + 1] -eq $character) {
+                    $index++
+                }
+                continue
+            }
+        }
+        [void]$current.Append($character)
+    }
+    . $addCurrentShellCommand
+    @($commands)
+}
+
 function ConvertTo-WorkflowStep {
     param(
         [Parameter(Mandatory = $true)] [AllowEmptyString()] [string[]] $Lines,
@@ -135,8 +282,13 @@ function ConvertTo-WorkflowStep {
         [Parameter(Mandatory = $true)] [int] $Indent
     )
     $stepLines = @($Lines[$Start..($End - 1)])
+    $text = $stepLines -join [Environment]::NewLine
+    $run = Get-StepRunText -Lines $stepLines -StepIndent $Indent
     [pscustomobject]@{
-        Run = Get-StepRunText -Lines $stepLines -StepIndent $Indent
+        Run = $run
+        Text = $text
+        ActiveText = ConvertTo-CommentFreeText -Text $text
+        Executable = ConvertTo-ExecutableShellScript -Script $run
         Position = $Start
     }
 }
@@ -250,7 +402,7 @@ function Find-StepCommandOccurrences {
 
     $occurrences = @()
     for ($stepIndex = 0; $stepIndex -lt $Steps.Count; $stepIndex++) {
-        foreach ($match in [regex]::Matches($Steps[$stepIndex].Run, $Pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+        foreach ($match in [regex]::Matches($Steps[$stepIndex].Executable, $Pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
             $occurrences += [pscustomobject]@{
                 StepIndex = $stepIndex
                 Position = $match.Index
@@ -337,5 +489,216 @@ function Assert-WorkflowTargetSetupOrder {
         if ($occurrences[0].StepIndex -ge $targetOccurrences[0].StepIndex) {
             Throw-BuildContractViolation 'ORDER_AFTER_TARGET' "Workflow '$WorkflowName' must configure $($setup.Key) before Target."
         }
+    }
+}
+
+function Get-NamedWorkflowSteps {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Workflow,
+        [Parameter(Mandatory = $true)] [string] $StepName
+    )
+
+    $results = @()
+    $namePattern = '(?m)^[ ]*-\s+name:\s*' + [regex]::Escape($StepName) + '\s*$'
+    foreach ($job in @(Get-WorkflowJobs -Workflow $Workflow)) {
+        for ($stepIndex = 0; $stepIndex -lt $job.Steps.Count; $stepIndex++) {
+            if ([regex]::IsMatch($job.Steps[$stepIndex].ActiveText, $namePattern)) {
+                $results += [pscustomobject]@{
+                    Job = $job
+                    Step = $job.Steps[$stepIndex]
+                    StepIndex = $stepIndex
+                }
+            }
+        }
+    }
+    @($results)
+}
+
+function Get-LiveSmokeHelperBasenameOccurrenceCount {
+    param([Parameter(Mandatory = $true)] [string] $Workflow)
+
+    $activeText = ConvertTo-CommentFreeText -Text $Workflow
+    $quoteIndependentText = $activeText.Replace("'", '').Replace('"', '')
+    [regex]::Matches(
+        $quoteIndependentText,
+        '(?<![A-Za-z0-9_.-])live-github-smoke\.sh(?![A-Za-z0-9_.-])',
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase
+    ).Count
+}
+
+function Assert-ExactLiveSmokeCommandSet {
+    param(
+        [Parameter(Mandatory = $true)] [string] $WorkflowName,
+        [Parameter(Mandatory = $true)] [object] $Step,
+        [Parameter(Mandatory = $true)] [string] $SourceCommand
+    )
+
+    if (
+        $Step.ActiveText -match '(?i)(?:secrets\.|github\.token|GITHUB_TOKEN|GH_TOKEN|ACTIONS_RUNTIME_TOKEN|ID_TOKEN)' -or
+        $Step.Executable -match '(?i)(?:secrets\.|github\.token|GITHUB_TOKEN|GH_TOKEN|ACTIONS_RUNTIME_TOKEN|ID_TOKEN)'
+    ) {
+        Throw-BuildContractViolation 'LIVE_SMOKE_TOKEN' "Workflow '$WorkflowName' must not expose a secret or token to the live smoke."
+    }
+
+    $expected = @(
+        'set -euo pipefail',
+        $SourceCommand,
+        'sudo useradd --no-create-home --shell /bin/bash skill-manager-smoke',
+        "trap 'sudo userdel skill-manager-smoke' EXIT",
+        (
+            'sudo --user skill-manager-smoke --set-home /bin/bash ' +
+            '"${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" ' +
+            '"${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" ' +
+            '"$smoke_source_url"'
+        )
+    )
+    $actual = @(Split-ExecutableShellCommands -Script $Step.Executable)
+    if ($actual.Count -ne $expected.Count) {
+        Throw-BuildContractViolation 'LIVE_SMOKE_COMMAND_SET' "Workflow '$WorkflowName' live smoke must contain only the approved command sequence."
+    }
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        if ($actual[$index] -cne $expected[$index]) {
+            Throw-BuildContractViolation 'LIVE_SMOKE_COMMAND_SET' "Workflow '$WorkflowName' live smoke command $index differs from the approved sequence."
+        }
+    }
+}
+
+function Assert-LiveSmokeWorkflowContract {
+    param(
+        [Parameter(Mandatory = $true)] [string] $PrWorkflow,
+        [Parameter(Mandatory = $true)] [string] $MainWorkflow
+    )
+
+    $prSmokes = @(Get-NamedWorkflowSteps `
+        -Workflow $PrWorkflow `
+        -StepName 'Exercise fork head through a live GitHub source')
+    if ($prSmokes.Count -eq 0) {
+        Throw-BuildContractViolation 'MISSING_PR_LIVE_SMOKE' 'The PR workflow must invoke the shared live-smoke helper exactly once.'
+    }
+    if ($prSmokes.Count -gt 1) {
+        Throw-BuildContractViolation 'DUPLICATE_PR_LIVE_SMOKE' 'The PR workflow must invoke the shared live-smoke helper exactly once.'
+    }
+    $prSmoke = $prSmokes[0]
+    if ($prSmoke.Job.Name -cne 'preflight') {
+        Throw-BuildContractViolation 'PR_LIVE_SMOKE_JOB' 'The PR live smoke must run in the existing preflight job.'
+    }
+    if ($prSmoke.Step.ActiveText -notmatch '(?m)^[ ]*if:\s*matrix\.target\s*==\s*''aarch64-unknown-linux-musl''\s*$') {
+        Throw-BuildContractViolation 'PR_LIVE_SMOKE_CONDITION' 'The PR live smoke must run only for aarch64-unknown-linux-musl.'
+    }
+    if (
+        $prSmoke.Step.ActiveText -notmatch '(?m)^[ ]*SMOKE_REPOSITORY:\s*\$\{\{\s*github\.event\.pull_request\.head\.repo\.full_name\s*\}\}\s*$' -or
+        $prSmoke.Step.ActiveText -notmatch '(?m)^[ ]*SMOKE_REF:\s*\$\{\{\s*github\.event\.pull_request\.head\.sha\s*\}\}\s*$' -or
+        $prSmoke.Step.Executable -notmatch '(?m)^smoke_source_url="https://github\.com/\$\{SMOKE_REPOSITORY\}/tree/\$\{SMOKE_REF\}/skills"\s*$'
+    ) {
+        Throw-BuildContractViolation 'PR_LIVE_SMOKE_SOURCE' 'The PR live smoke must use the public fork head repository and exact head SHA.'
+    }
+    $targetSteps = @(Find-StepCommandOccurrences -Steps $prSmoke.Job.Steps -Pattern 'run-build-matrix-entry\.ps1[\s\S]*?-Phase\s+Target\b')
+    if (-not $targetSteps.Count -or $prSmoke.StepIndex -le $targetSteps[-1].StepIndex) {
+        Throw-BuildContractViolation 'PR_LIVE_SMOKE_ORDER' 'The PR live smoke must run after the Target phase.'
+    }
+    Assert-ExactLiveSmokeCommandSet `
+        -WorkflowName 'pr.yml' `
+        -Step $prSmoke.Step `
+        -SourceCommand 'smoke_source_url="https://github.com/${SMOKE_REPOSITORY}/tree/${SMOKE_REF}/skills"'
+    if ((Get-LiveSmokeHelperBasenameOccurrenceCount -Workflow $PrWorkflow) -ne 1) {
+        Throw-BuildContractViolation 'LIVE_SMOKE_COMMAND_SET' 'The PR workflow must reference the live-smoke helper basename only in the approved command sequence.'
+    }
+
+    $mainSmokes = @(Get-NamedWorkflowSteps `
+        -Workflow $MainWorkflow `
+        -StepName 'Exercise GitHub source at an exact commit')
+    if ($mainSmokes.Count -eq 0) {
+        Throw-BuildContractViolation 'MISSING_MAIN_LIVE_SMOKE' 'The main workflow must invoke the shared live-smoke helper exactly once.'
+    }
+    if ($mainSmokes.Count -gt 1) {
+        Throw-BuildContractViolation 'DUPLICATE_MAIN_LIVE_SMOKE' 'The main workflow must invoke the shared live-smoke helper exactly once.'
+    }
+    $mainSmoke = $mainSmokes[0]
+    if ($mainSmoke.Job.Name -cne 'live-github-smoke') {
+        Throw-BuildContractViolation 'MAIN_LIVE_SMOKE_JOB' 'The main live smoke must run in the live-github-smoke job.'
+    }
+    if ($mainSmoke.Step.Executable -notmatch '(?m)^smoke_source_url="https://github\.com/\$\{GITHUB_REPOSITORY\}/tree/\$\{GITHUB_SHA\}/skills"\s*$') {
+        Throw-BuildContractViolation 'MAIN_LIVE_SMOKE_SOURCE' 'The main live smoke must use GITHUB_REPOSITORY and the exact GITHUB_SHA.'
+    }
+    Assert-ExactLiveSmokeCommandSet `
+        -WorkflowName 'security-and-live.yml' `
+        -Step $mainSmoke.Step `
+        -SourceCommand 'smoke_source_url="https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}/skills"'
+    if ((Get-LiveSmokeHelperBasenameOccurrenceCount -Workflow $MainWorkflow) -ne 1) {
+        Throw-BuildContractViolation 'LIVE_SMOKE_COMMAND_SET' 'The main workflow must reference the live-smoke helper basename only in the approved command sequence.'
+    }
+}
+
+function Assert-LiveSmokeHelperContract {
+    param([Parameter(Mandatory = $true)] [string] $Helper)
+
+    if ($Helper -notmatch '(?m)^set -euo pipefail\s*$') {
+        Throw-BuildContractViolation 'LIVE_SMOKE_HELPER_STRICT' 'The live-smoke helper must enable strict Bash error handling.'
+    }
+    if ($Helper -match '(?m)^[ ]*eval\b') {
+        Throw-BuildContractViolation 'LIVE_SMOKE_HELPER_EVAL' 'The live-smoke helper must not use eval.'
+    }
+    $calls = @([regex]::Matches($Helper, '(?m)^[ ]*"\$skill_manager"\s+'))
+    if ($calls.Count -ne 2) {
+        Throw-BuildContractViolation 'LIVE_SMOKE_HELPER_CALLS' 'The live-smoke helper must make exactly two skill-manager calls.'
+    }
+    $sourceCall = [regex]::Match(
+        $Helper,
+        '(?m)^[ ]*"\$skill_manager"\s+--json\s+source\s+add\s+"\$source_url"\s+live-github-smoke\s*$'
+    )
+    if (-not $sourceCall.Success) {
+        Throw-BuildContractViolation 'LIVE_SMOKE_HELPER_SOURCE' 'The live-smoke helper must add the exact URL with an explicit noninteractive source name.'
+    }
+    $statusCall = [regex]::Match(
+        $Helper,
+        '(?m)^[ ]*"\$skill_manager"\s+--json\s+status\s+--refresh\s*$'
+    )
+    if (-not $statusCall.Success) {
+        Throw-BuildContractViolation 'LIVE_SMOKE_HELPER_STATUS' 'The live-smoke helper must refresh status after adding the source.'
+    }
+    if ($sourceCall.Index -ge $statusCall.Index) {
+        Throw-BuildContractViolation 'LIVE_SMOKE_HELPER_ORDER' 'The live-smoke helper must add the source before refreshing status.'
+    }
+}
+
+function Assert-LocalLiveSmokeContract {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Justfile,
+        [Parameter(Mandatory = $true)] [string] $Wrapper
+    )
+
+    if (
+        $Justfile -notmatch (
+            '(?m)^[ ]*pwsh\s+-File\s+\.\./\.\./tools/live-github-smoke\.ps1\s+' +
+            '-SourceUrl\s+\{\{quote\(url\)\}\}\s*$'
+        ) -or
+        $Justfile -match '(?im)^[ ]*(?:bash\b|.*\$PWD)'
+    ) {
+        Throw-BuildContractViolation 'LOCAL_LIVE_SMOKE_RECIPE' 'The local live-smoke recipe must use the cross-platform PowerShell wrapper.'
+    }
+    if ($Wrapper -match '(?im)^[ ]*(?:Invoke-Expression|iex)\b') {
+        Throw-BuildContractViolation 'LOCAL_LIVE_SMOKE_EVAL' 'The local live-smoke wrapper must not evaluate command strings.'
+    }
+    $calls = @([regex]::Matches($Wrapper, '(?m)^[ ]*&\s+\$resolvedBinary\s+'))
+    if ($calls.Count -ne 2) {
+        Throw-BuildContractViolation 'LOCAL_LIVE_SMOKE_CALLS' 'The local live-smoke wrapper must make exactly two skill-manager calls.'
+    }
+    if ($Wrapper -notmatch '(?m)^[ ]*&\s+\$resolvedBinary\s+--json\s+source\s+add\s+\$SourceUrl\s+live-github-smoke\s*$') {
+        Throw-BuildContractViolation 'LOCAL_LIVE_SMOKE_SOURCE' 'The local live-smoke wrapper must add the URL with an explicit source name.'
+    }
+    if ($Wrapper -notmatch '(?m)^[ ]*&\s+\$resolvedBinary\s+--json\s+status\s+--refresh\s*$') {
+        Throw-BuildContractViolation 'LOCAL_LIVE_SMOKE_STATUS' 'The local live-smoke wrapper must refresh status.'
+    }
+    if (
+        $Wrapper -notmatch 'skill-manager-live-smoke-' -or
+        $Wrapper -notmatch 'live-smoke-paths\.ps1' -or
+        $Wrapper -notmatch 'SetEnvironmentVariable\(''SKILL_MANAGER_HOME''' -or
+        $Wrapper -notmatch '\bfinally\s*\{' -or
+        $Wrapper -notmatch 'Resolve-SmokeCanonicalExistingPath\s+-Path\s+\$systemTempRoot' -or
+        $Wrapper -notmatch 'Resolve-SmokeCanonicalExistingPath\s+-Path\s+\$smokeRoot' -or
+        $Wrapper -notmatch 'Assert-SmokePathContained' -or
+        $Wrapper -notmatch 'Remove-Item\s+-LiteralPath\s+\$canonicalSmokeRoot\s+-Recurse\s+-Force'
+    ) {
+        Throw-BuildContractViolation 'LOCAL_LIVE_SMOKE_ISOLATION' 'The local live-smoke wrapper must isolate and clean up its temporary home.'
     }
 }

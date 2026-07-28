@@ -56,6 +56,14 @@ foreach ($workflowName in @('build.yml', 'pr.yml')) {
     $workflow = Get-Content $workflowPath -Raw
     Assert-WorkflowTargetSetupOrder -WorkflowName $workflowName -Workflow $workflow
 }
+$prWorkflow = Get-Content (Join-Path $repoRoot '.github/workflows/pr.yml') -Raw
+$mainWorkflow = Get-Content (Join-Path $repoRoot '.github/workflows/security-and-live.yml') -Raw
+Assert-LiveSmokeWorkflowContract -PrWorkflow $prWorkflow -MainWorkflow $mainWorkflow
+$liveSmokeHelper = Get-Content (Join-Path $repoRoot 'tools/live-github-smoke.sh') -Raw
+Assert-LiveSmokeHelperContract -Helper $liveSmokeHelper
+$skillManagerJustfile = Get-Content (Join-Path $repoRoot 'clis/skill-manager/Justfile') -Raw
+$localLiveSmokeWrapper = Get-Content (Join-Path $repoRoot 'tools/live-github-smoke.ps1') -Raw
+Assert-LocalLiveSmokeContract -Justfile $skillManagerJustfile -Wrapper $localLiveSmokeWrapper
 
 if ($ValidateOnly) {
     & (Join-Path $PSScriptRoot 'test-build-matrix-contract.ps1')
