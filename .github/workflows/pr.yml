@@ -45,7 +45,7 @@ jobs:
         run: pwsh -File tools/install-ci-tools.ps1 -Mode Quality -Phase Toolchain
       # Pull requests restore trusted caches but never write cache entries.
       - name: Restore Cargo downloads
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
@@ -55,14 +55,14 @@ jobs:
           restore-keys: |
             cargo-downloads-${{ runner.os }}-${{ runner.arch }}-
       - name: Restore pinned quality tools
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.tools/cargo-install
           key: cargo-tools-quality-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('TOOL_VERSIONS', 'tools/install-ci-tools.ps1', 'tools/get-tool-version.ps1') }}
           restore-keys: |
             cargo-tools-quality-${{ runner.os }}-${{ runner.arch }}-
       - name: Restore Rust build outputs
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/clis/skill-manager/target
           key: rust-target-quality-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('TOOL_VERSIONS', 'clis/skill-manager/Cargo.lock', 'clis/skill-manager/Cargo.toml') }}
@@ -95,7 +95,7 @@ jobs:
         run: pwsh -File tools/install-ci-tools.ps1 -Mode Base -Phase Toolchain
       # Pull requests restore trusted caches but never write cache entries.
       - name: Restore Cargo downloads
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
@@ -106,14 +106,14 @@ jobs:
             cargo-downloads-${{ runner.os }}-${{ runner.arch }}-
       - name: Restore cargo-zigbuild
         if: matrix.zig
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.tools/cargo-install
           key: cargo-tools-zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('TOOL_VERSIONS', 'tools/install-ci-tools.ps1', 'tools/get-tool-version.ps1') }}
           restore-keys: |
             cargo-tools-zig-${{ runner.os }}-${{ runner.arch }}-
       - name: Restore target-specific Rust build outputs
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/clis/${{ matrix.cli }}/target
           key: rust-target-package-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cli }}-${{ matrix.target }}-${{ hashFiles('TOOL_VERSIONS', 'clis/*/Cargo.lock', 'clis/*/Cargo.toml') }}
