@@ -31,7 +31,7 @@ jobs:
         name: Validate registry and generate CLI × target matrix
         shell: pwsh
         run: |
-          $matrix = pwsh -File tools/get-build-matrix.ps1
+          $matrix = pwsh -File tools/get-build-matrix.ps1 -Profile Full
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "matrix=$matrix" | Add-Content $env:GITHUB_OUTPUT
   quality:
@@ -89,9 +89,7 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust
         shell: pwsh
-        env:
-          TARGET: ${{ matrix.target }}
-        run: pwsh -File tools/install-ci-tools.ps1 -Mode Base -Phase Toolchain -Target $env:TARGET
+        run: pwsh -File tools/install-ci-tools.ps1 -Mode Base -Phase Toolchain
       - name: Cache Cargo downloads
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
@@ -121,8 +119,12 @@ jobs:
         shell: pwsh
         env:
           CLI: ${{ matrix.cli }}
-        run: |
-          cargo build --locked --release --manifest-path "clis/$env:CLI/Cargo.toml"
+        run: pwsh -File tools/run-build-matrix-entry.ps1 -Cli $env:CLI -Phase Host
+      - name: Configure target Rust toolchain
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup target add $env:TARGET
       - name: Install pinned cargo-zigbuild
         if: matrix.zig
         shell: pwsh
@@ -149,29 +151,12 @@ jobs:
           NATIVE: ${{ matrix.native }}
           ZIG: ${{ matrix.zig }}
         run: |
-          $cli = $env:CLI
-          $target = $env:TARGET
-          $manifest = "clis/$cli/Cargo.toml"
-          if ($env:ZIG -eq 'true') {
-            cargo zigbuild --locked --release --target $target --manifest-path $manifest
-            cargo zigbuild --locked --all-features --target $target --manifest-path $manifest --tests
-          } else {
-            cargo build --locked --release --target $target --manifest-path $manifest
-            if ($env:NATIVE -eq 'true') { cargo test --locked --all-features --target $target --manifest-path $manifest }
-            else { cargo test --locked --all-features --target $target --manifest-path $manifest --no-run }
-          }
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $version = (Get-Content VERSION -Raw).Trim()
-          $targetExtension = if ($target -match 'windows') { '.exe' } else { '' }
-          $hostExtension = if ($IsWindows) { '.exe' } else { '' }
-          $binary = "clis/$cli/target/$target/release/$cli$targetExtension"
-          $hostBinary = "clis/$cli/target/release/$cli$hostExtension"
-          pwsh -File tools/verify-target.ps1 -Path $binary -Target $target
-          if ($env:NATIVE -eq 'true') {
-            $actualVersion = (& $binary --version).Trim()
-            if ($actualVersion -ne "$cli $version") { throw "Native binary version '$actualVersion' does not equal '$cli $version'." }
-          }
-          pwsh -File tools/build-package.ps1 -Cli $cli -Target $target -PrebuiltTarget
+          pwsh -File tools/run-build-matrix-entry.ps1 `
+            -Cli $env:CLI `
+            -Target $env:TARGET `
+            -Native $env:NATIVE `
+            -Zig $env:ZIG `
+            -Phase Target
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.cli }}-${{ matrix.target }}

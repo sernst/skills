@@ -12,6 +12,26 @@ env:
   CARGO_INSTALL_ROOT: ${{ github.workspace }}/.tools/cargo-install
 
 jobs:
+  discover:
+    name: Discover PR preflight matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.registry.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        shell: pwsh
+        run: pwsh -File tools/install-ci-tools.ps1 -Mode Base
+      - id: registry
+        name: Validate registry and generate PR preflight matrix
+        shell: pwsh
+        run: |
+          $matrix = pwsh -File tools/get-build-matrix.ps1 -Profile Pr
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "matrix=$matrix" | Add-Content $env:GITHUB_OUTPUT
   quality:
     name: Run repository quality gate
     runs-on: ubuntu-24.04
@@ -58,3 +78,86 @@ jobs:
         run: just check
       - name: Audit GitHub workflows
         run: zizmor --pedantic .github/workflows
+  preflight:
+    name: Preflight ${{ matrix.cli }} for ${{ matrix.target }}
+    needs: [discover, quality]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        shell: pwsh
+        run: pwsh -File tools/install-ci-tools.ps1 -Mode Base -Phase Toolchain
+      # Pull requests restore trusted caches but never write cache entries.
+      - name: Restore Cargo downloads
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-downloads-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('clis/*/Cargo.lock', 'clis/*/Cargo.toml', 'TOOL_VERSIONS') }}
+          restore-keys: |
+            cargo-downloads-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore cargo-zigbuild
+        if: matrix.zig
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ github.workspace }}/.tools/cargo-install
+          key: cargo-tools-zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('TOOL_VERSIONS', 'tools/install-ci-tools.ps1', 'tools/get-tool-version.ps1') }}
+          restore-keys: |
+            cargo-tools-zig-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore target-specific Rust build outputs
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ github.workspace }}/clis/${{ matrix.cli }}/target
+          key: rust-target-package-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cli }}-${{ matrix.target }}-${{ hashFiles('TOOL_VERSIONS', 'clis/*/Cargo.lock', 'clis/*/Cargo.toml') }}
+          restore-keys: |
+            rust-target-package-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cli }}-${{ matrix.target }}-
+      - name: Build host-side generator
+        shell: pwsh
+        env:
+          CLI: ${{ matrix.cli }}
+        run: pwsh -File tools/run-build-matrix-entry.ps1 -Cli $env:CLI -Phase Host
+      - name: Configure target Rust toolchain
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup target add $env:TARGET
+      - name: Install pinned cargo-zigbuild
+        if: matrix.zig
+        shell: pwsh
+        run: cargo install cargo-zigbuild --version (pwsh -File tools/get-tool-version.ps1 cargo-zigbuild) --locked
+      - name: Install pinned Zig
+        if: matrix.zig
+        shell: bash
+        run: bash tools/install-zig.sh "$(pwsh -File tools/get-tool-version.ps1 zig)"
+      - name: Install musl linker
+        if: matrix.musl
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Enable Visual C++ ARM64 compiler
+        if: matrix.msvc_arm64
+        shell: pwsh
+        run: pwsh -File tools/enable-msvc-arm64.ps1
+      - name: Build target, test safely, verify, and package
+        shell: pwsh
+        env:
+          CLI: ${{ matrix.cli }}
+          TARGET: ${{ matrix.target }}
+          NATIVE: ${{ matrix.native }}
+          ZIG: ${{ matrix.zig }}
+        run: |
+          pwsh -File tools/run-build-matrix-entry.ps1 `
+            -Cli $env:CLI `
+            -Target $env:TARGET `
+            -Native $env:NATIVE `
+            -Zig $env:ZIG `
+            -Phase Target

@@ -16,6 +16,10 @@ use serde_json::Value;
 use skill_manager::config::{acquire_lock, canonical_config_bytes};
 use tempfile::TempDir;
 
+mod support;
+
+use support::portable_canonicalize;
+
 fn sandbox() -> TempDir {
     tempfile::tempdir().expect("create isolated home")
 }
@@ -184,14 +188,13 @@ fn source_add_and_remove_without_a_reference_use_the_current_directory() {
     assert_eq!(config["sources"][0]["name"], "cwd-source");
     assert_eq!(config["sources"][0]["label"], "Cwd Source");
     assert_eq!(
-        PathBuf::from(
+        portable_canonicalize(PathBuf::from(
             config["sources"][0]["path"]
                 .as_str()
                 .expect("stored local source path")
-        )
-        .canonicalize()
+        ))
         .expect("canonical stored source"),
-        home.path().canonicalize().expect("canonical sandbox")
+        portable_canonicalize(home.path()).expect("canonical sandbox")
     );
 
     cli(home.path())
@@ -1970,14 +1973,26 @@ fn project_scope_overrides_global_and_update_remove_infer_existing_scope() {
     assert_eq!(deployments[0]["scope"], "global");
     assert_eq!(deployments[0]["effective"], false);
     assert_eq!(
-        deployments[0]["path"].as_str(),
-        Some(expected_global_deployment.to_string_lossy().as_ref())
+        portable_canonicalize(PathBuf::from(
+            deployments[0]["path"]
+                .as_str()
+                .expect("global deployment path"),
+        ))
+        .expect("canonical global deployment path"),
+        portable_canonicalize(&expected_global_deployment)
+            .expect("canonical expected global deployment path")
     );
     assert_eq!(deployments[1]["scope"], "project");
     assert_eq!(deployments[1]["effective"], true);
     assert_eq!(
-        deployments[1]["path"].as_str(),
-        Some(expected_project_deployment.to_string_lossy().as_ref())
+        portable_canonicalize(PathBuf::from(
+            deployments[1]["path"]
+                .as_str()
+                .expect("project deployment path"),
+        ))
+        .expect("canonical project deployment path"),
+        portable_canonicalize(&expected_project_deployment)
+            .expect("canonical expected project deployment path")
     );
 
     let mut ambiguous_remove = cli(home.path());

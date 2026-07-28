@@ -13,6 +13,10 @@ use predicates::prelude::*;
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod support;
+
+use support::portable_canonicalize;
+
 fn cli(home: &Path) -> Command {
     let mut command = Command::cargo_bin("skill-manager").expect("test binary");
     command
@@ -72,7 +76,12 @@ fn assert_exact_paired_list(home: &Path, active: &str, alternate: &Path) {
             .collect::<Vec<_>>(),
         [
             format!("personal     (Personal Skills)  {active}"),
-            format!("  alternate  (inactive)         {}", alternate.display()),
+            format!(
+                "  alternate  (inactive)         {}",
+                portable_canonicalize(alternate)
+                    .expect("canonical alternate source")
+                    .display()
+            ),
         ]
     );
 }
@@ -82,6 +91,7 @@ fn human_status_shows_the_active_and_indented_inactive_location_exactly() {
     let home = TempDir::new().expect("temporary home");
     let local = home.path().join("local-skills");
     add_local(home.path(), &local, "personal");
+    let canonical_local = portable_canonicalize(&local).expect("canonical local source");
     cli(home.path())
         .args(["source", "alternate", "personal", "sernst/skills"])
         .assert()
@@ -97,7 +107,7 @@ fn human_status_shows_the_active_and_indented_inactive_location_exactly() {
         format!(
             "Sources:\npersonal     (Personal Skills)  {}\n  alternate  (inactive)         \
              sernst/skills\n\nNo skills found in sources or deployed targets.\n",
-            local.display()
+            canonical_local.display()
         )
     );
 }
@@ -107,6 +117,7 @@ fn alternate_swap_noops_events_metadata_and_aligned_display_are_stable() {
     let home = TempDir::new().expect("temporary home");
     let local = home.path().join("local-skills");
     add_local(home.path(), &local, "personal");
+    let canonical_local = portable_canonicalize(&local).expect("canonical local source");
     let mut config = read_config(home.path());
     let original_id = config["sources"][0]["id"].clone();
     config["sources"][0]["source_extension"] = Value::String("preserved".into());
@@ -161,7 +172,7 @@ fn alternate_swap_noops_events_metadata_and_aligned_display_are_stable() {
     assert_eq!(swapped[0]["data"]["source"], "sernst/skills");
     assert_eq!(
         swapped[0]["data"]["previous"]["source"],
-        local.to_string_lossy().as_ref()
+        canonical_local.to_string_lossy().as_ref()
     );
     let after_swap = read_config(home.path());
     assert_eq!(after_swap["sources"][0]["id"], original_id);
@@ -181,7 +192,7 @@ fn alternate_swap_noops_events_metadata_and_aligned_display_are_stable() {
     );
     assert_eq!(
         swapped_back[0]["data"]["source"],
-        local.to_string_lossy().as_ref()
+        canonical_local.to_string_lossy().as_ref()
     );
 
     cli(home.path())
@@ -203,6 +214,7 @@ fn locate_aliases_update_location_atomically_and_salted_add_reuses_the_old_locat
     let home = TempDir::new().expect("temporary home");
     let original = home.path().join("original");
     add_local(home.path(), &original, "personal");
+    let canonical_original = portable_canonicalize(&original).expect("canonical original source");
     let original_id = read_config(home.path())["sources"][0]["id"]
         .as_str()
         .expect("source id")
@@ -228,7 +240,7 @@ fn locate_aliases_update_location_atomically_and_salted_add_reuses_the_old_locat
     assert_eq!(updated[0]["data"]["source"], "sernst/skills");
     assert_eq!(
         updated[0]["data"]["previous"]["source"],
-        original.to_string_lossy().as_ref()
+        canonical_original.to_string_lossy().as_ref()
     );
     let config = read_config(home.path());
     assert_eq!(config["sources"][0]["id"], original_id);

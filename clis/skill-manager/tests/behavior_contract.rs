@@ -12,6 +12,10 @@ use skill_manager::domain::SkillState;
 use skill_manager::domain::SourceType;
 use skill_manager::skills::{directories_equal, matches_patterns, skill_state};
 
+mod support;
+
+use support::portable_canonicalize;
+
 #[test]
 fn directory_equality_compares_relative_names_and_contents() {
     let temp = tempfile::tempdir().expect("temporary root");
@@ -99,5 +103,6 @@ fn source_reference_and_bare_name_resolution_cases() {
     let local = source_from_reference(temp.path().to_str().expect("utf8 path"), None)
         .expect("local source");
     assert_eq!(local.source_type, SourceType::Local);
-    assert_eq!(local.path.as_deref(), Some(temp.path()));
+    let canonical_temp = portable_canonicalize(temp.path()).expect("canonical temporary path");
+    assert_eq!(local.path.as_deref(), Some(canonical_temp.as_path()));
 }

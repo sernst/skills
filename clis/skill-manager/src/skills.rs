@@ -731,6 +731,9 @@ mod tests {
         };
 
         let found = detect_skill_dirs(&resolved).unwrap_or_else(|error| unreachable!("{error}"));
-        assert_eq!(found, vec![skill]);
+        let canonical_skill = skill
+            .canonicalize()
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(found, vec![canonical_skill]);
     }
 }

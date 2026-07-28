@@ -1,7 +1,11 @@
-param([switch] $ValidateOnly)
+param(
+    [switch] $ValidateOnly,
+    [ValidateSet('Full', 'Pr')] [string] $Profile = 'Full'
+)
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'build-matrix-contract.ps1')
 $registryPath = Join-Path $repoRoot 'clis/registry.just'
 $repositoryVersion = (Get-Content (Join-Path $repoRoot 'VERSION') -Raw).Trim()
 $entries = @()
@@ -27,21 +31,43 @@ foreach ($line in Get-Content $registryPath) {
 }
 if (-not $entries.Count) { throw 'The CLI registry is empty.' }
 if (@($entries | Sort-Object -Unique).Count -ne $entries.Count) { throw 'The CLI registry contains duplicate IDs.' }
-if ($ValidateOnly) { Write-Output "Validated $($entries.Count) registered CLI(s)."; exit 0 }
-
-$targets = @(
-    @{ runner='macos-15-intel'; target='x86_64-apple-darwin'; native=$true; zig=$false; musl=$false; msvc_arm64=$false },
-    @{ runner='macos-15'; target='aarch64-apple-darwin'; native=$true; zig=$false; musl=$false; msvc_arm64=$false },
-    @{ runner='windows-2025'; target='x86_64-pc-windows-msvc'; native=$true; zig=$false; musl=$false; msvc_arm64=$false },
-    @{ runner='windows-2025'; target='aarch64-pc-windows-msvc'; native=$false; zig=$false; musl=$false; msvc_arm64=$true },
-    @{ runner='ubuntu-24.04'; target='x86_64-unknown-linux-gnu'; native=$true; zig=$false; musl=$false; msvc_arm64=$false },
-    @{ runner='ubuntu-24.04'; target='aarch64-unknown-linux-gnu'; native=$false; zig=$true; musl=$false; msvc_arm64=$false },
-    @{ runner='ubuntu-24.04'; target='x86_64-unknown-linux-musl'; native=$true; zig=$false; musl=$true; msvc_arm64=$false },
-    @{ runner='ubuntu-24.04'; target='aarch64-unknown-linux-musl'; native=$false; zig=$true; musl=$false; msvc_arm64=$false }
+$fullTargets = @(
+    @{ runner='macos-15-intel'; target='x86_64-apple-darwin'; archive='tar.gz'; native=$true; zig=$false; musl=$false; msvc_arm64=$false },
+    @{ runner='macos-15'; target='aarch64-apple-darwin'; archive='tar.gz'; native=$true; zig=$false; musl=$false; msvc_arm64=$false },
+    @{ runner='windows-2025'; target='x86_64-pc-windows-msvc'; archive='zip'; native=$true; zig=$false; musl=$false; msvc_arm64=$false },
+    @{ runner='windows-2025'; target='aarch64-pc-windows-msvc'; archive='zip'; native=$false; zig=$false; musl=$false; msvc_arm64=$true },
+    @{ runner='ubuntu-24.04'; target='x86_64-unknown-linux-gnu'; archive='tar.gz'; native=$true; zig=$false; musl=$false; msvc_arm64=$false },
+    @{ runner='ubuntu-24.04'; target='aarch64-unknown-linux-gnu'; archive='tar.gz'; native=$false; zig=$true; musl=$false; msvc_arm64=$false },
+    @{ runner='ubuntu-24.04'; target='x86_64-unknown-linux-musl'; archive='tar.gz'; native=$true; zig=$false; musl=$true; msvc_arm64=$false },
+    @{ runner='ubuntu-24.04'; target='aarch64-unknown-linux-musl'; archive='tar.gz'; native=$false; zig=$true; musl=$false; msvc_arm64=$false }
 )
+$prTargetNames = @(
+    'x86_64-pc-windows-msvc',
+    'aarch64-apple-darwin',
+    'aarch64-unknown-linux-musl'
+)
+$prTargets = @($fullTargets | Where-Object { $_.target -in $prTargetNames })
+
+Assert-CanonicalFullBuildTargets -Targets $fullTargets
+Assert-CanonicalPrBuildTargets -Targets $prTargets
+
+foreach ($workflowName in @('build.yml', 'pr.yml')) {
+    $workflowPath = Join-Path $repoRoot ".github/workflows/$workflowName"
+    $workflow = Get-Content $workflowPath -Raw
+    Assert-WorkflowTargetSetupOrder -WorkflowName $workflowName -Workflow $workflow
+}
+
+if ($ValidateOnly) {
+    & (Join-Path $PSScriptRoot 'test-build-matrix-contract.ps1')
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    Write-Output "Validated $($entries.Count) registered CLI(s) and Full/Pr build profiles."
+    exit 0
+}
+
+$targets = if ($Profile -eq 'Pr') { $prTargets } else { $fullTargets }
 $include = foreach ($cli in $entries) {
     foreach ($target in $targets) {
-        [ordered]@{ cli=$cli; runner=$target.runner; target=$target.target; native=$target.native; zig=$target.zig; musl=$target.musl; msvc_arm64=$target.msvc_arm64 }
+        [ordered]@{ cli=$cli; runner=$target.runner; target=$target.target; archive=$target.archive; native=$target.native; zig=$target.zig; musl=$target.musl; msvc_arm64=$target.msvc_arm64 }
     }
 }
 [ordered]@{ include=@($include) } | ConvertTo-Json -Depth 4 -Compress
