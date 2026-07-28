@@ -11,6 +11,16 @@ function Copy-Targets {
     })
 }
 
+function New-SmokeEscapeFixturePath {
+    param([Parameter(Mandatory = $true)] [string] $CanonicalTempRoot)
+
+    $parent = [IO.Directory]::GetParent($CanonicalTempRoot)
+    if ($null -ne $parent) {
+        return [IO.Path]::Combine($parent.FullName, 'skill-manager-live-smoke-escape')
+    }
+    [IO.Path]::Combine($CanonicalTempRoot, 'outside', 'skill-manager-live-smoke-escape')
+}
+
 function Assert-Rejected {
     param(
         [Parameter(Mandatory = $true)] [scriptblock] $Operation,
@@ -151,12 +161,19 @@ $validContainedSmoke = Join-Path $canonicalTempRoot 'skill-manager-live-smoke-fi
 Assert-SmokePathContained `
     -CanonicalTempRoot $canonicalTempRoot `
     -CanonicalSmokeRoot $validContainedSmoke
-$escapedSmoke = Join-Path (Split-Path -Parent $canonicalTempRoot) 'skill-manager-live-smoke-escape'
+$escapedSmoke = New-SmokeEscapeFixturePath -CanonicalTempRoot $canonicalTempRoot
 Assert-Rejected {
     Assert-SmokePathContained `
         -CanonicalTempRoot $canonicalTempRoot `
         -CanonicalSmokeRoot $escapedSmoke
 } 'SMOKE_PATH_ESCAPE' 'live-smoke cleanup lexical escape'
+$canonicalPathRoot = [IO.Path]::GetPathRoot($canonicalTempRoot)
+$rootEscapedSmoke = New-SmokeEscapeFixturePath -CanonicalTempRoot $canonicalPathRoot
+Assert-Rejected {
+    Assert-SmokePathContained `
+        -CanonicalTempRoot $canonicalPathRoot `
+        -CanonicalSmokeRoot $rootEscapedSmoke
+} 'SMOKE_PATH_ESCAPE' 'live-smoke cleanup escape from a filesystem root'
 $nestedSmoke = Join-Path $canonicalTempRoot 'nested/skill-manager-live-smoke-escape'
 Assert-Rejected {
     Assert-SmokePathContained `
