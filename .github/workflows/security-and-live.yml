@@ -21,7 +21,7 @@ jobs:
       - shell: pwsh
         run: pwsh -File tools/install-ci-tools.ps1 -Mode Advisory
       - run: just advisory
-  live-github-smoke:
+  github-source-smoke:
     name: Exercise live GitHub source
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -41,9 +41,14 @@ jobs:
         run: |
           set -euo pipefail
           smoke_source_url="https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}/skills"
+          smoke_stage=$(sudo mktemp -d /tmp/skill-manager-live-stage.XXXXXXXX)
+          trap 'sudo rm -rf -- "${smoke_stage:?}" || true' EXIT
+          sudo chmod 0755 "$smoke_stage"
+          sudo install -o root -g root -m 0755 "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" "$smoke_stage/run-smoke"
+          sudo install -o root -g root -m 0755 "${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" "$smoke_stage/skill-manager"
           sudo useradd --no-create-home --shell /bin/bash skill-manager-smoke
-          trap 'sudo userdel skill-manager-smoke' EXIT
+          trap 'sudo userdel skill-manager-smoke || true; sudo rm -rf -- "${smoke_stage:?}" || true' EXIT
           sudo --user skill-manager-smoke --set-home /bin/bash \
-            "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" \
-            "${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" \
+            "$smoke_stage/run-smoke" \
+            "$smoke_stage/skill-manager" \
             "$smoke_source_url"

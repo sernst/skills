@@ -198,26 +198,36 @@ $validPrSmoke = @(
     '        run: |',
     '          set -euo pipefail',
     '          smoke_source_url="https://github.com/${SMOKE_REPOSITORY}/tree/${SMOKE_REF}/skills"',
+    '          smoke_stage=$(sudo mktemp -d /tmp/skill-manager-live-stage.XXXXXXXX)',
+    '          trap ''sudo rm -rf -- "${smoke_stage:?}" || true'' EXIT',
+    '          sudo chmod 0755 "$smoke_stage"',
+    '          sudo install -o root -g root -m 0755 "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" "$smoke_stage/run-smoke"',
+    '          sudo install -o root -g root -m 0755 "${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" "$smoke_stage/skill-manager"',
     '          sudo useradd --no-create-home --shell /bin/bash skill-manager-smoke',
-    "          trap 'sudo userdel skill-manager-smoke' EXIT",
+    '          trap ''sudo userdel skill-manager-smoke || true; sudo rm -rf -- "${smoke_stage:?}" || true'' EXIT',
     '          sudo --user skill-manager-smoke --set-home /bin/bash \',
-    '            "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" \',
-    '            "${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" \',
+    '            "$smoke_stage/run-smoke" \',
+    '            "$smoke_stage/skill-manager" \',
     '            "$smoke_source_url"'
 ) -join [Environment]::NewLine
 $validMainSmoke = @(
     'jobs:',
-    '  live-github-smoke:',
+    '  github-source-smoke:',
     '    steps:',
     '      - name: Exercise GitHub source at an exact commit',
     '        run: |',
     '          set -euo pipefail',
     '          smoke_source_url="https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}/skills"',
+    '          smoke_stage=$(sudo mktemp -d /tmp/skill-manager-live-stage.XXXXXXXX)',
+    '          trap ''sudo rm -rf -- "${smoke_stage:?}" || true'' EXIT',
+    '          sudo chmod 0755 "$smoke_stage"',
+    '          sudo install -o root -g root -m 0755 "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" "$smoke_stage/run-smoke"',
+    '          sudo install -o root -g root -m 0755 "${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" "$smoke_stage/skill-manager"',
     '          sudo useradd --no-create-home --shell /bin/bash skill-manager-smoke',
-    "          trap 'sudo userdel skill-manager-smoke' EXIT",
+    '          trap ''sudo userdel skill-manager-smoke || true; sudo rm -rf -- "${smoke_stage:?}" || true'' EXIT',
     '          sudo --user skill-manager-smoke --set-home /bin/bash \',
-    '            "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" \',
-    '            "${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" \',
+    '            "$smoke_stage/run-smoke" \',
+    '            "$smoke_stage/skill-manager" \',
     '            "$smoke_source_url"'
 ) -join [Environment]::NewLine
 Assert-LiveSmokeWorkflowContract -PrWorkflow $validPrSmoke -MainWorkflow $validMainSmoke
@@ -261,19 +271,72 @@ Assert-Rejected {
 Assert-Rejected {
     Assert-LiveSmokeWorkflowContract `
         -PrWorkflow ($validPrSmoke.Replace(
-            '            "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" \',
-            '            # "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" \'
+            '          sudo install -o root -g root -m 0755 "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" "$smoke_stage/run-smoke"',
+            '          # sudo install -o root -g root -m 0755 "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" "$smoke_stage/run-smoke"'
         )) `
         -MainWorkflow $validMainSmoke
 } 'LIVE_SMOKE_COMMAND_SET' 'commented-out PR helper path'
 Assert-Rejected {
     Assert-LiveSmokeWorkflowContract `
         -PrWorkflow ($validPrSmoke.Replace(
-            '            "${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" \',
-            '            # "${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" \'
+            '          sudo install -o root -g root -m 0755 "${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" "$smoke_stage/skill-manager"',
+            '          # sudo install -o root -g root -m 0755 "${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" "$smoke_stage/skill-manager"'
         )) `
         -MainWorkflow $validMainSmoke
 } 'LIVE_SMOKE_COMMAND_SET' 'commented-out PR binary path'
+foreach ($stagingMutation in @(
+    [pscustomobject]@{
+        Case = 'stage created without root ownership'
+        Old = '          smoke_stage=$(sudo mktemp -d /tmp/skill-manager-live-stage.XXXXXXXX)'
+        New = '          smoke_stage=$(mktemp -d /tmp/skill-manager-live-stage.XXXXXXXX)'
+    },
+    [pscustomobject]@{
+        Case = 'stage blocks unprivileged traversal'
+        Old = '          sudo chmod 0755 "$smoke_stage"'
+        New = '          sudo chmod 0700 "$smoke_stage"'
+    },
+    [pscustomobject]@{
+        Case = 'staged helper is not root-owned'
+        Old = '          sudo install -o root -g root -m 0755 "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" "$smoke_stage/run-smoke"'
+        New = '          sudo install -o runner -g runner -m 0755 "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" "$smoke_stage/run-smoke"'
+    },
+    [pscustomobject]@{
+        Case = 'staged helper is not executable'
+        Old = '          sudo install -o root -g root -m 0755 "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" "$smoke_stage/run-smoke"'
+        New = '          sudo install -o root -g root -m 0644 "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" "$smoke_stage/run-smoke"'
+    },
+    [pscustomobject]@{
+        Case = 'staging cleanup is not armed before copies'
+        Old = '          trap ''sudo rm -rf -- "${smoke_stage:?}" || true'' EXIT'
+        New = '          trap ''true'' EXIT'
+    },
+    [pscustomobject]@{
+        Case = 'user cleanup drops staging cleanup'
+        Old = '          trap ''sudo userdel skill-manager-smoke || true; sudo rm -rf -- "${smoke_stage:?}" || true'' EXIT'
+        New = '          trap ''sudo userdel skill-manager-smoke || true'' EXIT'
+    },
+    [pscustomobject]@{
+        Case = 'unprivileged helper executes from the workspace'
+        Old = '            "$smoke_stage/run-smoke" \'
+        New = '            "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" \'
+    },
+    [pscustomobject]@{
+        Case = 'unprivileged binary executes from the workspace'
+        Old = '            "$smoke_stage/skill-manager" \'
+        New = '            "${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" \'
+    },
+    [pscustomobject]@{
+        Case = 'unprivileged helper executes from runner home'
+        Old = '            "$smoke_stage/run-smoke" \'
+        New = '            "/home/runner/run-smoke" \'
+    }
+)) {
+    Assert-Rejected {
+        Assert-LiveSmokeWorkflowContract `
+            -PrWorkflow ($validPrSmoke.Replace($stagingMutation.Old, $stagingMutation.New)) `
+            -MainWorkflow $validMainSmoke
+    } 'LIVE_SMOKE_COMMAND_SET' $stagingMutation.Case
+}
 Assert-Rejected {
     Assert-LiveSmokeWorkflowContract `
         -PrWorkflow ($validPrSmoke.Replace(
@@ -300,6 +363,7 @@ Assert-LiveSmokeWorkflowContract -PrWorkflow $validPrSmoke -MainWorkflow $commen
 foreach ($alternateHelperCommand in @(
     'bash tools/live-github-smoke.sh',
     'bash "${GITHUB_WORKSPACE}"/tools/live-github-smoke.sh',
+    'bash tools/live-github-"smoke".sh',
     'HELPER=tools/live-github-smoke.sh; bash "$HELPER"',
     'HELPER=tools/live-github-smoke.sh'
 )) {
@@ -314,6 +378,17 @@ foreach ($alternateHelperCommand in @(
             -MainWorkflow ($validMainSmoke + [Environment]::NewLine + "      - run: $alternateHelperCommand")
     } 'LIVE_SMOKE_COMMAND_SET' "alternate main live-smoke helper reference: $alternateHelperCommand"
 }
+$splitStemHelperCommand = 'HELPER_STEM=live-github-smoke; bash "${GITHUB_WORKSPACE}/tools/${HELPER_STEM}.sh"'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow ($validPrSmoke + [Environment]::NewLine + "      - run: $splitStemHelperCommand") `
+        -MainWorkflow $validMainSmoke
+} 'LIVE_SMOKE_COMMAND_SET' 'split-stem PR live-smoke helper reconstruction'
+Assert-Rejected {
+    Assert-LiveSmokeWorkflowContract `
+        -PrWorkflow $validPrSmoke `
+        -MainWorkflow ($validMainSmoke + [Environment]::NewLine + "      - run: $splitStemHelperCommand")
+} 'LIVE_SMOKE_COMMAND_SET' 'split-stem main live-smoke helper reconstruction'
 Assert-Rejected {
     Assert-LiveSmokeWorkflowContract `
         -PrWorkflow ($validPrSmoke + [Environment]::NewLine + '      - run: "${GITHUB_WORKSPACE}/tools/live-github-smoke.sh"') `

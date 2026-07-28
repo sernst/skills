@@ -514,14 +514,14 @@ function Get-NamedWorkflowSteps {
     @($results)
 }
 
-function Get-LiveSmokeHelperBasenameOccurrenceCount {
+function Get-LiveSmokeHelperStemOccurrenceCount {
     param([Parameter(Mandatory = $true)] [string] $Workflow)
 
     $activeText = ConvertTo-CommentFreeText -Text $Workflow
     $quoteIndependentText = $activeText.Replace("'", '').Replace('"', '')
     [regex]::Matches(
         $quoteIndependentText,
-        '(?<![A-Za-z0-9_.-])live-github-smoke\.sh(?![A-Za-z0-9_.-])',
+        '(?<![A-Za-z0-9_-])live-github-smoke(?![A-Za-z0-9_-])',
         [Text.RegularExpressions.RegexOptions]::IgnoreCase
     ).Count
 }
@@ -543,16 +543,36 @@ function Assert-ExactLiveSmokeCommandSet {
     $expected = @(
         'set -euo pipefail',
         $SourceCommand,
+        'smoke_stage=$(sudo mktemp -d /tmp/skill-manager-live-stage.XXXXXXXX)',
+        'trap ''sudo rm -rf -- "${smoke_stage:?}" || true'' EXIT',
+        'sudo chmod 0755 "$smoke_stage"',
+        (
+            'sudo install -o root -g root -m 0755 ' +
+            '"${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" ' +
+            '"$smoke_stage/run-smoke"'
+        ),
+        (
+            'sudo install -o root -g root -m 0755 ' +
+            '"${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" ' +
+            '"$smoke_stage/skill-manager"'
+        ),
         'sudo useradd --no-create-home --shell /bin/bash skill-manager-smoke',
-        "trap 'sudo userdel skill-manager-smoke' EXIT",
+        'trap ''sudo userdel skill-manager-smoke || true; sudo rm -rf -- "${smoke_stage:?}" || true'' EXIT',
         (
             'sudo --user skill-manager-smoke --set-home /bin/bash ' +
-            '"${GITHUB_WORKSPACE}/tools/live-github-smoke.sh" ' +
-            '"${GITHUB_WORKSPACE}/clis/skill-manager/target/release/skill-manager" ' +
+            '"$smoke_stage/run-smoke" ' +
+            '"$smoke_stage/skill-manager" ' +
             '"$smoke_source_url"'
         )
     )
     $actual = @(Split-ExecutableShellCommands -Script $Step.Executable)
+    $directWorkspaceExecutions = @($actual | Where-Object {
+        $_ -match '^sudo --user skill-manager-smoke --set-home /bin/bash\b' -and
+        $_ -match '(?:GITHUB_WORKSPACE|/home/runner)'
+    })
+    if ($directWorkspaceExecutions.Count -gt 0) {
+        Throw-BuildContractViolation 'LIVE_SMOKE_COMMAND_SET' "Workflow '$WorkflowName' must not execute smoke inputs from the runner workspace as the unprivileged user."
+    }
     if ($actual.Count -ne $expected.Count) {
         Throw-BuildContractViolation 'LIVE_SMOKE_COMMAND_SET' "Workflow '$WorkflowName' live smoke must contain only the approved command sequence."
     }
@@ -600,8 +620,8 @@ function Assert-LiveSmokeWorkflowContract {
         -WorkflowName 'pr.yml' `
         -Step $prSmoke.Step `
         -SourceCommand 'smoke_source_url="https://github.com/${SMOKE_REPOSITORY}/tree/${SMOKE_REF}/skills"'
-    if ((Get-LiveSmokeHelperBasenameOccurrenceCount -Workflow $PrWorkflow) -ne 1) {
-        Throw-BuildContractViolation 'LIVE_SMOKE_COMMAND_SET' 'The PR workflow must reference the live-smoke helper basename only in the approved command sequence.'
+    if ((Get-LiveSmokeHelperStemOccurrenceCount -Workflow $PrWorkflow) -ne 1) {
+        Throw-BuildContractViolation 'LIVE_SMOKE_COMMAND_SET' 'The PR workflow must reference the live-smoke helper stem only in the approved command sequence.'
     }
 
     $mainSmokes = @(Get-NamedWorkflowSteps `
@@ -614,8 +634,8 @@ function Assert-LiveSmokeWorkflowContract {
         Throw-BuildContractViolation 'DUPLICATE_MAIN_LIVE_SMOKE' 'The main workflow must invoke the shared live-smoke helper exactly once.'
     }
     $mainSmoke = $mainSmokes[0]
-    if ($mainSmoke.Job.Name -cne 'live-github-smoke') {
-        Throw-BuildContractViolation 'MAIN_LIVE_SMOKE_JOB' 'The main live smoke must run in the live-github-smoke job.'
+    if ($mainSmoke.Job.Name -cne 'github-source-smoke') {
+        Throw-BuildContractViolation 'MAIN_LIVE_SMOKE_JOB' 'The main live smoke must run in the github-source-smoke job.'
     }
     if ($mainSmoke.Step.Executable -notmatch '(?m)^smoke_source_url="https://github\.com/\$\{GITHUB_REPOSITORY\}/tree/\$\{GITHUB_SHA\}/skills"\s*$') {
         Throw-BuildContractViolation 'MAIN_LIVE_SMOKE_SOURCE' 'The main live smoke must use GITHUB_REPOSITORY and the exact GITHUB_SHA.'
@@ -624,8 +644,8 @@ function Assert-LiveSmokeWorkflowContract {
         -WorkflowName 'security-and-live.yml' `
         -Step $mainSmoke.Step `
         -SourceCommand 'smoke_source_url="https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}/skills"'
-    if ((Get-LiveSmokeHelperBasenameOccurrenceCount -Workflow $MainWorkflow) -ne 1) {
-        Throw-BuildContractViolation 'LIVE_SMOKE_COMMAND_SET' 'The main workflow must reference the live-smoke helper basename only in the approved command sequence.'
+    if ((Get-LiveSmokeHelperStemOccurrenceCount -Workflow $MainWorkflow) -ne 1) {
+        Throw-BuildContractViolation 'LIVE_SMOKE_COMMAND_SET' 'The main workflow must reference the live-smoke helper stem only in the approved command sequence.'
     }
 }
 
