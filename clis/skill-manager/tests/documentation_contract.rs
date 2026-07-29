@@ -13,7 +13,9 @@ fn repository_root() -> PathBuf {
 }
 
 fn read(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_else(|error| unreachable!("{}: {error}", path.display()))
+    fs::read_to_string(path)
+        .unwrap_or_else(|error| unreachable!("{}: {error}", path.display()))
+        .replace("\r\n", "\n")
 }
 
 fn function_block<'a>(source: &'a str, name: &str) -> &'a str {
