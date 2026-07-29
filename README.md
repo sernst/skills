@@ -1,83 +1,142 @@
-# AI Agent Skills
+# Skills and skill-manager
 
-My personal collection of AI Agent Skills. Mix of ones I've developed myself and
-others I've adapted from others.
+This repository is a two-part toolkit:
 
-## Command-line tools
+1. [`skills/`](./skills) contains reusable instructions that teach AI agents
+   specialized workflows.
+2. [`skill-manager`](./clis/skill-manager) is a native CLI that discovers those
+   skills from local or GitHub sources and deploys them to the skill directories
+   used by agent harnesses.
 
-Native executable tools live in [`clis`](./clis). The first is
-[`skill-manager`](./clis/skill-manager), a Rust CLI for discovering, resolving,
-and deploying skills. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the Just-based
-quality workflow and [RELEASES.md](./RELEASES.md) for tagged release procedures.
+Use the CLI when you want one source of truth for skills across Claude Code,
+Codex/OpenAI agents, and Google Antigravity. Use the skills directly when you
+want to inspect or adapt the instructions.
 
-`skill-manager` can install skills globally or into the current project; a
-project installation takes precedence when both exist. Its configuration,
-cache, backups, and locks are stored together beneath `~/.skill-manager/`.
-The [command reference](./clis/skill-manager/docs/cli.md),
-[configuration guide](./clis/skill-manager/docs/configuration.md), and
-[JSON contract](./clis/skill-manager/docs/json.md) cover scope selection,
-wildcard skill selection, and safe configuration reset/restore workflows.
+## Install
 
-# Manifest
+Download the archive for your operating system and CPU from the
+[latest release](https://github.com/sernst/skills/releases/latest), verify it
+against `SHA256SUMS`, extract `skill-manager` (or `skill-manager.exe`), and put
+it on `PATH`.
 
-## [drafting-commit-message](./skills/drafting-commit-message/SKILL.md)
+For a complete, paste-into-an-agent installation and upgrade procedure on
+Windows, macOS, and Linux, use
+[`install.skill-manager.md`](./install.skill-manager.md). The release archive
+also includes shell completions and a man page.
 
-Helps draft meaningful commit messages from the current changes, whether staged
-or all local unstaged edits if nothing is staged. It enforces a short, imperative
-Title Case title (under 50 characters) plus a bulleted description in the form
-`- **<Change Category>** - <overview>`, consolidating related edits into the
-fewest bullets possible rather than listing a blow-by-blow diff. Each bullet must
-explain the motivation and impact of a change — the before-state and outcome —
-never the mechanism of which files or lines were touched. Use it when drafting a
-commit message or when asked to "draft/create/make a commit message."
+## Five-minute quick start
 
-## [grill-me](./skills/grill-me/SKILL.md)
+The repository hosts its own skills below `skills/`, so it is also a useful
+self-hosting example:
 
-An adapted version of the popular skill from
-[Matt Pocock](https://github.com/mattpocock) designed to work on coding and
-non-coding tasks equally. It first determines whether the topic at hand is a
-coding task (architecture, implementation, code changes) or a non-coding task
-(strategy, process, communication), then explores the codebase or project files
-to resolve what it can on its own before asking anything. It then interviews me
-relentlessly, one question at a time, walking down each branch of the decision
-tree — covering things like architecture and edge cases for coding tasks, or
-goals and constraints for non-coding ones — and offers a recommended answer for
-every question until we reach shared understanding.
+```console
+$ skill-manager --json-input
+{"command":"source.add","source":"sernst/skills/skills","name":"sernst-skills","label":"sernst skills"}
+{"version":1,"event":"source.added","level":"info","data":{...}}
 
-## [reviewing-implemented-work-order](./skills/reviewing-implemented-work-order/SKILL.md)
+$ skill-manager --json-input
+{"command":"load","sources":["sernst-skills"],"filters":["managing-skills"],"shared":true,"global":true,"dry_run":true}
+{"version":1,"event":"skill.loaded","level":"info","data":{"skill":"managing-skills",...,"dry_run":true}}
+{"version":1,"event":"summary","level":"info","data":{"action":"load",...}}
 
-Performs a structured code review of a work order (job) implementation,
-following my engineering practices for work-order-driven development. It locates
-the relevant job file across repo-specific or cross-repo work-order layouts,
-then reviews the commits implementing it against the job, research, and plan
-files to surface issues like runtime errors, pattern drift, security gaps, and
-missing test coverage. Every issue found is written to a `review.<slug>.md` file
-alongside the work order, complete with priority, repo attribution, and
-fully-qualified file references, with no cap on how many issues get recorded.
-Use it when reviewing the implementation of a work order/job rather than an ad
-hoc branch.
+$ skill-manager --json-input
+{"command":"load","sources":["sernst-skills"],"filters":["managing-skills"],"shared":true,"global":true}
+{"version":1,"event":"skill.loaded","level":"info","data":{"skill":"managing-skills",...}}
+{"version":1,"event":"summary","level":"info","data":{"action":"load",...}}
 
-## [reviewing-my-code](./skills/reviewing-my-code/SKILL.md)
+$ skill-manager --json-input
+{"command":"status","filters":["managing-skills"],"shared":true,"global":true}
+{"version":1,"event":"status.row","level":"info","data":{"skill":"managing-skills",...}}
+{"version":1,"event":"summary","level":"info","data":{"action":"status","skills":1}}
+```
 
-Acts as a pre-review assistant that reviews code changes on the current branch —
-typically the most recent commit — following my engineering practices. It spawns
-parallel subagents to summarize the changes, identifies up to five key themes,
-and then reviews the code for runtime errors, pattern drift, performance issues,
-security vulnerabilities, implementation gaps, and missing or inadequate test
-coverage. Rather than finalizing a review, it drafts the raw material — flagged
-issues and prioritized themes — so I can focus my own review time on the areas
-that matter most. Use it when reviewing changes in a branch outside of the
-formal work-order process.
+Start a new agent session if the harness scans installed skills only at
+startup. You can then ask the agent to use `$managing-skills` for conversational
+skill discovery, deployment, update, removal, and configuration.
 
-## [running-as-maestro](./skills/running-as-maestro/SKILL.md)
+For an interactive shell, the equivalent shorter flow is:
 
-Switches me into an orchestrator role for the rest of the session, delegating
-work to subagents instead of doing it directly, and remains in effect across
-every subsequent turn until explicitly cancelled. As maestro it judges which
-lighter-weight model tier fits each sub-task, favors `auto` routing in Copilot
-(or the Sol/Terra/Luna tiers outside it), and dispatches independent subagent
-work in parallel rather than sequentially. It stays accountable for verifying
-subagent output — even when the verification itself is delegated — and
-communicates the quality-versus-cost tradeoffs it's making along the way. Use it
-when told to act as "the maestro" or to oversee work through subagents rather
-than implement it myself.
+```console
+skill-manager source add sernst/skills/skills sernst-skills --label "sernst skills"
+skill-manager load sernst-skills --filter managing-skills --shared --global --dry-run --no-input
+skill-manager load sernst-skills --filter managing-skills --shared --global --no-input
+skill-manager status managing-skills --shared --global --no-input
+```
+
+## Mental model
+
+```text
+sources -> discovered skills -> targets
+                              -> global scope
+                              -> project scope
+```
+
+- A **source** is a local directory or GitHub repository path containing one
+  skill or a collection of skill directories.
+- A **skill** is a directory whose root contains `SKILL.md`. Patterns and
+  filters select which discovered skills an operation uses.
+- A **target** is a root-relative deployment template. Built-ins are `claude`
+  (`.claude/skills`), `shared` (`.agents/skills`), and `antigravity`
+  (`.gemini/antigravity/skills`).
+- A **scope** resolves a target beneath the manager home (`global`) or the exact
+  current working directory (`project`). A project deployment takes precedence
+  over a global deployment.
+
+Manager-owned configuration, cache, backups, and locks live beneath
+`~/.skill-manager/` by default. Set `SKILL_MANAGER_HOME` to isolate that state.
+
+## Learn the CLI
+
+- [`cheatsheet.skill-manager.md`](./cheatsheet.skill-manager.md): goal-oriented
+  command, flag, JSON, NDJSON, configuration, and safety reference.
+- [`clis/skill-manager/docs/cli.md`](./clis/skill-manager/docs/cli.md):
+  canonical human CLI behavior.
+- [`clis/skill-manager/docs/json.md`](./clis/skill-manager/docs/json.md):
+  strict recipe and NDJSON contract for automation.
+- [`clis/skill-manager/docs/configuration.md`](./clis/skill-manager/docs/configuration.md):
+  storage, target templates, backups, migration, and filesystem safety.
+- [`clis/skill-manager/README.md`](./clis/skill-manager/README.md): CLI package
+  overview and contributor entry point.
+
+Preview `load`, `update`, `copy`, and `remove` with `--dry-run`. A dry run does
+not deploy or remove skills, but startup storage migration and a required
+remote-cache refresh can still update manager-owned state. Use explicit targets
+and scopes in unattended calls, parse every NDJSON line, and check the process
+exit code.
+
+## Skill catalog
+
+### [`drafting-commit-message`](./skills/drafting-commit-message/SKILL.md)
+
+Draft a concise, imperative commit title and motivation-focused change bullets
+from staged or unstaged changes.
+
+### [`grill-me`](./skills/grill-me/SKILL.md)
+
+Explore the available project context, then interview the user one decision at
+a time until a plan or design has no unresolved branches.
+
+### [`managing-skills`](./skills/managing-skills/SKILL.md)
+
+Operate the complete `skill-manager` CLI conversationally through strict JSON
+recipes and parsed NDJSON, with explicit safety and confirmation rules.
+
+### [`reviewing-implemented-work-order`](./skills/reviewing-implemented-work-order/SKILL.md)
+
+Review a work-order implementation against its job, research, plan, repository
+patterns, security requirements, and test coverage.
+
+### [`reviewing-my-code`](./skills/reviewing-my-code/SKILL.md)
+
+Prepare a focused review of branch changes by identifying key themes and
+surfacing correctness, security, performance, and coverage issues.
+
+### [`running-as-maestro`](./skills/running-as-maestro/SKILL.md)
+
+Run an agent as an accountable orchestrator that delegates work to subagents,
+selects appropriate model tiers, and verifies their output.
+
+## Contributing and releases
+
+See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the Just-based quality workflow
+and [`RELEASES.md`](./RELEASES.md) for tagged release procedures.

@@ -2,6 +2,14 @@
 
 `skill-manager` discovers `SKILL.md` directories from local or GitHub sources and deploys them to AI-tool skill directories. It is a standalone Rust 2024 executable with a testable library and recoverable filesystem deployment.
 
+Start with the repository [README](../../README.md) for the two-part toolkit and
+five-minute setup, or keep the
+[skill-manager cheatsheet](../../cheatsheet.skill-manager.md) nearby for
+goal-oriented examples. Agents can use the
+[`managing-skills` skill](../../skills/managing-skills/SKILL.md) for complete
+conversational operation; the
+[pasteable installer](../../install.skill-manager.md) installs both.
+
 ## Install
 
 Download the archive matching your operating system and CPU from the GitHub release, unpack it, and add the executable to `PATH`. Archives include shell completions and a man page.
@@ -10,12 +18,14 @@ Download the archive matching your operating system and CPU from the GitHub rele
 
 ```console
 $ skill-manager source add ./my-skills --name team --label "Team skills"
-$ skill-manager load --all --no-input
+$ skill-manager load --all --global --no-input
 $ skill-manager status
 $ skill-manager update --target claude --no-input
 ```
 
-Use `--dry-run` before a mutating command to emit its plan without changing configuration, cache, targets, backups, or lock state.
+Use `--dry-run` before a deployment mutation to emit its plan without changing
+skill deployments. Startup storage migration still runs, and discovery may
+refresh manager-owned remote cache when required, even during a dry run.
 
 ## Commands
 
@@ -33,13 +43,21 @@ $ skill-manager source swap personal
 
 ## Configuration and safety
 
-The active configuration file is `~/.skill-manager.config.json`; the older `~/.skills-syncer.config.json` is migrated once. The v0-to-v1 migration makes a non-overwriting `.v0.bak` backup. Remote cache content is under `~/.skill-manager-cache`.
+Manager-owned state is consolidated beneath `~/.skill-manager/`: `config.json`,
+`cache/`, `backups/`, and `locks/`. On startup, the manager safely and
+idempotently migrates recognized legacy flat configuration, cache, and backup
+locations. Schema migrations archive exact source bytes before conversion.
 
 Deployments are staged and journaled per skill. A later failed skill does not undo earlier committed skills; the next invocation recovers incomplete work. The manager refuses unsafe tree entries such as links and special files. Details are in [configuration and migration](docs/configuration.md) and [the canonical-deviation ledger](docs/deviations.md).
 
 ## Automation
 
-`--json` writes NDJSON events. `--json='{...}'`, `--json-input`, and `--input FILE` also provide a strict single-invocation recipe and imply noninteractive JSON mode. See [the JSON contract](docs/json.md) for envelope, validation, precedence, and exit codes.
+`--json` writes NDJSON events. `--json='{...}'`, `--json-input`, and `--input
+FILE` also provide a strict single-invocation recipe and imply noninteractive
+JSON mode. See [the JSON contract](docs/json.md) for envelope, validation,
+precedence, and exit codes, [the command reference](docs/cli.md) for human CLI
+behavior, and [configuration and migration](docs/configuration.md) for storage,
+backups, and target templates.
 
 ## Development
 
