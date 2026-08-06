@@ -47,14 +47,21 @@ GitHub Copilot has broader provider and model coverage and an `auto` mode that
 can often choose well for the task:
 
 1. Default to `auto` for most subagent dispatches.
-2. Pin a specific model only by exception, when you have a clear task-driven
+2. Exception: judge subagents. Pin the judge to a specific model that
+   satisfies the judge floor defined in the verification section below —
+   equal-or-greater class than the executor's actual model (known
+   post-execution even under `auto`), and never an older generation of the
+   same family — preferring a different provider of equivalent class when
+   available. Weak auto-routed judges have been observed specifically in
+   this harness, so this exception is not optional.
+3. Pin a specific model only by exception, when you have a clear task-driven
    reason (specialized capability, latency, cost, or reliability).
-3. Optimize across providers by task fit; do not default to GPT-family models
+4. Optimize across providers by task fit; do not default to GPT-family models
    when another provider is better for the sub-task.
-4. If you assign the same model/provider repeatedly across independent
+5. If you assign the same model/provider repeatedly across independent
    sub-tasks, explicitly justify why diversification is not better for ROI.
-5. If `auto` is unavailable, choose the cheapest model that can credibly do the
-   task, then escalate only if needed.
+6. If `auto` is unavailable, choose the cheapest model that can credibly do
+   the task, then escalate only if needed.
 
 **Copilot dispatch examples (keep concise and adapt to available models):**
 
@@ -95,8 +102,28 @@ verdict.
 Instruct the judge to be a genuine bar-raiser, not a rubber stamp: presume the
 work is deficient until it demonstrates otherwise against the acceptance
 criteria, and actively hunt for unmet requirements, edge cases, and corners cut
-rather than confirming that the work "looks right." Judge model tier is still a
-normal per-task ROI call — no special tier rule.
+rather than confirming that the work "looks right."
+
+The judge's model has a hard floor: it must run on a model of equal or
+greater capability class than the executor whose work it is judging, and it
+must not be an older generation of the same model family as the executor (a
+sonnet-4.x judge over a sonnet-5 executor, for example, is forbidden). A
+weaker judge cannot reliably hold the bar against a stronger executor's
+output. Comparing class across providers has no canonical mapping — it's a
+judgment call using rough capability tiers (frontier/heavy vs. mid vs.
+light), and when you're unsure whether a candidate judge clears the floor,
+err toward the stronger judge. Where a harness gives you access to models
+from multiple providers, prefer a judge of equivalent-or-greater class from a
+different provider than the executor, for greater independence of judgment —
+but this is only a preference among candidates that already satisfy the
+floor; a stronger same-provider judge always beats a weaker
+different-provider one, and the floor is never sacrificed for provider
+diversity. The floor scales naturally: a light/cheap executor only needs a
+light/cheap judge, so this doesn't force expensive judges onto cheap work,
+and if the executor is already top class, an equal-class judge satisfies the
+floor. The judge is dispatched after execution completes, so you always know
+which model actually did the work — even one routed by an `auto` mode — and
+can select the judge accordingly.
 
 The judge does the hard work of scrutiny, but you still own every output. If
 you disagree with a judge's rejection, overrule it and accept the executor's
@@ -122,6 +149,21 @@ acceptance criteria with new desiderata cycle over cycle (goalpost-moving)
 instead of narrowing on the original criteria. Judge subagents are fresh each
 cycle and have no memory of prior verdicts — you are the one who has to carry
 rejection reasons across cycles and notice the repetition or drift.
+
+After 2 rejected cycles on the same subtask, explicitly consider — and briefly
+state your decision either way to the user — whether to escalate the
+executor+judge pair to a higher capability class for the remaining attempts
+(for example, handing a sonnet-class pair off to an opus-class pair).
+Escalation composes with the judge floor above: the escalated judge must
+still be equal-or-greater class than the escalated executor. Escalation does
+not reset or extend the attempt budget — the 4-attempts-total ceiling is
+unchanged, and escalated attempts still count against it. At the thrash
+trigger, class escalation is an allowed alternative to stepping in yourself,
+but only when you judge the repeated failure to be capability-bound rather
+than instruction-bound (an unclear brief, missing context), and only within
+the same attempt budget. If no higher class is available — you're already at
+top class — or the failure looks instruction-bound, the existing step-in
+rules apply unchanged.
 
 When you step in, make your own call on how to resolve the disagreement,
 dictate that resolution to the subagent(s) to carry out, and then do a
