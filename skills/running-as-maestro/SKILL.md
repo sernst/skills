@@ -21,39 +21,62 @@ forward, across every subsequent turn, until the user explicitly redirects or
 cancels it. Do not slip back into doing work directly just because a later
 request looks simple.
 
-**Right Model tiers for the job.** You are operating as a top-tier class of
+**Right model tiers for the job.** You are operating as a top-tier class of
 agent. You have access to lighter subagent tiers that should be used as
 appropriate on a per sub-task basis to optimize session ROI. Inform the user
 which provider + model (or `auto`) is being used for each subagent or group of
-subagents, along with a one-line reason for that choice.
+subagents, along with a one-line reason for that choice. Within whatever
+capability class or tier you choose for a subagent, always use the latest
+generally-available release of that class offered by your harness — never
+dispatch on, say, sonnet-4.8 when sonnet-5 is available. Preview or beta
+releases do not count as "latest" unless the user asks for one specifically or
+the class has no GA release yet. Exception: if the user's own prompt explicitly
+requests an older version (for example, their skills are tuned for an older
+model), that request overrides this default.
 
-**If you are a GPT/Codex-family agent outside GitHub Copilot** (an OpenAI model
-running via the native API, Codex CLI, or ChatGPT), this paragraph applies to
-you specifically; Claude-family agents already handle tier selection implicitly
-from the paragraph above and can disregard this one. Unlike Claude, you will not
-automatically launch subagents on a lighter tier — left unspecified, your
-subagents default to your own model. You must explicitly pick a tier per
-subagent and pass it when launching, matching tier weight to task complexity as
-a judgment call: **Sol** (heaviest, most capable), **Terra** (balanced mid
-tier), and **Luna** (lightest, fastest) — roughly Sun > Earth > Moon. These are
-typically named with a `-sol`/`-terra`/`-luna` suffix (e.g.
-`gpt-5.6-sol`/`gpt-5.6-terra`/`gpt-5.6-luna`), but the exact identifier and
-version depend on what's available in your current environment — use whatever
-matching tier is exposed there, falling back to the closest lighter-weight
-option if these exact names aren't available (e.g. on older models).
+**Identify your harness once, then apply exactly one of the profiles below.**
+Determine which harness you are running in and apply only the matching
+profile — entirely ignore the other three; rules written for a profile that
+isn't yours must never influence your decisions.
 
-**If you are running in GitHub Copilot**, apply this Copilot-specific policy.
-GitHub Copilot has broader provider and model coverage and an `auto` mode that
-can often choose well for the task:
+## Claude family
 
-1. Default to `auto` for most subagent dispatches.
+This profile applies only if you are a Claude-family agent (Claude Code,
+Claude via the native API, or similar). If that is not you, skip this profile
+entirely. Claude harnesses already handle subagent tier selection natively and
+implicitly, so no additional tier-selection mechanics apply beyond the general
+rules above.
+
+## GPT/Codex family outside GitHub Copilot
+
+This profile applies only if you are a GPT/Codex-family agent running outside
+GitHub Copilot (an OpenAI model via the native API, Codex CLI, or ChatGPT). If
+that is not you, skip this profile entirely.
+
+Unlike Claude, you will not automatically launch subagents on a lighter
+tier — left unspecified, your subagents default to your own model. You must
+explicitly pick a tier per subagent and pass it when launching, matching tier
+weight to task complexity as a judgment call: **Sol** (heaviest, most
+capable), **Terra** (balanced mid tier), and **Luna** (lightest, fastest).
+These are typically named with a `-sol`/`-terra`/`-luna` suffix (e.g.
+`gpt-5.6-sol`/`gpt-5.6-terra`/`gpt-5.6-luna`); exact identifiers vary by
+environment, so use whatever matching tier is exposed there, falling back to
+the closest lighter-weight option when these exact names aren't available.
+
+## GitHub Copilot
+
+This profile applies only if you are running in GitHub Copilot. If that is
+not you, skip this profile entirely. GitHub Copilot has broader provider and
+model coverage and an `auto` mode that can often choose well for the task:
+
+1. Default to `auto` for most subagent dispatches — the router's exact label
+   varies by surface (for example `Auto` in VS Code), so use whatever label
+   your surface exposes; every reference to `auto` in this document means
+   that router, however it is labeled.
 2. Exception: judge subagents. Pin the judge to a specific model that
-   satisfies the judge floor defined in the verification section below —
-   equal-or-greater class than the executor's actual model (known
-   post-execution even under `auto`), and never an older generation of the
-   same family — preferring a different provider of equivalent class when
-   available. Weak auto-routed judges have been observed specifically in
-   this harness, so this exception is not optional.
+   satisfies the judge floor defined in the Rules for every harness section
+   below. Weak auto-routed judges have been observed specifically in this
+   harness, so this exception is not optional.
 3. Pin a specific model only by exception, when you have a clear task-driven
    reason (specialized capability, latency, cost, or reliability).
 4. Optimize across providers by task fit; do not default to GPT-family models
@@ -63,14 +86,24 @@ can often choose well for the task:
 6. If `auto` is unavailable, choose the cheapest model that can credibly do
    the task, then escalate only if needed.
 
-**Copilot dispatch examples (keep concise and adapt to available models):**
+In practice: route broad exploratory research across unknown code paths
+through `auto`, pin a stronger model explicitly when a specific provider is a
+clearly better fit for heavy synthesis or nuanced reasoning, and pin a
+low-cost fast model for high-volume triage/mechanical checks, escalating only
+on failure.
 
-- Broad exploratory research across unknown code paths -> `auto` for balanced
-  quality/cost routing.
-- Large synthesis or nuanced reasoning where Claude is available and stronger
-  fit -> pin a Claude model explicitly with rationale.
-- High-volume triage/mechanical checks -> pin a low-cost fast model (for example
-  a flash/mini/luna-class option) and escalate only on failure.
+## Any other harness
+
+This profile applies only if you are running in a harness not covered by the
+three profiles above. If that is not you, skip this profile entirely. Apply
+the general rules only, and do not import rules from the other profiles.
+Determine whether this harness's subagents inherit the parent model by
+default; if they do, explicitly pick an appropriately light tier per sub-task
+rather than letting subagents run on the top-tier model.
+
+## Rules for every harness
+
+These rules apply regardless of which profile above matched.
 
 **Delegation is a judgment call.** Default to offloading research, drafting,
 mechanical edits, and legwork to subagents whenever reasonably possible. There
