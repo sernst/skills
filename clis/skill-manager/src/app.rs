@@ -8,16 +8,17 @@ use serde_json::{Value, json};
 
 use crate::cache::{GitHubTransport, materialize_source};
 use crate::cli::{
-    Command, ConfigsAction, ConfigsArgs, CopyArgs, RemoveArgs, ResolveArgs, ScopeSelection,
-    SourceAction, SourceAddArgs, SourceAlternateArgs, SourceLocateArgs, SourceModeArg,
-    SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction, TargetSelection,
+    Command, ConfigsAction, ConfigsArgs, CopyArgs, ImportArgs, RemoveArgs, ResolveArgs,
+    ScopeSelection, SourceAction, SourceAddArgs, SourceAlternateArgs, SourceLocateArgs,
+    SourceModeArg, SourceSelection, SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs,
+    TargetAction, TargetSelection,
 };
 use crate::config::{
     Config, ConfigBackup, ConfigRepository, FileConfigRepository, derive_salted_source_id,
     find_source_index, fold, is_builtin_name, location_from_reference, location_identity,
-    location_reference, locations_equal, manager_home, normalize_target_template, resolved_targets,
-    resolved_targets_for_scope, set_source_location, source_from_reference, source_location,
-    source_reference,
+    location_reference, locations_equal, manager_home, normalize_target_template, portable_path,
+    resolved_targets, resolved_targets_for_scope, set_source_location, source_from_reference,
+    source_location, source_reference,
 };
 use crate::domain::{
     ResolvedSource, Scope, ScopedTarget, SkillCandidate, SourceEntry, SourceLocation, SourceMode,
@@ -25,6 +26,10 @@ use crate::domain::{
 };
 use crate::error::{Result, SkillManagerError};
 use crate::event::{Level, Reporter};
+use crate::plan::{
+    DiffStat, PlanAction, PlanEntry, diff_directories, file_change_lines, plan_summary, plan_table,
+    totals_line,
+};
 use crate::prompt::Prompt;
 use crate::skills::{
     deployed_skills, detect_skill_dirs, directories_equal, discover_skills, expand_skill_patterns,
@@ -36,7 +41,25 @@ use crate::status::{
     status_summary_counts, status_summary_with_counts,
 };
 use crate::storage_migration::LayoutMigrationResult;
-use crate::transaction::{TransactionHook, deploy_skill, remove_skill};
+use crate::transaction::{TransactionHook, deploy_skill, import_skill, remove_skill};
+
+/// One planned skill/target/scope deployment computed before any mutation.
+struct SyncStep {
+    candidate: SkillCandidate,
+    target: Target,
+    scope: Scope,
+    destination: PathBuf,
+    existed: bool,
+    same: bool,
+}
+
+/// One deployed copy that differs from its source and can be imported.
+struct ImportCandidate {
+    target: Target,
+    scope: Scope,
+    deployment: PathBuf,
+    stat: DiffStat,
+}
 
 /// Outcome converted to the executable exit code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,10 +126,17 @@ where
         let mut config = loaded.config;
         match command {
             Command::Load(args) => {
-                self.run_sync(&config, &args, false)?;
+                self.run_sync(&config, &args, false, true)?;
             }
             Command::Update(args) => {
-                self.run_sync(&config, &args, true)?;
+                if !self.run_sync(&config, &args.sync, true, args.yes)? {
+                    return Ok(RunOutcome::Cancelled);
+                }
+            }
+            Command::Import(args) => {
+                if !self.run_import(&config, &args)? {
+                    return Ok(RunOutcome::Cancelled);
+                }
             }
             Command::Copy(args) => {
                 self.run_copy(&config, &args)?;
@@ -219,13 +249,18 @@ where
         if answer == "yes" {
             return Ok(true);
         }
+        self.report_cancelled(&format!("configs.{action}"))?;
+        Ok(false)
+    }
+
+    /// Report one declined confirmation identically for every command.
+    fn report_cancelled(&mut self, action: &str) -> Result<()> {
         self.reporter.human("Cancelled.")?;
         self.reporter.event(
             "command.cancelled",
             Level::Info,
-            json!({ "action": format!("configs.{action}") }),
-        )?;
-        Ok(false)
+            json!({ "action": action }),
+        )
     }
 
     // Configuration display deliberately coordinates every human and machine section here.
@@ -877,9 +912,15 @@ where
         self.reporter.event(event, level, target_data(target))
     }
 
-    // Sync is an orchestration boundary for discovery, scope inference, and transactional events.
+    // Sync is an orchestration boundary for discovery, scope inference, planning, and events.
     #[allow(clippy::too_many_lines)]
-    fn run_sync(&mut self, config: &Config, args: &SyncArgs, update_only: bool) -> Result<()> {
+    fn run_sync(
+        &mut self,
+        config: &Config,
+        args: &SyncArgs,
+        update_only: bool,
+        confirmed: bool,
+    ) -> Result<bool> {
         let operands = split_sync_operands(&args.sources);
         let sources = self.resolve_sources(
             config,
@@ -921,8 +962,7 @@ where
             .map(|name| fold(name))
             .collect::<BTreeSet<_>>();
 
-        let mut changed = 0_usize;
-        let mut skipped = 0_usize;
+        let mut steps = Vec::new();
         for candidate in discovery.winners.values() {
             if !selected.contains(&fold(&candidate.name))
                 || !matches_patterns(&candidate.name, &args.filters)?
@@ -938,70 +978,86 @@ where
                 for scope in scopes {
                     let target = scoped_target(template, scope, &self.home, &project_root);
                     let destination = target.target.path.join(&candidate.name);
-                    let destination_existed = destination.is_dir();
-                    if update_only && !destination_existed {
+                    let existed = destination.is_dir();
+                    if update_only && !existed {
                         continue;
                     }
-                    let same =
-                        destination_existed && directories_equal(&candidate.path, &destination)?;
-                    if same {
-                        skipped += 1;
-                        self.reporter.event(
-                            "skill.skipped",
-                            Level::Info,
-                            skill_action_data(
-                                candidate,
-                                &target.target,
-                                Some(scope),
-                                &destination,
-                                args.dry_run,
-                                "skipped",
-                            ),
-                        )?;
-                        continue;
-                    }
-                    if !args.dry_run {
-                        deploy_skill(
-                            &candidate.path,
-                            &target.target.path,
-                            self.repository.cache_root(),
-                            self.hook,
-                        )?;
-                    }
-                    changed += 1;
-                    self.reporter.human(&format!(
-                        "{} {} -> {} ({}){}",
-                        if update_only { "Updated" } else { "Loaded" },
-                        candidate.name,
-                        target.target.name,
-                        scope.as_str(),
-                        if args.dry_run { " (dry-run)" } else { "" }
-                    ))?;
-                    let action = if update_only {
-                        "updated"
-                    } else if destination_existed {
-                        "overwritten"
-                    } else {
-                        "loaded"
-                    };
-                    self.reporter.event(
-                        if update_only {
-                            "skill.updated"
-                        } else {
-                            "skill.loaded"
-                        },
-                        Level::Info,
-                        skill_action_data(
-                            candidate,
-                            &target.target,
-                            Some(scope),
-                            &destination,
-                            args.dry_run,
-                            action,
-                        ),
-                    )?;
+                    let same = existed && directories_equal(&candidate.path, &destination)?;
+                    steps.push(SyncStep {
+                        candidate: candidate.clone(),
+                        target: target.target,
+                        scope,
+                        destination,
+                        existed,
+                        same,
+                    });
                 }
             }
+        }
+
+        if update_only && !self.confirm_update_plan(&steps, args.dry_run, confirmed)? {
+            return Ok(false);
+        }
+
+        let mut changed = 0_usize;
+        let mut skipped = 0_usize;
+        for step in &steps {
+            if step.same {
+                skipped += 1;
+                self.reporter.event(
+                    "skill.skipped",
+                    Level::Info,
+                    skill_action_data(
+                        &step.candidate,
+                        &step.target,
+                        Some(step.scope),
+                        &step.destination,
+                        args.dry_run,
+                        "skipped",
+                    ),
+                )?;
+                continue;
+            }
+            if !args.dry_run {
+                deploy_skill(
+                    &step.candidate.path,
+                    &step.target.path,
+                    self.repository.cache_root(),
+                    self.hook,
+                )?;
+            }
+            changed += 1;
+            self.reporter.human(&format!(
+                "{} {} -> {} ({}){}",
+                if update_only { "Updated" } else { "Loaded" },
+                step.candidate.name,
+                step.target.name,
+                step.scope.as_str(),
+                if args.dry_run { " (dry-run)" } else { "" }
+            ))?;
+            let action = if update_only {
+                "updated"
+            } else if step.existed {
+                "overwritten"
+            } else {
+                "loaded"
+            };
+            self.reporter.event(
+                if update_only {
+                    "skill.updated"
+                } else {
+                    "skill.loaded"
+                },
+                Level::Info,
+                skill_action_data(
+                    &step.candidate,
+                    &step.target,
+                    Some(step.scope),
+                    &step.destination,
+                    args.dry_run,
+                    action,
+                ),
+            )?;
         }
         if !operands.skill_patterns.is_empty() && changed + skipped == 0 {
             return Err(SkillManagerError::NotFound {
@@ -1018,7 +1074,62 @@ where
                 "skipped": skipped,
                 "dry_run": args.dry_run
             }),
-        )
+        )?;
+        Ok(true)
+    }
+
+    /// Display the update plan and, when interactive, confirm it once.
+    ///
+    /// Machine mode keeps its existing event-only contract, so the plan is a
+    /// human-output feature. A dry run and `--yes` both display the plan
+    /// without prompting.
+    fn confirm_update_plan(
+        &mut self,
+        steps: &[SyncStep],
+        dry_run: bool,
+        confirmed: bool,
+    ) -> Result<bool> {
+        if self.reporter.is_json() || steps.is_empty() {
+            return Ok(true);
+        }
+        let mut entries = Vec::with_capacity(steps.len());
+        for step in steps {
+            let action = if step.same {
+                PlanAction::Skip
+            } else if step.existed {
+                PlanAction::Update
+            } else {
+                PlanAction::Load
+            };
+            let stat = if step.same {
+                DiffStat::default()
+            } else {
+                diff_directories(&step.destination, &step.candidate.path)?
+            };
+            entries.push(PlanEntry {
+                action,
+                skill: step.candidate.name.clone(),
+                location: format!("{} ({})", step.target.name, step.scope.as_str()),
+                stat,
+            });
+        }
+        let symbols = self.reporter.is_interactive();
+        let color = self.reporter.color_enabled();
+        self.reporter.human("Update plan:")?;
+        for line in plan_table(&entries, symbols, color) {
+            self.reporter.human(&line)?;
+        }
+        self.reporter.human(&plan_summary(&entries))?;
+        self.reporter.human("")?;
+        let actionable = entries.iter().any(|entry| entry.action != PlanAction::Skip);
+        if dry_run || confirmed || !actionable || self.no_input {
+            return Ok(true);
+        }
+        if self.prompt.confirm("Apply this update plan?", true)? {
+            return Ok(true);
+        }
+        self.report_cancelled("update")?;
+        Ok(false)
     }
 
     fn run_copy(&mut self, config: &Config, args: &CopyArgs) -> Result<()> {
@@ -1075,6 +1186,285 @@ where
             Level::Info,
             json!({ "action": "copy", "copied": copied, "dry_run": args.dry_run }),
         )
+    }
+
+    // Import resolves one source, detects divergent deployments, plans, confirms,
+    // and mirrors in a single ordered operation.
+    #[allow(clippy::too_many_lines)]
+    fn run_import(&mut self, config: &Config, args: &ImportArgs) -> Result<bool> {
+        if is_fnmatch_operand(&args.skill) {
+            return Err(SkillManagerError::InvalidInput(format!(
+                "import selects exactly one skill and does not accept patterns: {}",
+                args.skill
+            )));
+        }
+        validate_skill_name(&args.skill)?;
+        let sources = self.resolve_sources(
+            config,
+            &[],
+            &SourceSelection::default(),
+            false,
+            args.dry_run,
+        )?;
+        let discovery = discover_skills(&sources, &[], &config.exclude)?;
+        self.emit_collisions(&discovery.collisions)?;
+        let candidate = discovery
+            .winners
+            .get(&fold(&args.skill))
+            .cloned()
+            .ok_or_else(|| SkillManagerError::NotFound {
+                kind: "source skill",
+                reference: args.skill.clone(),
+            })?;
+        // Detection compares deployments with the materialized source, so it runs
+        // before the destination is resolved. Nothing to import must never ask
+        // where an import would have been written.
+        let target_templates =
+            self.select_target_templates(config, &args.targets, false, args.dry_run)?;
+        let project_root = current_project_root()?;
+        let inspected_scopes = explicit_scope(&args.scope)
+            .map_or_else(|| vec![Scope::Global, Scope::Project], |scope| vec![scope]);
+        let mut detected = Vec::new();
+        for template in &target_templates {
+            for scope in &inspected_scopes {
+                let target = scoped_target(template, *scope, &self.home, &project_root);
+                let deployment = target.target.path.join(&candidate.name);
+                if !deployment.is_dir() || directories_equal(&candidate.path, &deployment)? {
+                    continue;
+                }
+                detected.push((target.target, *scope, deployment));
+            }
+        }
+
+        let mut imported = 0_usize;
+        let mut skipped = 0_usize;
+        if detected.is_empty() {
+            skipped = 1;
+            self.reporter.human(&format!(
+                "Nothing to import: {} source is up to date with every selected deployment.",
+                candidate.name
+            ))?;
+            self.reporter.event(
+                "skill.import-skipped",
+                Level::Info,
+                skill_import_skipped_data(&candidate, args.dry_run),
+            )?;
+        } else {
+            let Some(destination) = self.import_destination(&candidate)? else {
+                return Ok(false);
+            };
+            let mut candidates = Vec::with_capacity(detected.len());
+            for (target, scope, deployment) in detected {
+                let stat = diff_directories(&destination, &deployment)?;
+                candidates.push(ImportCandidate {
+                    target,
+                    scope,
+                    deployment,
+                    stat,
+                });
+            }
+            let index = self.select_import_candidate(&candidate.name, &candidates)?;
+            let selection = candidates.get(index).ok_or_else(|| {
+                SkillManagerError::InvalidInput("import selection is out of range".into())
+            })?;
+            self.render_import_plan(&candidate, selection, &destination)?;
+            self.reporter.event(
+                "skill.import-planned",
+                Level::Info,
+                skill_import_data(&candidate, selection, &destination, args.dry_run, "planned"),
+            )?;
+            if !self.confirm_import(selection, &destination, args.dry_run, args.yes)? {
+                return Ok(false);
+            }
+            if !args.dry_run {
+                import_skill(
+                    &selection.deployment,
+                    &destination,
+                    self.repository.cache_root(),
+                    self.hook,
+                )?;
+            }
+            imported = 1;
+            self.reporter.human(&format!(
+                "Imported {} from {} ({}) into {}{}",
+                candidate.name,
+                selection.target.name,
+                selection.scope.as_str(),
+                destination.display(),
+                if args.dry_run { " (dry-run)" } else { "" }
+            ))?;
+            self.reporter.event(
+                "skill.imported",
+                Level::Info,
+                skill_import_data(
+                    &candidate,
+                    selection,
+                    &destination,
+                    args.dry_run,
+                    "imported",
+                ),
+            )?;
+        }
+        self.reporter.event(
+            "summary",
+            Level::Info,
+            json!({
+                "action": "import",
+                "imported": imported,
+                "skipped": skipped,
+                "dry_run": args.dry_run
+            }),
+        )?;
+        Ok(true)
+    }
+
+    /// Resolve the local source directory an import may overwrite.
+    ///
+    /// Returns `Ok(None)` when the user declines a GitHub-backed source's local
+    /// alternate location.
+    fn import_destination(&mut self, candidate: &SkillCandidate) -> Result<Option<PathBuf>> {
+        let entry = &candidate.source.entry;
+        if entry.source_type == SourceType::Local {
+            return Ok(Some(portable_path(&candidate.path)));
+        }
+        let Some(SourceLocation::Local { path }) = entry.alternate.clone() else {
+            return Err(SkillManagerError::InvalidInput(format!(
+                "import writes to local source checkouts only; '{}' is GitHub-backed ({}) and has no local alternate location. Add one with: skill-manager source alternate {} <local-path>",
+                entry.name,
+                source_reference(entry),
+                entry.name
+            )));
+        };
+        let destination = portable_path(&if entry.mode == SourceMode::Single {
+            path
+        } else {
+            path.join(&candidate.name)
+        });
+        if self.no_input {
+            return Err(SkillManagerError::InteractionRequired(format!(
+                "'{}' is GitHub-backed; importing into its local alternate {} requires interactive confirmation",
+                entry.name,
+                destination.display()
+            )));
+        }
+        if self.prompt.confirm(
+            &format!(
+                "'{}' is GitHub-backed ({}); import into its local alternate {} instead?",
+                entry.name,
+                source_reference(entry),
+                destination.display()
+            ),
+            false,
+        )? {
+            return Ok(Some(destination));
+        }
+        self.report_cancelled("import")?;
+        Ok(None)
+    }
+
+    /// Choose which divergent deployment supplies the imported content.
+    fn select_import_candidate(
+        &mut self,
+        skill: &str,
+        candidates: &[ImportCandidate],
+    ) -> Result<usize> {
+        if candidates.len() == 1 {
+            return Ok(0);
+        }
+        if self.no_input {
+            return Err(SkillManagerError::InteractionRequired(format!(
+                "{} changed deployments of {skill} are importable; narrow the selection with --target, --global, or --project",
+                candidates.len()
+            )));
+        }
+        let choices = candidates
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} ({}) - {}",
+                    item.target.name,
+                    item.scope.as_str(),
+                    totals_line(&item.stat)
+                )
+            })
+            .collect::<Vec<_>>();
+        self.prompt
+            .choose(&format!("Choose the {skill} copy to import"), &choices)
+    }
+
+    /// Render the human-reviewable import plan.
+    fn render_import_plan(
+        &mut self,
+        candidate: &SkillCandidate,
+        selection: &ImportCandidate,
+        destination: &Path,
+    ) -> Result<()> {
+        let symbols = self.reporter.is_interactive();
+        let color = self.reporter.color_enabled();
+        let location = format!("{} ({})", selection.target.name, selection.scope.as_str());
+        let source_label = format!("{} (source)", candidate.source.entry.name);
+        let width = location.len().max(source_label.len());
+        self.reporter
+            .human(&format!("Import plan for {}:", candidate.name))?;
+        self.reporter.human(&format!(
+            "  from  {:width$}  {}",
+            location,
+            selection.deployment.display()
+        ))?;
+        self.reporter.human(&format!(
+            "  to    {:width$}  {}",
+            source_label,
+            destination.display()
+        ))?;
+        self.reporter.human("")?;
+        let entry = PlanEntry {
+            action: PlanAction::Import,
+            skill: candidate.name.clone(),
+            location,
+            stat: selection.stat.clone(),
+        };
+        for line in plan_table(std::slice::from_ref(&entry), symbols, color) {
+            self.reporter.human(&line)?;
+        }
+        if !selection.stat.is_empty() {
+            self.reporter.human("")?;
+            for line in file_change_lines(&selection.stat, symbols, color) {
+                self.reporter.human(&line)?;
+            }
+        }
+        self.reporter.human(&totals_line(&selection.stat))?;
+        self.reporter.human("")
+    }
+
+    /// Confirm the destructive source overwrite unless it was pre-approved.
+    fn confirm_import(
+        &mut self,
+        selection: &ImportCandidate,
+        destination: &Path,
+        dry_run: bool,
+        confirmed: bool,
+    ) -> Result<bool> {
+        if dry_run || confirmed {
+            return Ok(true);
+        }
+        if self.no_input {
+            return Err(SkillManagerError::InteractionRequired(
+                "import overwrites source content; pass --yes in noninteractive mode".into(),
+            ));
+        }
+        if self.prompt.confirm(
+            &format!(
+                "Replace {} with the {} ({}) copy?",
+                destination.display(),
+                selection.target.name,
+                selection.scope.as_str()
+            ),
+            false,
+        )? {
+            return Ok(true);
+        }
+        self.report_cancelled("import")?;
+        Ok(false)
     }
 
     // Resolution, confirmation, execution, and reporting form one ordered
@@ -1233,12 +1623,7 @@ where
                 &format!("Remove {} skill deployment(s)?", plan.len()),
                 false,
             )? {
-                self.reporter.human("Cancelled.")?;
-                self.reporter.event(
-                    "command.cancelled",
-                    Level::Info,
-                    json!({ "action": "remove" }),
-                )?;
+                self.report_cancelled("remove")?;
                 return Ok(false);
             }
         }
@@ -1804,7 +2189,9 @@ where
 
 fn command_dry_run(command: &Command) -> bool {
     match command {
-        Command::Load(args) | Command::Update(args) => args.dry_run,
+        Command::Load(args) => args.dry_run,
+        Command::Update(args) => args.sync.dry_run,
+        Command::Import(args) => args.dry_run,
         Command::Copy(args) => args.dry_run,
         Command::Remove(args) => args.dry_run,
         _ => false,
@@ -2101,6 +2488,45 @@ fn skill_action_data(
     data
 }
 
+fn skill_import_data(
+    candidate: &SkillCandidate,
+    selection: &ImportCandidate,
+    destination: &Path,
+    dry_run: bool,
+    action: &str,
+) -> Value {
+    let mut data = source_data(&candidate.source.entry);
+    if let Some(object) = data.as_object_mut() {
+        object.insert("skill".into(), json!(candidate.name));
+        object.insert("path".into(), json!(candidate.path));
+        object.insert("target".into(), json!(selection.target.name));
+        object.insert("target_path".into(), json!(selection.target.path));
+        object.insert("scope".into(), json!(selection.scope));
+        object.insert("deployment".into(), json!(selection.deployment));
+        object.insert("destination".into(), json!(destination));
+        object.insert(
+            "files_changed".into(),
+            json!(selection.stat.files_changed()),
+        );
+        object.insert("insertions".into(), json!(selection.stat.insertions()));
+        object.insert("deletions".into(), json!(selection.stat.deletions()));
+        object.insert("action".into(), json!(action));
+        object.insert("dry_run".into(), json!(dry_run));
+    }
+    data
+}
+
+fn skill_import_skipped_data(candidate: &SkillCandidate, dry_run: bool) -> Value {
+    let mut data = source_data(&candidate.source.entry);
+    if let Some(object) = data.as_object_mut() {
+        object.insert("skill".into(), json!(candidate.name));
+        object.insert("path".into(), json!(candidate.path));
+        object.insert("action".into(), json!("skipped"));
+        object.insert("dry_run".into(), json!(dry_run));
+    }
+    data
+}
+
 fn set_target_enabled(config: &mut Config, name: &str, enabled: bool) -> Result<()> {
     if let Some(entry) = find_named_mut(&mut config.targets, name) {
         entry.enabled = enabled;
@@ -2217,9 +2643,9 @@ mod tests {
     };
     use crate::cache::GitHubTransport;
     use crate::cli::{
-        Command, CopyArgs, RemoveArgs, SourceAction, SourceAddArgs, SourceArgs, SourceModeArg,
-        SourceRemoveArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction, TargetArgs,
-        TargetNameArgs, TargetPathArgs,
+        Command, CopyArgs, ImportArgs, RemoveArgs, SourceAction, SourceAddArgs, SourceArgs,
+        SourceModeArg, SourceRemoveArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction,
+        TargetArgs, TargetNameArgs, TargetPathArgs, UpdateArgs,
     };
     use crate::config::{Config, FileConfigRepository, resolved_targets, source_from_reference};
     use crate::domain::{ResolvedSource, Scope, SkillCandidate, TargetEntry};
@@ -2312,7 +2738,15 @@ mod tests {
             ..SyncArgs::default()
         };
         assert!(command_dry_run(&Command::Load(sync.clone())));
-        assert!(command_dry_run(&Command::Update(sync)));
+        assert!(command_dry_run(&Command::Update(UpdateArgs {
+            sync,
+            yes: false,
+        })));
+        assert!(command_dry_run(&Command::Import(ImportArgs {
+            skill: "alpha".into(),
+            dry_run: true,
+            ..ImportArgs::default()
+        })));
         assert!(command_dry_run(&Command::Copy(CopyArgs {
             source: "source".into(),
             destination: PathBuf::from("target"),

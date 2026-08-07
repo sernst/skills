@@ -100,7 +100,8 @@ fn source_recipe_fields(source: &str) -> BTreeMap<String, BTreeSet<String>> {
     let mut recipes = BTreeMap::new();
     for (name, function) in [
         ("load", "overlay_sync"),
-        ("update", "overlay_sync"),
+        ("update", "overlay_update"),
+        ("import", "overlay_import"),
         ("copy", "overlay_copy"),
         ("remove", "overlay_remove"),
         ("status", "overlay_status"),
@@ -496,7 +497,7 @@ fn config_and_summary_payload_references_match_production_emit_sites() {
     );
 
     let summaries = event_json_payloads(app, "summary");
-    assert_eq!(summaries.len(), 7, "production summary emit-site count");
+    assert_eq!(summaries.len(), 8, "production summary emit-site count");
     let summary_fields = summaries
         .iter()
         .map(|payload| object_fields(payload))
@@ -504,6 +505,7 @@ fn config_and_summary_payload_references_match_production_emit_sites() {
     for (marker, expected_count) in [
         ("summary-source-list", 1),
         ("summary-load-update", 1),
+        ("summary-import", 1),
         ("summary-copy", 1),
         ("summary-remove", 2),
         ("summary-status", 1),
@@ -603,7 +605,7 @@ fn every_production_event_has_a_source_derived_payload_family() {
         ("target.removed", "target-removed", 1),
         ("collision.detected", "collision-detected", 1),
         ("collision.resolved", "collision-resolved", 1),
-        ("command.cancelled", "command-cancelled", 2),
+        ("command.cancelled", "command-cancelled", 1),
     ] {
         let payloads = event_json_payloads(app, event);
         assert_eq!(payloads.len(), count, "{event} emit-site count");
@@ -646,6 +648,9 @@ fn every_production_event_has_a_source_derived_payload_family() {
         ("config.shown", "config-shown"),
         ("diagnostic", "diagnostic-message"),
         ("skill.copied", "skill-action"),
+        ("skill.import-planned", "skill-import"),
+        ("skill.import-skipped", "skill-import-skipped"),
+        ("skill.imported", "skill-import"),
         ("skill.loaded", "skill-action"),
         ("skill.removed", "skill-removed"),
         ("skill.skipped", "skill-action"),

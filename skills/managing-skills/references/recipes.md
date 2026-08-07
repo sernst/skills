@@ -54,9 +54,10 @@ plural field.
 ## Discovery and deployment recipes
 
 <!-- recipe-command: load fields: all,all_targets,antigravity,cd,cd_only,claude,command,dry_run,filter,filters,global,no_cd,no_input,project,refresh,shared,source,sources,target,targets -->
-### `load`
+### `load` (`install`)
 
-Deploy discovered skills, replacing existing deployments.
+Deploy discovered skills, replacing existing deployments. The recipe alias
+`install` canonicalizes to `load`; emit `"command":"load"`.
 
 Fields: `command:"load"`; `sources`/`source` (`string|string[]`);
 `filters`/`filter`; source, target, and scope selection; `dry_run` and `refresh`
@@ -69,16 +70,39 @@ least one target using a built-in target boolean, `all_targets:true`, or
 {"command":"load","sources":["sernst-skills"],"filters":["managing-skills"],"shared":true,"global":true,"dry_run":true}
 ```
 
-<!-- recipe-command: update fields: all,all_targets,antigravity,cd,cd_only,claude,command,dry_run,filter,filters,global,no_cd,no_input,project,refresh,shared,source,sources,target,targets -->
+<!-- recipe-command: update fields: all,all_targets,antigravity,cd,cd_only,claude,command,dry_run,filter,filters,global,no_cd,no_input,project,refresh,shared,source,sources,target,targets,yes -->
 ### `update`
 
-Refresh only existing deployments. Fields are identical to `load`. A committed
-non-interactive call must explicitly select at least one target; a dry run may
-implicitly preview enabled targets. Without an explicit scope it infers each
-existing deployment; specify a scope to restrict it.
+Refresh only existing deployments. Fields match `load` plus `yes` (`bool`). A
+committed non-interactive call must explicitly select at least one target; a
+dry run may implicitly preview enabled targets. Without an explicit scope it
+infers each existing deployment; specify a scope to restrict it. The human
+pre-confirmation plan and its `yes` bypass are interactive-only; recipe
+carriers are already non-interactive and never prompt.
 
 ```json
 {"command":"update","sources":["managing-*"],"all_targets":true,"dry_run":true}
+```
+
+<!-- recipe-command: import fields: all,all_targets,antigravity,claude,command,dry_run,global,no_input,project,shared,skill,target,targets,yes -->
+### `import`
+
+Adopt a deployed, possibly agent-modified copy of one skill as the new source
+content. Required: `skill` (`string`), exactly one skill name and never a
+pattern. Optional: target selection, scope selection, `dry_run`, `yes`, and
+`no_input`.
+
+Import is the reverse of `load`, so it fully mirrors the chosen deployment over
+the configured local source directory, including deleting source files the
+deployment no longer has. It writes to local source checkouts only. A
+GitHub-backed source requires a local alternate location and an interactive
+confirmation, so a machine call against such a source fails instead of
+guessing. A committed non-interactive call requires `yes:true`, and it must
+narrow target/scope selection whenever more than one deployment differs from
+the source.
+
+```json
+{"command":"import","skill":"managing-skills","claude":true,"global":true,"dry_run":true}
 ```
 
 <!-- recipe-command: copy fields: command,destination,dry_run,filter,filters,no_input,refresh,source -->

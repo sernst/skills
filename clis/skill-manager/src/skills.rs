@@ -251,8 +251,20 @@ pub fn directories_equal(left: &Path, right: &Path) -> Result<bool> {
     Ok(directory_hashes(left)? == directory_hashes(right)?)
 }
 
-fn directory_hashes(root: &Path) -> Result<BTreeMap<String, [u8; 32]>> {
-    let mut hashes = BTreeMap::new();
+/// Map slash-separated relative paths to the regular files of one tree.
+///
+/// A missing root is an empty tree, which lets planning code compare against a
+/// destination that does not exist yet. Directory entries, timestamps, and
+/// ownership are deliberately ignored.
+///
+/// # Errors
+///
+/// Returns an error for links, hard links, special entries, or filesystem reads.
+pub fn directory_files(root: &Path) -> Result<BTreeMap<String, PathBuf>> {
+    let mut files = BTreeMap::new();
+    if !root.is_dir() {
+        return Ok(files);
+    }
     for item in walkdir::WalkDir::new(root)
         .sort_by_file_name()
         .follow_links(false)
@@ -285,8 +297,15 @@ fn directory_hashes(root: &Path) -> Result<BTreeMap<String, [u8; 32]>> {
             .map(|component| component.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        let bytes =
-            fs::read(item.path()).map_err(|error| SkillManagerError::io(item.path(), error))?;
+        files.insert(relative, item.path().to_path_buf());
+    }
+    Ok(files)
+}
+
+fn directory_hashes(root: &Path) -> Result<BTreeMap<String, [u8; 32]>> {
+    let mut hashes = BTreeMap::new();
+    for (relative, path) in directory_files(root)? {
+        let bytes = fs::read(&path).map_err(|error| SkillManagerError::io(&path, error))?;
         hashes.insert(relative, Sha256::digest(bytes).into());
     }
     Ok(hashes)

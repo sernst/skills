@@ -70,6 +70,7 @@ exist.
 | Deploy it | `skill-manager load sernst-skills --filter managing-skills --shared --global --no-input` |
 | Inspect it in both scopes | `skill-manager status managing-skills --shared --no-input` |
 | Preview updates to existing copies | `skill-manager update sernst-skills --filter managing-skills --all --dry-run --no-input` |
+| Adopt an agent-modified copy back into its source | `skill-manager import managing-skills --claude --global --dry-run --no-input` |
 | Preview project removal | `skill-manager remove managing-skills --shared --project --dry-run --no-input` |
 | Remove after review | `skill-manager remove managing-skills --shared --project --yes --no-input` |
 | Refresh remote source state | `skill-manager status --refresh --no-input` |
@@ -78,15 +79,17 @@ exist.
 
 ## Discovery, deployment, and status commands
 
-### `load` and `update`
+### `load` (`install`) and `update`
 
 ```text
 skill-manager load [SOURCE_OR_PATTERN ...] [OPTIONS]
-skill-manager update [SOURCE_OR_PATTERN ...] [OPTIONS]
+skill-manager install [SOURCE_OR_PATTERN ...] [OPTIONS]
+skill-manager update [SOURCE_OR_PATTERN ...] [OPTIONS] [--yes]
 ```
 
-`load` creates or replaces deployments. `update` changes only skills already
-deployed in eligible targets/scopes; it never creates a new deployment.
+`load` creates or replaces deployments; `install` is a visible alias for it and
+accepts the identical options. `update` changes only skills already deployed in
+eligible targets/scopes; it never creates a new deployment.
 
 | Option | Meaning |
 | --- | --- |
@@ -100,6 +103,13 @@ deployed in eligible targets/scopes; it never creates a new deployment.
 | `--global`/`-g`, `--project`/`-p` | Select installation scope. |
 | `--dry-run` | Plan without deploying skills. |
 | `--refresh` | Force GitHub cache refresh. |
+| `--yes`/`-y` (`update` only) | Skip the plan confirmation; the plan still prints. |
+
+Interactive `update` prints a change plan first—one `update`, `load`, or `skip`
+line per skill/target/scope with its file and line deltas—and then asks once
+before deploying. Declining cancels with exit `0` and no deployment. `--yes`
+and `--dry-run` print the same plan without prompting, and machine mode keeps
+its event-only contract.
 
 In interactive `load`, scope defaults to project when a selected target's
 leading directory already exists in CWD; otherwise global. Non-interactive
@@ -108,6 +118,42 @@ all existing deployments, preferring a project copy when both exist. A
 committed non-interactive `load` or `update` must explicitly select targets with
 one or more built-in selectors, `--all`, or `--target NAME`; dry-run may
 implicitly preview enabled targets.
+
+### `import`
+
+```text
+skill-manager import SKILL [OPTIONS]
+```
+
+The reverse of `load`: it adopts a deployed—possibly agent-modified—copy of one
+skill as the new canonical source content.
+
+| Option | Meaning |
+| --- | --- |
+| `--claude`, `--shared`, `--antigravity`/`--ag` | Narrow detection to a built-in target. |
+| `--all` | Consider all enabled configured targets. |
+| `--target NAME` | Narrow detection to a configured target; repeatable. |
+| `--global`/`-g`, `--project`/`-p` | Narrow detection to one scope. |
+| `--dry-run` | Show the plan without writing to the source. |
+| `--yes`/`-y` | Skip the destructive source-overwrite confirmation. |
+
+Exactly one skill name is accepted; patterns are not. The skill is resolved
+through the same first-source-wins discovery as `load`. Candidates are deployed
+copies that differ from the source; identical copies are never candidates, and
+having none is a clean success. One candidate is preselected, and several
+require an interactive choice or narrower target/scope flags.
+
+Before writing, `import` prints a `from` deployment, a `to` source path, a
+git-style per-file summary (`added`/`modified`/`deleted` with `+N/-N`, or a byte
+delta for binary content), and a totals line. The confirmation defaults to no.
+Applying it makes the source directory byte-identical to the chosen deployed
+copy, including deleting source files the deployment no longer has, through the
+same staged, journaled transaction used for deployments.
+
+Import writes to local source checkouts only. A GitHub-backed source needs a
+local alternate location and an interactive confirmation naming that path;
+without a resolvable local destination the command fails rather than guessing.
+Both only apply once a candidate exists, so an up-to-date source never prompts.
 
 ### `copy`
 
@@ -235,7 +281,7 @@ them with `--json`.
 
 Patterns use case-folded Python `fnmatch` behavior. A positional operand
 containing `*`, `?`, or `[` is a skill-name pattern for `load`, `update`,
-`remove`, and `resolve`. Other positional operands retain their command-specific
+`remove`, and `resolve`; `import` takes exactly one literal skill name. Other positional operands retain their command-specific
 source, skill-directory, or collection-directory meaning.
 
 Positional patterns are ORed, then ANDed with the OR-combined `--filter`
@@ -265,7 +311,7 @@ skill-manager --input recipe.json
 The recipe command names are:
 
 ```text
-load  update  copy  remove  status  resolve
+load  update  import  copy  remove  status  resolve
 source.add  source.remove  source.list  source.update
 source.locate  source.alternate  source.swap
 target.add  target.list  target.enable  target.disable
@@ -303,7 +349,8 @@ errors are NDJSON on stdout. A partial transaction emits committed action events
 before `command.failed`; do not discard them.
 
 Important events include `skill.loaded`, `skill.updated`, `skill.copied`,
-`skill.removed`, `skill.skipped`, `status.row`, `collision.detected`,
+`skill.removed`, `skill.skipped`, `skill.import-planned`, `skill.imported`,
+`skill.import-skipped`, `status.row`, `collision.detected`,
 `collision.resolved`, source/target/config lifecycle events, `diagnostic`,
 `summary`, `command.cancelled`, and `command.failed`. See
 [`skills/managing-skills/references/events.md`](./skills/managing-skills/references/events.md)
@@ -341,8 +388,9 @@ and filesystem-safety details.
 
 - Preflight with `status`, `source list`, `target list`, or `configs`.
 - Use explicit targets and scopes in unattended operations.
-- Dry-run `load`, `update`, `copy`, and `remove`.
-- Review exact removal/configuration effects before `--yes`.
+- Dry-run `load`, `update`, `import`, `copy`, and `remove`.
+- Review exact removal, import, and configuration effects before `--yes`;
+  `import` overwrites source content, including deleting source files.
 - Remember that dry-run does not suppress startup migration or required cache
   refresh.
 - Parse the full NDJSON stream and exit code.

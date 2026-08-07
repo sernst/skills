@@ -20,6 +20,9 @@ mod support;
 
 use support::portable_canonicalize;
 
+/// Windows verbatim path spelling that user-facing output must never contain.
+const VERBATIM_PREFIX: &str = r"\\?\";
+
 fn sandbox() -> TempDir {
     tempfile::tempdir().expect("create isolated home")
 }
@@ -2227,5 +2230,588 @@ fn positional_fnmatch_and_config_recovery_contracts_are_end_to_end() {
         fs::read(raw_home.path().join(".skill-manager/config.json"))
             .expect("exact confirmation resets config"),
         expected
+    );
+}
+
+fn events_of<'a>(events: &'a [Value], name: &str) -> Vec<&'a Value> {
+    events
+        .iter()
+        .filter(|event| event["event"] == name)
+        .collect()
+}
+
+fn seed_github_cache(home: &Path, skill: &str, body: &str) {
+    let config = read_config(home);
+    let id = config["sources"][0]["id"]
+        .as_str()
+        .expect("generated source ID")
+        .to_owned();
+    let cache = home.join(".skill-manager").join("cache").join(id);
+    let content = cache.join("content").join(skill);
+    fs::create_dir_all(&content).expect("create cached skill directory");
+    fs::write(content.join("SKILL.md"), body).expect("write cached skill");
+    fs::write(
+        cache.join("metadata.json"),
+        serde_json::json!({
+            "fetched_at": chrono::Utc::now().to_rfc3339(),
+            "resolved_ref": "main",
+            "owner": "acme",
+            "repo": "skills",
+            "ref": null,
+            "repo_path": null
+        })
+        .to_string(),
+    )
+    .expect("write cache metadata");
+}
+
+/// A single changed deployment is adopted as the new source content in full.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "One end-to-end import contract keeps the idle, dry-run, and committed phases auditable together."
+)]
+fn import_mirrors_one_changed_deployment_and_dry_runs_change_nothing() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    let skill = create_skill(&source, "alpha", "# Alpha\nline two\n");
+    fs::create_dir_all(skill.join("reference")).expect("create source reference directory");
+    fs::write(skill.join("reference/stale.md"), "stale\n").expect("write stale reference");
+
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 path"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args(["--json", "load", "--claude", "--global", "--no-input"])
+        .assert()
+        .success();
+
+    let idle = json_events(
+        cli(home.path())
+            .args([
+                "--json",
+                "import",
+                "alpha",
+                "--claude",
+                "--global",
+                "--yes",
+                "--no-input",
+            ])
+            .output()
+            .expect("run idle import"),
+    );
+    assert_eq!(events_of(&idle, "skill.import-skipped").len(), 1);
+    assert!(events_of(&idle, "skill.imported").is_empty());
+    let summary = events_of(&idle, "summary")[0]["data"].clone();
+    assert_eq!(summary["action"], "import");
+    assert_eq!(summary["imported"], 0);
+    assert_eq!(summary["skipped"], 1);
+
+    let deployed = home.path().join(".claude/skills/alpha");
+    fs::write(
+        deployed.join("SKILL.md"),
+        "# Alpha\nline two edited\nline three\n",
+    )
+    .expect("agent edits the deployed skill");
+    fs::remove_file(deployed.join("reference/stale.md")).expect("agent deletes a reference");
+    fs::write(deployed.join("reference/new.md"), "fresh\n").expect("agent adds a reference");
+
+    let config_before = fs::read(home.path().join(".skill-manager/config.json"))
+        .expect("read configuration before dry run");
+    let planned = json_events(
+        cli(home.path())
+            .args([
+                "--json",
+                "import",
+                "alpha",
+                "--claude",
+                "--global",
+                "--yes",
+                "--no-input",
+                "--dry-run",
+            ])
+            .output()
+            .expect("run dry-run import"),
+    );
+    let plan = events_of(&planned, "skill.import-planned");
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan[0]["data"]["dry_run"], true);
+    assert_eq!(plan[0]["data"]["files_changed"], 3);
+    assert_eq!(plan[0]["data"]["target"], "claude");
+    assert_eq!(plan[0]["data"]["scope"], "global");
+    assert_eq!(
+        events_of(&planned, "skill.imported")[0]["data"]["dry_run"],
+        true
+    );
+    assert_eq!(
+        fs::read_to_string(skill.join("SKILL.md")).expect("source is untouched by a dry run"),
+        "# Alpha\nline two\n"
+    );
+    assert!(skill.join("reference/stale.md").is_file());
+    assert!(!skill.join("reference/new.md").exists());
+    assert_eq!(
+        fs::read(home.path().join(".skill-manager/config.json"))
+            .expect("read configuration after dry run"),
+        config_before
+    );
+
+    let committed = json_events(
+        cli(home.path())
+            .args([
+                "--json",
+                "import",
+                "alpha",
+                "--claude",
+                "--global",
+                "--yes",
+                "--no-input",
+            ])
+            .output()
+            .expect("run committed import"),
+    );
+    let imported = events_of(&committed, "skill.imported");
+    assert_eq!(imported.len(), 1);
+    assert_eq!(imported[0]["data"]["action"], "imported");
+    assert_eq!(imported[0]["data"]["dry_run"], false);
+    assert_eq!(
+        fs::read_to_string(skill.join("SKILL.md")).expect("imported source content"),
+        "# Alpha\nline two edited\nline three\n"
+    );
+    assert_eq!(
+        fs::read_to_string(skill.join("reference/new.md")).expect("imported new reference"),
+        "fresh\n"
+    );
+    assert!(
+        !skill.join("reference/stale.md").exists(),
+        "import must mirror deletions into the source"
+    );
+    assert!(!source.join(".skill-manager-journals").exists());
+    assert!(!source.join(".skill-manager-staging").exists());
+
+    cli(home.path())
+        .args([
+            "--json",
+            "import",
+            "alpha",
+            "--claude",
+            "--global",
+            "--yes",
+            "--no-input",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"event\":\"skill.import-skipped\"",
+        ));
+}
+
+/// Import renders a reviewable plain-text plan and accepts recipe invocation.
+#[test]
+fn import_renders_a_plain_plan_and_runs_from_a_recipe() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    let skill = create_skill(&source, "alpha", "# Alpha\n");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 path"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args(["--json", "load", "--claude", "--global", "--no-input"])
+        .assert()
+        .success();
+    let deployed = home.path().join(".claude/skills/alpha");
+    fs::write(deployed.join("SKILL.md"), "# Alpha\nsecond line\n").expect("agent edit");
+    fs::write(deployed.join("logo.bin"), [0_u8, 1, 2, 3]).expect("agent adds binary content");
+
+    let output = cli(home.path())
+        .args([
+            "import",
+            "alpha",
+            "--claude",
+            "--global",
+            "--no-input",
+            "--dry-run",
+        ])
+        .output()
+        .expect("run human dry-run import");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 plan");
+    assert!(stdout.contains("Import plan for alpha:"));
+    assert!(stdout.contains("from  claude (global)"));
+    assert!(stdout.contains("to    primary (source)"));
+    assert!(stdout.contains("action  skill  target           change"));
+    assert!(stdout.contains("import  alpha  claude (global)"));
+    assert!(stdout.contains("modified  SKILL.md"));
+    assert!(stdout.contains("added     logo.bin"));
+    assert!(stdout.contains("bin +4 bytes"));
+    assert!(stdout.contains("2 files changed, +1/-0, 1 binary"));
+    assert!(!stdout.contains('\u{1b}'), "plain output must be ANSI-free");
+    assert!(!stdout.contains('\u{2190}'), "plain output uses words");
+
+    let recipe = serde_json::json!({
+        "command": "import",
+        "skill": "alpha",
+        "claude": true,
+        "global": true,
+        "yes": true
+    });
+    cli(home.path())
+        .args(["--json-input"])
+        .write_stdin(recipe.to_string())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"event\":\"skill.imported\""))
+        .stdout(predicate::str::contains("\"action\":\"import\""));
+    assert_eq!(
+        fs::read_to_string(skill.join("SKILL.md")).expect("recipe import applied"),
+        "# Alpha\nsecond line\n"
+    );
+    assert!(skill.join("logo.bin").is_file());
+}
+
+/// Several changed deployments require selection, which recipes cannot supply.
+#[test]
+fn import_requires_narrowing_when_several_deployments_changed() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    let skill = create_skill(&source, "alpha", "# Alpha\n");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 path"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args([
+            "--json",
+            "load",
+            "--claude",
+            "--shared",
+            "--global",
+            "--no-input",
+        ])
+        .assert()
+        .success();
+    fs::write(
+        home.path().join(".claude/skills/alpha/SKILL.md"),
+        "# Alpha claude\n",
+    )
+    .expect("edit claude copy");
+    fs::write(
+        home.path().join(".agents/skills/alpha/SKILL.md"),
+        "# Alpha shared\n",
+    )
+    .expect("edit shared copy");
+
+    cli(home.path())
+        .args([
+            "--json", "import", "alpha", "--claude", "--shared", "--global", "--yes",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "2 changed deployments of alpha are importable",
+        ));
+    cli(home.path())
+        .args(["--json", "import", "alph*", "--claude", "--global", "--yes"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("does not accept patterns"));
+    cli(home.path())
+        .args([
+            "--json", "import", "missing", "--claude", "--global", "--yes",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("source skill"));
+    assert_eq!(
+        fs::read_to_string(skill.join("SKILL.md")).expect("source is untouched"),
+        "# Alpha\n"
+    );
+
+    cli(home.path())
+        .args(["import", "alpha", "--claude", "--shared", "--global"])
+        .write_stdin("2\ny\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Choose the alpha copy to import"))
+        .stderr(predicate::str::contains("shared (global)"));
+    assert_eq!(
+        fs::read_to_string(skill.join("SKILL.md")).expect("selected copy is imported"),
+        "# Alpha shared\n"
+    );
+
+    cli(home.path())
+        .args(["import", "alpha", "--claude", "--global"])
+        .write_stdin("n\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Cancelled."));
+    assert_eq!(
+        fs::read_to_string(skill.join("SKILL.md")).expect("declined import changes nothing"),
+        "# Alpha shared\n"
+    );
+}
+
+/// GitHub-backed sources import only into a confirmed local alternate location.
+#[test]
+fn import_into_a_github_source_requires_a_confirmed_local_alternate() {
+    let home = sandbox();
+    cli(home.path())
+        .args(["--json", "source", "add", "acme/skills", "remote"])
+        .assert()
+        .success();
+    seed_github_cache(home.path(), "alpha", "# Alpha remote\n");
+    cli(home.path())
+        .args(["--json", "load", "--claude", "--global", "--no-input"])
+        .assert()
+        .success();
+    let idle = cli(home.path())
+        .args(["import", "alpha", "--claude", "--global", "--yes"])
+        .output()
+        .expect("run idle import against a GitHub source");
+    assert!(idle.status.success());
+    let idle_stdout = String::from_utf8(idle.stdout).expect("utf8 idle output");
+    let idle_stderr = String::from_utf8(idle.stderr).expect("utf8 idle diagnostics");
+    assert!(idle_stdout.contains("Nothing to import"));
+    assert!(
+        !idle_stdout.contains("GitHub-backed") && !idle_stderr.contains("GitHub-backed"),
+        "an up-to-date GitHub source must not ask about a destination it will not write"
+    );
+
+    fs::write(
+        home.path().join(".claude/skills/alpha/SKILL.md"),
+        "# Alpha remote\nagent addition\n",
+    )
+    .expect("agent edits the deployed remote skill");
+
+    cli(home.path())
+        .args(["--json", "import", "alpha", "--claude", "--global", "--yes"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "import writes to local source checkouts only",
+        ))
+        .stdout(predicate::str::contains("source alternate remote"));
+
+    let checkout = home.path().join("checkout");
+    fs::create_dir_all(&checkout).expect("create local alternate checkout");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "alternate",
+            "remote",
+            checkout.to_str().expect("utf8 path"),
+        ])
+        .assert()
+        .success();
+
+    cli(home.path())
+        .args(["--json", "import", "alpha", "--claude", "--global", "--yes"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "requires interactive confirmation",
+        ));
+    assert!(!checkout.join("alpha").exists());
+
+    cli(home.path())
+        .args(["import", "alpha", "--claude", "--global", "--yes"])
+        .write_stdin("n\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Cancelled."))
+        .stderr(predicate::str::contains("is GitHub-backed (acme/skills)"));
+    assert!(!checkout.join("alpha").exists());
+
+    cli(home.path())
+        .args(["import", "alpha", "--claude", "--global", "--yes"])
+        .write_stdin("y\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Imported alpha"));
+    assert_eq!(
+        fs::read_to_string(checkout.join("alpha/SKILL.md")).expect("alternate receives the import"),
+        "# Alpha remote\nagent addition\n"
+    );
+}
+
+/// Displayed and reported source paths never leak Windows verbatim prefixes.
+#[test]
+fn import_paths_are_reported_without_verbatim_prefixes() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "alpha", "# Alpha\n");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 path"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args(["--json", "load", "--claude", "--global", "--no-input"])
+        .assert()
+        .success();
+    fs::write(
+        home.path().join(".claude/skills/alpha/SKILL.md"),
+        "# Alpha\nedited\n",
+    )
+    .expect("agent edit");
+
+    let expected = portable_canonicalize(source.join("alpha")).expect("canonical source skill");
+    let human = cli(home.path())
+        .args([
+            "import",
+            "alpha",
+            "--claude",
+            "--global",
+            "--yes",
+            "--no-input",
+        ])
+        .output()
+        .expect("run human import");
+    assert!(human.status.success());
+    let stdout = String::from_utf8(human.stdout).expect("utf8 import output");
+    assert!(stdout.contains("Imported alpha"));
+    assert!(
+        !stdout.contains(VERBATIM_PREFIX),
+        "human paths must not use verbatim spellings: {stdout}"
+    );
+    assert!(stdout.contains(&expected.display().to_string()));
+
+    fs::write(
+        home.path().join(".claude/skills/alpha/SKILL.md"),
+        "# Alpha\nedited twice\n",
+    )
+    .expect("agent edit again");
+    let events = json_events(
+        cli(home.path())
+            .args(["--json", "import", "alpha", "--claude", "--global", "--yes"])
+            .output()
+            .expect("run machine import"),
+    );
+    let destination = events_of(&events, "skill.imported")[0]["data"]["destination"]
+        .as_str()
+        .expect("reported destination path")
+        .to_owned();
+    assert!(!destination.contains(VERBATIM_PREFIX), "{destination}");
+    assert_eq!(PathBuf::from(destination), expected);
+}
+
+/// Update displays its plan first and only then asks for one confirmation.
+#[test]
+fn update_confirms_a_rendered_plan_before_deploying() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    let alpha = create_skill(&source, "alpha", "# Alpha\n");
+    create_skill(&source, "beta", "# Beta\n");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 path"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args(["--json", "load", "--claude", "--global", "--no-input"])
+        .assert()
+        .success();
+    let deployed = home.path().join(".claude/skills/alpha/SKILL.md");
+    fs::write(alpha.join("SKILL.md"), "# Alpha\nsecond line\n").expect("edit source skill");
+
+    cli(home.path())
+        .args(["update", "--claude", "--global"])
+        .write_stdin("n\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Update plan:"))
+        .stdout(predicate::str::contains("action  skill  target"))
+        .stdout(predicate::str::contains("update  alpha  claude (global)"))
+        .stdout(predicate::str::contains("skip    beta   claude (global)"))
+        .stdout(predicate::str::contains("1 to update, 1 unchanged"))
+        .stdout(predicate::str::contains("Cancelled."))
+        .stderr(predicate::str::contains("Apply this update plan?"));
+    assert_eq!(
+        fs::read_to_string(&deployed).expect("declined update deploys nothing"),
+        "# Alpha\n"
+    );
+
+    let accepted = cli(home.path())
+        .args(["update", "--claude", "--global"])
+        .write_stdin("y\n")
+        .output()
+        .expect("run accepted update");
+    assert!(accepted.status.success());
+    let stdout = String::from_utf8(accepted.stdout).expect("utf8 update output");
+    assert!(stdout.contains("Update plan:"));
+    assert!(stdout.contains("Updated alpha -> claude (global)"));
+    assert!(!stdout.contains('\u{1b}'), "plain output must be ANSI-free");
+    assert_eq!(
+        fs::read_to_string(&deployed).expect("accepted update deploys"),
+        "# Alpha\nsecond line\n"
+    );
+
+    fs::write(alpha.join("SKILL.md"), "# Alpha\nthird line\n").expect("edit source skill again");
+    let confirmed = cli(home.path())
+        .args(["update", "--claude", "--global", "--yes"])
+        .output()
+        .expect("run preconfirmed update");
+    assert!(confirmed.status.success());
+    assert!(
+        String::from_utf8(confirmed.stdout)
+            .expect("utf8 update output")
+            .contains("Update plan:")
+    );
+    assert!(
+        !String::from_utf8(confirmed.stderr)
+            .expect("utf8 update diagnostics")
+            .contains("Apply this update plan?"),
+        "--yes must skip the confirmation while still printing the plan"
+    );
+    assert_eq!(
+        fs::read_to_string(&deployed).expect("preconfirmed update deploys"),
+        "# Alpha\nthird line\n"
+    );
+
+    fs::write(alpha.join("SKILL.md"), "# Alpha\nfourth line\n").expect("edit source once more");
+    let machine = cli(home.path())
+        .args(["--json", "update", "--claude", "--global"])
+        .output()
+        .expect("run machine update");
+    let events = json_events(machine);
+    assert_eq!(events_of(&events, "skill.updated").len(), 1);
+    assert_eq!(events_of(&events, "skill.skipped").len(), 1);
+    let summary = events_of(&events, "summary")[0]["data"].clone();
+    assert_eq!(summary["action"], "update");
+    assert_eq!(summary["changed"], 1);
+    assert_eq!(summary["skipped"], 1);
+    assert_eq!(
+        fs::read_to_string(&deployed).expect("machine update deploys without prompting"),
+        "# Alpha\nfourth line\n"
     );
 }

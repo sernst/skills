@@ -416,16 +416,19 @@ fn styled_state(text: &str, state: SkillState, color: bool) -> String {
     )
 }
 
-fn padded(value: &str, width: usize) -> String {
+/// Pad a cell to a display width shared with other plan/status renderers.
+pub(crate) fn padded(value: &str, width: usize) -> String {
     let padding = width.saturating_sub(display_width(value));
     format!("{value}{}", " ".repeat(padding))
 }
 
-fn join_columns(columns: &[String]) -> String {
+/// Join rendered cells with the shared column gap.
+pub(crate) fn join_columns(columns: &[String]) -> String {
     columns.join(COLUMN_GAP).trim_end().into()
 }
 
-fn separator(widths: &[usize]) -> String {
+/// Render the dashed header separator for a set of column widths.
+pub(crate) fn separator(widths: &[usize]) -> String {
     join_columns(
         &widths
             .iter()
@@ -434,7 +437,8 @@ fn separator(widths: &[usize]) -> String {
     )
 }
 
-fn display_width(value: &str) -> usize {
+/// Measure the terminal display width of a cell.
+pub(crate) fn display_width(value: &str) -> usize {
     UnicodeWidthStr::width(value)
 }
 

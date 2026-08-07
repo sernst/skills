@@ -58,9 +58,12 @@ pub enum ColorChoice {
 #[derive(Clone, Debug, Subcommand)]
 pub enum Command {
     /// Deploy source skills, replacing existing deployments.
+    #[command(visible_alias = "install")]
     Load(SyncArgs),
     /// Refresh only skills already deployed.
-    Update(SyncArgs),
+    Update(UpdateArgs),
+    /// Adopt a deployed skill copy as the new source content.
+    Import(ImportArgs),
     /// Copy source skills into an arbitrary destination.
     Copy(CopyArgs),
     /// Remove deployed skills.
@@ -178,6 +181,40 @@ pub struct SyncArgs {
     /// Force remote cache refresh.
     #[arg(long)]
     pub refresh: bool,
+}
+
+/// Arguments for `update`.
+///
+/// `update` shows a change plan before deploying anything, so it accepts one
+/// confirmation flag that `load` deliberately does not.
+#[derive(Clone, Debug, Default, Args)]
+pub struct UpdateArgs {
+    /// Discovery, target, and scope selection shared with `load`.
+    #[command(flatten)]
+    pub sync: SyncArgs,
+    /// Skip the update confirmation; the plan is still displayed.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+}
+
+/// Arguments for `import`.
+#[derive(Clone, Debug, Default, Args)]
+pub struct ImportArgs {
+    /// Exactly one deployed skill name; patterns are not accepted.
+    #[arg(value_name = "SKILL")]
+    pub skill: String,
+    /// Target selection narrowing the scanned deployments.
+    #[command(flatten)]
+    pub targets: TargetSelection,
+    /// Installation scope narrowing the scanned deployments.
+    #[command(flatten)]
+    pub scope: ScopeSelection,
+    /// Plan without changing the source.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Skip the destructive source-overwrite confirmation.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 /// Arguments for `copy`.
@@ -518,7 +555,8 @@ mod tests {
             let cli = Cli::try_parse_from(["skill-manager", command, flag])
                 .unwrap_or_else(|error| unreachable!("{error}"));
             let selection = match cli.command {
-                Some(Command::Load(args) | Command::Update(args)) => args.scope,
+                Some(Command::Load(args)) => args.scope,
+                Some(Command::Update(args)) => args.sync.scope,
                 Some(Command::Remove(args)) => args.scope,
                 Some(Command::Status(args)) => args.scope,
                 _ => unreachable!("expected scoped command"),

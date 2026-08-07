@@ -24,6 +24,68 @@ Windows, macOS, and Linux, use
 [`install.skill-manager.md`](./install.skill-manager.md). The release archive
 also includes shell completions and a man page.
 
+### Install from the terminal
+
+Each snippet resolves the latest release, downloads the archive for your CPU,
+extracts just the `skill-manager` binary into the current directory, and
+removes the download. They skip `SHA256SUMS` verification for brevity; use
+`install.skill-manager.md` above for the fully verified procedure.
+
+Windows (PowerShell):
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$repo  = 'sernst/skills'
+$tag   = (Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest").tag_name
+$arch  = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+$asset = "skill-manager-$tag-$arch-pc-windows-msvc.zip"
+$tmp   = Join-Path $env:TEMP "skill-manager-$tag"
+New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+Invoke-WebRequest "https://github.com/$repo/releases/download/$tag/$asset" `
+  -OutFile (Join-Path $tmp $asset)
+Expand-Archive -Path (Join-Path $tmp $asset) -DestinationPath $tmp -Force
+Get-ChildItem -Path $tmp -Recurse -Filter 'skill-manager.exe' |
+  Select-Object -First 1 | Move-Item -Destination . -Force
+Remove-Item -Recurse -Force $tmp
+```
+
+macOS (bash):
+
+```bash
+set -euo pipefail
+repo="sernst/skills"
+tag=$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" \
+  | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+arch=$(uname -m)
+if [ "$arch" = "arm64" ]; then arch=aarch64; else arch=x86_64; fi
+asset="skill-manager-$tag-$arch-apple-darwin.tar.gz"
+tmp=$(mktemp -d)
+curl -fsSL -o "$tmp/$asset" "https://github.com/$repo/releases/download/$tag/$asset"
+tar -xzf "$tmp/$asset" -C "$tmp"
+mv "$tmp"/*/skill-manager .
+rm -rf "$tmp"
+```
+
+Linux (bash, static musl build):
+
+```bash
+set -euo pipefail
+repo="sernst/skills"
+tag=$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" \
+  | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+arch=$(uname -m)
+if [ "$arch" = "aarch64" ]; then arch=aarch64; else arch=x86_64; fi
+asset="skill-manager-$tag-$arch-unknown-linux-musl.tar.gz"
+tmp=$(mktemp -d)
+curl -fsSL -o "$tmp/$asset" "https://github.com/$repo/releases/download/$tag/$asset"
+tar -xzf "$tmp/$asset" -C "$tmp"
+mv "$tmp"/*/skill-manager .
+rm -rf "$tmp"
+```
+
+Run `./skill-manager --version` (or `.\skill-manager.exe --version` on
+Windows) to confirm it landed, then move the binary onto `PATH`.
+
 ## Five-minute quick start
 
 The repository hosts its own skills below `skills/`, so it is also a useful

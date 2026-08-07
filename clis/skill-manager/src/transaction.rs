@@ -62,8 +62,53 @@ pub fn deploy_skill<H: TransactionHook>(
     cache_root: &Path,
     hook: &H,
 ) -> Result<PathBuf> {
-    validate_skill_tree(source)?;
     let name = skill_name(source)?;
+    replace_directory(source, &target_root.join(name), cache_root, hook)
+}
+
+/// Transactionally replace one source skill directory with a deployed copy.
+///
+/// This is the reverse of [`deploy_skill`]: the destination is named
+/// explicitly, so a source checkout whose directory name differs from the
+/// deployed directory name is still replaced in place.
+///
+/// # Errors
+///
+/// Returns an error for unsafe source data, an unusable destination, lock
+/// contention, injected failure, or I/O.
+pub fn import_skill<H: TransactionHook>(
+    deployment: &Path,
+    destination: &Path,
+    cache_root: &Path,
+    hook: &H,
+) -> Result<PathBuf> {
+    replace_directory(deployment, destination, cache_root, hook)
+}
+
+fn replace_directory<H: TransactionHook>(
+    source: &Path,
+    destination: &Path,
+    cache_root: &Path,
+    hook: &H,
+) -> Result<PathBuf> {
+    validate_skill_tree(source)?;
+    let target_root = destination.parent().ok_or_else(|| {
+        SkillManagerError::InvalidInput(format!(
+            "replacement destination has no parent directory: {}",
+            destination.display()
+        ))
+    })?;
+    let name = destination
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            SkillManagerError::InvalidInput(format!(
+                "replacement destination is not a portable name: {}",
+                destination.display()
+            ))
+        })?
+        .to_owned();
+    validate_skill_name(&name)?;
     fs::create_dir_all(target_root).map_err(|error| SkillManagerError::io(target_root, error))?;
     let paths = transaction_paths(target_root, cache_root, &name);
     let _lock = acquire_lock(
@@ -84,13 +129,12 @@ pub fn deploy_skill<H: TransactionHook>(
     copy_tree(source, &staged_content)?;
     validate_skill_tree(&staged_content)?;
 
-    let destination = target_root.join(&name);
     if let Some(parent) = paths.backup.parent() {
         fs::create_dir_all(parent).map_err(|error| SkillManagerError::io(parent, error))?;
     }
     let mut journal = Journal {
         state: TransactionState::Prepared,
-        destination: destination.clone(),
+        destination: destination.to_path_buf(),
         stage: Some(staged_content.clone()),
         backup: paths.backup.clone(),
     };
@@ -98,15 +142,15 @@ pub fn deploy_skill<H: TransactionHook>(
     hook.after_state(TransactionState::Prepared)?;
 
     if destination.exists() {
-        fs::rename(&destination, &paths.backup)
-            .map_err(|error| SkillManagerError::io(&destination, error))?;
+        fs::rename(destination, &paths.backup)
+            .map_err(|error| SkillManagerError::io(destination, error))?;
         journal.state = TransactionState::OldMoved;
         write_journal(&paths.journal, &journal)?;
         hook.after_state(TransactionState::OldMoved)?;
     }
-    if let Err(error) = fs::rename(&staged_content, &destination) {
+    if let Err(error) = fs::rename(&staged_content, destination) {
         if paths.backup.exists() && !destination.exists() {
-            let _rollback = fs::rename(&paths.backup, &destination);
+            let _rollback = fs::rename(&paths.backup, destination);
         }
         return Err(SkillManagerError::io(&staged_content, error));
     }
@@ -115,9 +159,11 @@ pub fn deploy_skill<H: TransactionHook>(
     write_journal(&paths.journal, &journal)?;
     hook.after_state(TransactionState::Committed)?;
     cleanup_committed(&paths.journal, &paths.backup)?;
+    drop(staging);
     cleanup_empty_dir(&staging_parent);
     cleanup_empty_parent(&paths.backup);
-    Ok(destination)
+    cleanup_empty_parent(&paths.journal);
+    Ok(destination.to_path_buf())
 }
 
 /// Transactionally remove one deployed skill.
@@ -167,6 +213,7 @@ pub fn remove_skill<H: TransactionHook>(
     hook.after_state(TransactionState::Committed)?;
     cleanup_committed(&paths.journal, &paths.backup)?;
     cleanup_empty_parent(&paths.backup);
+    cleanup_empty_parent(&paths.journal);
     Ok(true)
 }
 
@@ -388,7 +435,7 @@ mod tests {
 
     use super::{
         Journal, NoopTransactionHook, TransactionHook, TransactionState, deploy_skill,
-        recover_journal, remove_skill, transaction_paths, write_journal,
+        import_skill, recover_journal, remove_skill, transaction_paths, write_journal,
     };
     use crate::error::{Result, SkillManagerError};
 
@@ -696,6 +743,56 @@ mod tests {
                     stage: None,
                     backup: target.join("backup"),
                 }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn import_mirrors_a_deployment_into_an_explicitly_named_destination() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let cache = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let deployment = root.path().join("target").join("demo");
+        std::fs::create_dir_all(deployment.join("reference"))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        std::fs::write(deployment.join("SKILL.md"), "agent edited")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        std::fs::write(deployment.join("reference").join("new.md"), "added")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+
+        let destination = root.path().join("source").join("Demo");
+        std::fs::create_dir_all(&destination).unwrap_or_else(|error| unreachable!("{error}"));
+        std::fs::write(destination.join("SKILL.md"), "original")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        std::fs::write(destination.join("stale.md"), "removed upstream")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+
+        let imported = import_skill(
+            &deployment,
+            &destination,
+            cache.path(),
+            &NoopTransactionHook,
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(imported, destination);
+        assert_eq!(
+            std::fs::read_to_string(destination.join("SKILL.md"))
+                .unwrap_or_else(|error| unreachable!("{error}")),
+            "agent edited"
+        );
+        assert!(destination.join("reference").join("new.md").is_file());
+        assert!(!destination.join("stale.md").exists());
+        let source_root = root.path().join("source");
+        assert!(!source_root.join(".skill-manager-journals").exists());
+        assert!(!source_root.join(".skill-manager-staging").exists());
+        assert!(!source_root.join(".skill-manager-backups").exists());
+
+        assert!(
+            import_skill(
+                &deployment,
+                std::path::Path::new(""),
+                cache.path(),
+                &NoopTransactionHook
             )
             .is_err()
         );

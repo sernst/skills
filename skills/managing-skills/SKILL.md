@@ -1,6 +1,6 @@
 ---
 name: managing-skills
-description: Manage reusable agent skills with the installed skill-manager CLI. Use when a user asks an agent to find, list, inspect, install, load, update, copy, remove, or resolve skills; manage skill sources or deployment targets; view, reset, or restore skill-manager configuration; check global or project deployment status; or generate CLI completions or a man page.
+description: Manage reusable agent skills with the installed skill-manager CLI. Use when a user asks an agent to find, list, inspect, install, load, update, import, copy, remove, or resolve skills; manage skill sources or deployment targets; view, reset, or restore skill-manager configuration; check global or project deployment status; or generate CLI completions or a man page.
 ---
 
 # Manage skills
@@ -40,7 +40,10 @@ known temporary file afterward. Use inline `--json=OBJECT` only when quoting is
 demonstrably safe.
 
 Treat every recipe invocation as non-interactive. A committed `load` or
-`update` must explicitly select at least one target. `all_targets:true` selects
+`update` must explicitly select at least one target. A committed `import`
+requires `yes:true`, must name exactly one skill, and must narrow target and
+scope selection whenever more than one deployment differs from its source;
+a GitHub-backed source cannot be imported non-interactively at all. `all_targets:true` selects
 enabled configured targets only; select a disabled target explicitly by name
 when the user intends that override. A machine `source.add` must include a
 nonblank `name`. Supply an explicit scope whenever required. Never answer
@@ -60,14 +63,14 @@ remains blocking; never ignore an exit code by itself.
 
 ## Apply the safety policy
 
-- Dry-run `load`, `update`, `copy`, and `remove` first. Explain that startup
+- Dry-run `load`, `update`, `import`, `copy`, and `remove` first. Explain that startup
   layout migration and necessary remote-cache refreshes can still alter
   manager-owned state during a dry run.
 - After a clean dry run, execute a clear `load`, `update`, or `copy` request
   without asking again.
-- Before `remove`, `source.remove`, `target.remove`, `target.disable`,
-  `target.set-path`, `configs.reset`, or `configs.restore`, show the exact
-  selected effects and obtain a second explicit confirmation. Then set
+- Before `import`, `remove`, `source.remove`, `target.remove`,
+  `target.disable`, `target.set-path`, `configs.reset`, or `configs.restore`,
+  show the exact selected effects and obtain a second explicit confirmation. Then set
   `yes:true` where supported. Never treat the user's initial request as that
   second confirmation.
 - A clear request may execute `source.add`, `source.update`, `source.locate`,

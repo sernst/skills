@@ -8,10 +8,10 @@ use serde_json::{Map, Value};
 
 use crate::cli::{
     Cli, Command, ConfigsAction, ConfigsArgs, ConfigsConfirmArgs, ConfigsRestoreArgs, CopyArgs,
-    RemoveArgs, ResolveArgs, ScopeSelection, SourceAction, SourceAddArgs, SourceAlternateArgs,
-    SourceArgs, SourceLocateArgs, SourceModeArg, SourceRemoveArgs, SourceSelection, SourceSwapArgs,
-    SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction, TargetArgs, TargetNameArgs,
-    TargetPathArgs, TargetSelection,
+    ImportArgs, RemoveArgs, ResolveArgs, ScopeSelection, SourceAction, SourceAddArgs,
+    SourceAlternateArgs, SourceArgs, SourceLocateArgs, SourceModeArg, SourceRemoveArgs,
+    SourceSelection, SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction,
+    TargetArgs, TargetNameArgs, TargetPathArgs, TargetSelection, UpdateArgs,
 };
 use crate::error::{Result, SkillManagerError};
 use crate::skills::is_fnmatch_operand;
@@ -93,7 +93,9 @@ pub fn apply_recipe(cli: &mut Cli) -> Result<()> {
 
 fn overlay_command(command: &mut Command, object: &Map<String, Value>, base: &Path) -> Result<()> {
     match command {
-        Command::Load(args) | Command::Update(args) => overlay_sync(args, object, base),
+        Command::Load(args) => overlay_sync(args, object, base),
+        Command::Update(args) => overlay_update(args, object, base),
+        Command::Import(args) => overlay_import(args, object),
         Command::Copy(args) => overlay_copy(args, object, base),
         Command::Remove(args) => overlay_remove(args, object, base),
         Command::Status(args) => overlay_status(args, object),
@@ -134,6 +136,70 @@ fn overlay_sync(args: &mut SyncArgs, object: &Map<String, Value>, _base: &Path) 
             "project",
         ],
     )?;
+    overlay_sync_fields(args, object)
+}
+
+fn overlay_update(args: &mut UpdateArgs, object: &Map<String, Value>, _base: &Path) -> Result<()> {
+    reject_unknown(
+        object,
+        &[
+            "command",
+            "no_input",
+            "source",
+            "sources",
+            "filter",
+            "filters",
+            "claude",
+            "shared",
+            "antigravity",
+            "all",
+            "all_targets",
+            "target",
+            "targets",
+            "cd",
+            "cd_only",
+            "no_cd",
+            "dry_run",
+            "refresh",
+            "global",
+            "project",
+            "yes",
+        ],
+    )?;
+    overlay_sync_fields(&mut args.sync, object)?;
+    overlay_bool(&mut args.yes, object.get("yes"))
+}
+
+fn overlay_import(args: &mut ImportArgs, object: &Map<String, Value>) -> Result<()> {
+    reject_unknown(
+        object,
+        &[
+            "command",
+            "no_input",
+            "skill",
+            "claude",
+            "shared",
+            "antigravity",
+            "all",
+            "all_targets",
+            "target",
+            "targets",
+            "dry_run",
+            "global",
+            "project",
+            "yes",
+        ],
+    )?;
+    if args.skill.is_empty() {
+        args.skill = first_string(object, &["skill"])?.unwrap_or_default();
+    }
+    overlay_target_selection(&mut args.targets, object)?;
+    overlay_scope_selection(&mut args.scope, object)?;
+    overlay_bool(&mut args.dry_run, object.get("dry_run"))?;
+    overlay_bool(&mut args.yes, object.get("yes"))
+}
+
+fn overlay_sync_fields(args: &mut SyncArgs, object: &Map<String, Value>) -> Result<()> {
     overlay_strings(&mut args.sources, object, &["sources", "source"])?;
     overlay_strings(&mut args.filters, object, &["filters", "filter"])?;
     overlay_source_selection(&mut args.source_selection, object)?;
@@ -628,6 +694,7 @@ fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Load(_) => "load",
         Command::Update(_) => "update",
+        Command::Import(_) => "import",
         Command::Copy(_) => "copy",
         Command::Remove(_) => "remove",
         Command::Status(_) => "status",
@@ -661,8 +728,9 @@ fn command_name(command: &Command) -> &'static str {
 
 fn canonical_command(value: &str) -> Result<&'static str> {
     match value {
-        "load" => Ok("load"),
+        "load" | "install" => Ok("load"),
         "update" => Ok("update"),
+        "import" => Ok("import"),
         "copy" => Ok("copy"),
         "remove" => Ok("remove"),
         "status" | "ls" | "list" => Ok("status"),
@@ -692,7 +760,8 @@ fn canonical_command(value: &str) -> Result<&'static str> {
 fn default_command(name: &str) -> Result<Command> {
     match name {
         "load" => Ok(Command::Load(SyncArgs::default())),
-        "update" => Ok(Command::Update(SyncArgs::default())),
+        "update" => Ok(Command::Update(UpdateArgs::default())),
+        "import" => Ok(Command::Import(ImportArgs::default())),
         "remove" => Ok(Command::Remove(RemoveArgs::default())),
         "status" => Ok(Command::Status(StatusArgs::default())),
         "resolve" => Ok(Command::Resolve(ResolveArgs::default())),
@@ -740,6 +809,7 @@ fn default_command(name: &str) -> Result<Command> {
 
 fn validate_required(command: &Command) -> Result<()> {
     let missing = match command {
+        Command::Import(args) if args.skill.is_empty() => Some("import.skill"),
         Command::Copy(args) if args.source.is_empty() => Some("copy.source"),
         Command::Copy(args) if args.destination.as_os_str().is_empty() => Some("copy.destination"),
         Command::Source(SourceArgs {

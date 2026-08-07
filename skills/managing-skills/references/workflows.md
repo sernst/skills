@@ -7,6 +7,7 @@ is a separate `skill-manager --json-input` invocation.
 
 - [Discover and inspect](#discover-and-inspect)
 - [Install or update skills](#install-or-update-skills)
+- [Import a modified deployment](#import-a-modified-deployment)
 - [Remove skills](#remove-skills)
 - [Manage sources](#manage-sources)
 - [Manage targets](#manage-targets)
@@ -68,6 +69,27 @@ unscoped update can infer every existing placement:
 ```
 
 Never turn an update request into a load of a new deployment.
+
+## Import a modified deployment
+
+Use `import` when the user edited a deployed skill in place and wants that copy
+to become the canonical source content. It overwrites the source in full, so
+dry-run first, show the reported file and line deltas, and obtain an explicit
+second confirmation before the committed call:
+
+```json
+{"command":"status","filters":["example"]}
+{"command":"import","skill":"example","claude":true,"global":true,"dry_run":true}
+{"command":"import","skill":"example","claude":true,"global":true,"yes":true}
+```
+
+Read `files_changed`, `insertions`, `deletions`, `deployment`, and `destination`
+from `skill.import-planned` when reporting the plan. `skill.import-skipped`
+means every selected deployment already matches the source, which is a clean
+success. An `InteractionRequired` failure means either several deployments
+differ—narrow with target and scope fields—or the source is GitHub-backed, which
+only a human-interactive terminal run can import into a local alternate
+location.
 
 ## Remove skills
 

@@ -33,7 +33,7 @@ fn version_is_available_without_configuration() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.1.0"));
+        .stdout(predicate::str::contains("0.1.1"));
 }
 
 /// Parser misuse follows Clap's conventional usage exit code and stderr stream.
@@ -58,6 +58,49 @@ fn status_aliases_are_accepted() {
             .success()
             .stdout(predicate::str::contains("--target"));
     }
+}
+
+/// `install` is a visible alias for `load` and shares its whole option surface.
+#[test]
+fn load_install_alias_is_accepted() {
+    for alias in ["load", "install"] {
+        let mut command = Command::cargo_bin("skill-manager").expect("test binary");
+        command
+            .args([alias, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--target"))
+            .stdout(predicate::str::contains("--dry-run"));
+    }
+    let mut listed = Command::cargo_bin("skill-manager").expect("test binary");
+    listed
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("install"))
+        .stdout(predicate::str::contains("import"));
+}
+
+/// `import` advertises one skill operand plus target, scope, and safety flags.
+#[test]
+fn import_help_documents_one_skill_and_its_safety_flags() {
+    let mut command = Command::cargo_bin("skill-manager").expect("test binary");
+    command
+        .args(["import", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SKILL"))
+        .stdout(predicate::str::contains("--target"))
+        .stdout(predicate::str::contains("--global"))
+        .stdout(predicate::str::contains("--dry-run"))
+        .stdout(predicate::str::contains("--yes"));
+
+    let mut extra = Command::cargo_bin("skill-manager").expect("test binary");
+    extra
+        .args(["import", "alpha", "beta"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 /// Positional operand help distinguishes literal sources/skills from patterns.

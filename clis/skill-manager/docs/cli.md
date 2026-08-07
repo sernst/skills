@@ -9,8 +9,9 @@ controls color and `NO_COLOR` disables it.
 
 | Command | Purpose |
 | --- | --- |
-| `load [SOURCE_OR_PATTERN...]` | Discover and deploy skills, replacing existing copies. |
-| `update [SOURCE_OR_PATTERN...]` | Update skills already deployed in the selected or inferred scope. |
+| `load [SOURCE_OR_PATTERN...]` | Discover and deploy skills, replacing existing copies; alias: `install`. |
+| `update [SOURCE_OR_PATTERN...]` | Update skills already deployed in the selected or inferred scope, after one plan confirmation. |
+| `import SKILL` | Adopt one deployed, possibly agent-modified copy as the new source content. |
 | `copy SOURCE DEST` | Copy discovered skills to an arbitrary destination. |
 | `remove [SKILL_OR_PATTERN...]` | Remove selected or auto-detected deployments. |
 | `status [FILTER...]` | Show source-relative deployment state; aliases: `ls`, `list`. |
@@ -20,8 +21,9 @@ controls color and `NO_COLOR` disables it.
 | `configs restore [BACKUP_ID] [--yes]` | Restore a selected backup, or the latest backup when omitted. |
 | `source …` / `target …` | Manage source definitions and deployment targets. |
 
-`load`, `update`, `remove`, and `status` accept built-in selectors `--claude`,
-`--shared`, `--antigravity`/`--ag`, `--all`, and repeatable `--target NAME`.
+`load`, `update`, `import`, `remove`, and `status` accept built-in selectors
+`--claude`, `--shared`, `--antigravity`/`--ag`, `--all`, and repeatable
+`--target NAME`.
 Selectors form a deduplicated union; an explicit target can include a disabled
 target. The built-ins resolve to `.claude/skills`, `.agents/skills`, and
 `.gemini/antigravity/skills` respectively.
@@ -41,6 +43,7 @@ The scope flags are mutually exclusive.
 | --- | --- |
 | `load` | Prompts once for a scope. The default is project when an enabled selected target's leading directory exists in CWD (such as `.claude`, `.agents`, or `.gemini`); otherwise global. |
 | `update` | Infers scope for every existing skill/target deployment. A project copy wins when both exist; `-g` or `-p` restricts the eligible deployments. |
+| `import` | Scans both scopes for changed deployments. When more than one differs from the source, it prompts for the copy to import; `-g` or `-p` restricts the scan. |
 | `remove` | Removes an unambiguous existing scope. When any selected skill exists in both scopes, it prompts once for project, global, or both; an explicit flag restricts it. |
 | `status` | Inspects both scopes by default; `-g` or `-p` narrows the report. |
 
@@ -54,6 +57,39 @@ All discovery commands accept repeatable `--filter PATTERN`, `--refresh`, and
 `--dry-run` where applicable. Configured sources are the default. `--cd` adds
 CWD for `status`; `--cd-only` uses only CWD; `--no-cd` retains the compatibility
 spelling for configured-source-only behavior.
+
+## Change plans for update and import
+
+Interactive `update` renders a change plan before it deploys anything: one
+`update`, `load`, or `skip` row per skill, target, and scope, each with the
+files and text lines that row would change, followed by a count summary and one
+confirmation defaulting to yes. Declining cancels with exit `0`, emits
+`command.cancelled`, and deploys nothing. `--yes`/`-y` and `--dry-run` print the
+same plan without prompting. `load` never adds this confirmation, and machine
+mode keeps its existing event-only contract.
+
+`import SKILL` reverses `load`. It resolves exactly one skill—patterns are
+rejected—through the same first-source-wins discovery, then scans the selected
+or enabled targets in both scopes for deployed copies whose content differs from
+the source. Identical copies are never candidates, and finding none succeeds
+with `skill.import-skipped`. A single candidate is preselected; several require
+an interactive choice or narrower target and scope flags.
+
+The import plan names the `from` deployment and the `to` source directory, then
+lists each added, modified, or deleted file with `+N/-N` line counts and a byte
+delta for binary content, plus a totals line. Its confirmation defaults to no
+because the write is destructive to the source. Applying it makes the source
+directory byte-identical to the chosen deployed copy, including deleting source
+files the deployment no longer has, using the same staged, journaled, locked
+transaction as a deployment. `--dry-run` renders the plan and writes nothing.
+
+Import writes to local source checkouts only. When the resolved source is
+GitHub-backed, it requires a configured local alternate location and an
+interactive confirmation naming that path, and it imports into that alternate.
+Without a resolvable local destination—including in non-interactive mode—it
+fails with an actionable error instead of guessing. That destination is resolved
+only after a candidate is found, so a source that is already up to date never
+prompts for, or fails over, a destination it would not write.
 
 ## Source and target lifecycle
 

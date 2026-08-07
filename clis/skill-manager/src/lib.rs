@@ -15,6 +15,8 @@ pub mod domain;
 pub mod error;
 /// Human and machine reporting.
 pub mod event;
+/// Shared pre-mutation change plans.
+pub mod plan;
 /// Interactive input boundary.
 pub mod prompt;
 /// Strict JSON invocation input.

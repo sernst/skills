@@ -21,15 +21,16 @@ $ skill-manager source add ./my-skills --name team --label "Team skills"
 $ skill-manager load --all --global --no-input
 $ skill-manager status
 $ skill-manager update --target claude --no-input
+$ skill-manager import my-skill --claude --global --dry-run --no-input
 ```
 
 Use `--dry-run` before a deployment mutation to emit its plan without changing
-skill deployments. Startup storage migration still runs, and discovery may
+skill deployments or source content. Startup storage migration still runs, and discovery may
 refresh manager-owned remote cache when required, even during a dry run.
 
 ## Commands
 
-`status` is the default command and has `ls` and `list` aliases. `load` creates or replaces deployments, while `update` only changes skills already present in a target. `copy` copies one source to an arbitrary destination. `remove` removes deployments and needs `--yes` for unattended use. `resolve` records a collision preference by excluding the losing source's duplicate.
+`status` is the default command and has `ls` and `list` aliases. `load`, whose visible alias is `install`, creates or replaces deployments, while `update` only changes skills already present in a target and confirms a rendered change plan first. `import` reverses `load` by adopting one deployed, possibly agent-modified copy as the new source content. `copy` copies one source to an arbitrary destination. `remove` removes deployments and needs `--yes` for unattended use. `resolve` records a collision preference by excluding the losing source's duplicate.
 
 `source add|remove|list|update|locate|alternate|swap` manages sources. For example, pair a development checkout with its normal remote and switch without retyping either location:
 

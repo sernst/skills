@@ -54,15 +54,17 @@ fn recipe_overlay_covers_transfer_command_shapes() {
         "shared": true,
         "antigravity": true,
         "all": true,
-        "cd_only": true
+        "cd_only": true,
+        "yes": true
     }));
     let Some(Command::Update(args)) = update.command else {
         unreachable!("update command")
     };
-    assert_eq!(args.sources, ["one"]);
-    assert_eq!(args.filters, ["a*", "b*"]);
-    assert!(args.targets.claude && args.targets.shared && args.targets.antigravity);
-    assert!(args.targets.all_targets && args.source_selection.cd_only);
+    assert_eq!(args.sync.sources, ["one"]);
+    assert_eq!(args.sync.filters, ["a*", "b*"]);
+    assert!(args.sync.targets.claude && args.sync.targets.shared);
+    assert!(args.sync.targets.antigravity && args.sync.targets.all_targets);
+    assert!(args.sync.source_selection.cd_only && args.yes);
 
     let copy = recipe(&serde_json::json!({
         "command": "copy",
@@ -94,6 +96,59 @@ fn recipe_overlay_covers_transfer_command_shapes() {
     };
     assert_eq!(args.skills, ["one", "two"]);
     assert!(args.source_selection.no_cd && args.dry_run && args.refresh && args.yes);
+}
+
+/// `install` is an alias for `load`, and `import` is its own strict shape.
+#[test]
+fn recipe_overlay_covers_the_install_alias_and_import_command() {
+    let installed = recipe(&serde_json::json!({
+        "command": "install",
+        "sources": ["primary"],
+        "claude": true,
+        "global": true
+    }));
+    let Some(Command::Load(args)) = installed.command else {
+        unreachable!("install must canonicalize to load")
+    };
+    assert_eq!(args.sources, ["primary"]);
+    assert!(args.targets.claude && args.scope.global);
+
+    let mut argv_alias = Cli::try_parse_from([
+        "skill-manager",
+        "--json={\"command\":\"install\"}",
+        "install",
+        "--claude",
+    ])
+    .expect("parse install alias");
+    apply_recipe(&mut argv_alias).expect("install alias matches the load command");
+    assert!(matches!(argv_alias.command, Some(Command::Load(_))));
+
+    let imported = recipe(&serde_json::json!({
+        "command": "import",
+        "skill": "alpha",
+        "targets": ["custom"],
+        "shared": true,
+        "project": true,
+        "dry_run": true,
+        "yes": true,
+        "no_input": true
+    }));
+    let Some(Command::Import(args)) = imported.command else {
+        unreachable!("import command")
+    };
+    assert_eq!(args.skill, "alpha");
+    assert_eq!(args.targets.target_names, ["custom"]);
+    assert!(args.targets.shared && args.scope.project);
+    assert!(args.dry_run && args.yes && imported.no_input);
+
+    assert!(
+        recipe_error(&serde_json::json!({"command": "import"}))
+            .contains("JSON invocation requires field import.skill")
+    );
+    assert!(
+        recipe_error(&serde_json::json!({"command": "import", "skill": "a", "refresh": true}))
+            .contains("unknown JSON invocation field: refresh")
+    );
 }
 
 #[test]

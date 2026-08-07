@@ -1520,12 +1520,23 @@ fn validate_github_repo_path(path: &str, source_name: &str) -> Result<()> {
 }
 
 fn portable_canonicalize(path: &Path) -> PathBuf {
-    let canonical = path
-        .canonicalize()
-        .unwrap_or_else(|_| lexically_normalized(path));
+    portable_path(
+        &path
+            .canonicalize()
+            .unwrap_or_else(|_| lexically_normalized(path)),
+    )
+}
+
+/// Remove Windows verbatim prefixes so a path is displayed and stored plainly.
+///
+/// `std::fs::canonicalize` can return `\\?\C:\...` or `\\?\UNC\...` spellings.
+/// Those are valid but unfamiliar, so every persisted and user-facing path uses
+/// the ordinary spelling instead. Non-Windows paths are returned unchanged.
+#[must_use]
+pub fn portable_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
-        let wide: Vec<u16> = canonical.as_os_str().encode_wide().collect();
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
         if let Some(rest) = wide.strip_prefix(VERBATIM_UNC_PREFIX) {
             let mut normal = vec![u16::from(b'\\'), u16::from(b'\\')];
             normal.extend_from_slice(rest);
@@ -1535,7 +1546,7 @@ fn portable_canonicalize(path: &Path) -> PathBuf {
             return PathBuf::from(OsString::from_wide(rest));
         }
     }
-    canonical
+    path.to_path_buf()
 }
 
 fn lexically_normalized(path: &Path) -> PathBuf {

@@ -53,6 +53,12 @@ The comments in this section are machine-checked against production emit sites.
 - `diagnostic`: warning message, sometimes with an unmatched `pattern`.
 <!-- event: skill.copied -->
 - `skill.copied`: copy plan or committed copy.
+<!-- event: skill.import-planned -->
+- `skill.import-planned`: selected deployment and its source-overwrite plan.
+<!-- event: skill.import-skipped -->
+- `skill.import-skipped`: no selected deployment differs from the source.
+<!-- event: skill.imported -->
+- `skill.imported`: import plan or committed source overwrite.
 <!-- event: skill.loaded -->
 - `skill.loaded`: load plan or committed deployment.
 <!-- event: skill.removed -->
@@ -174,6 +180,36 @@ the destination skill directory. `copy` has no `scope`; load/update/skip do.
 `action` for these events is `loaded`, `overwritten`, `updated`, `copied`, or
 `skipped` as applicable.
 
+<!-- payload: skill-import fields: action,alternate,deletions,deployment,destination,dry_run,files_changed,insertions,mode,path,scope,skill,source,source_id,source_label,source_name,source_type,target,target_path -->
+<!-- payload: skill-import-skipped fields: action,alternate,dry_run,mode,path,skill,source,source_id,source_label,source_name,source_type -->
+`skill.import-planned` and `skill.imported` reverse the action direction and
+contain the flattened source fields plus:
+
+```json
+{
+  "skill": "name",
+  "path": "/materialized/source/name",
+  "target": "claude",
+  "scope": "global",
+  "target_path": "/home/me/.claude/skills",
+  "deployment": "/home/me/.claude/skills/name",
+  "destination": "/work/skills/name",
+  "files_changed": 3,
+  "insertions": 12,
+  "deletions": 9,
+  "action": "planned|imported",
+  "dry_run": false
+}
+```
+
+For import events, `deployment` is the deployed copy that supplies the content
+and `destination` is the local source skill directory that is replaced in full.
+The counts describe that same replacement: `files_changed` counts added,
+modified, and deleted files, while `insertions` and `deletions` count text
+lines and stay `0` for binary content. `skill.import-skipped` reports only
+`skill`, `path`, `action` (`skipped`), `dry_run`, and the flattened source
+fields: no deployment was selected, so no destination was resolved.
+
 <!-- payload: skill-removed fields: action,dry_run,path,scope,skill,target,target_path -->
 `skill.removed` deliberately has a different shape and no source provenance or
 `destination` field:
@@ -263,15 +299,16 @@ current working directory. A `backup_path` or `displaced_backup_path` is the
 raw archived-byte path; its corresponding ID is the stable selector for
 restore operations.
 
-`command.cancelled` is `{"action":"remove"}` or a
-`{"action":"configs.reset|configs.restore"}` object. `command.failed` is
-`{"message":"..."}`.
+`command.cancelled` is one `{"action":"..."}` object naming the declined
+command, such as `remove`, `update`, `import`, `configs.reset`, or
+`configs.restore`. `command.failed` is `{"message":"..."}`.
 
 <!-- payload: command-cancelled fields: action -->
 <!-- payload: command-failed fields: message -->
 
 <!-- payload: summary-source-list fields: sources -->
 <!-- payload: summary-load-update fields: action,changed,dry_run,skipped -->
+<!-- payload: summary-import fields: action,dry_run,imported,skipped -->
 <!-- payload: summary-copy fields: action,copied,dry_run -->
 <!-- payload: summary-remove fields: action,dry_run,removed -->
 <!-- payload: summary-status fields: action,skills -->
@@ -280,6 +317,7 @@ restore operations.
 
 - `source.list`: `{sources}`;
 - `load`/`update`: `{action,changed,skipped,dry_run}`;
+- `import`: `{action,imported,skipped,dry_run}`;
 - `copy`: `{action,copied,dry_run}`;
 - `remove`: `{action,removed,dry_run}`;
 - `status`: `{action,skills}`;
