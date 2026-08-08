@@ -3891,7 +3891,8 @@ fn configs_human_output_is_layered_and_raw_output_remains_exact() {
     let verbose_stdout = String::from_utf8(verbose.stdout).expect("utf8 verbose configs");
     assert!(verbose_stdout.contains(&source_id));
     assert!(verbose_stdout.contains("template"));
-    assert!(verbose_stdout.contains(&alternate.display().to_string()));
+    let canonical_alternate = portable_canonicalize(&alternate).expect("canonical alternate");
+    assert!(verbose_stdout.contains(&canonical_alternate.display().to_string()));
     assert!(verbose_stdout.contains("Advanced settings"));
     assert!(verbose_stdout.contains("Legacy target overrides"));
     assert!(verbose_stdout.contains("draft-*"));

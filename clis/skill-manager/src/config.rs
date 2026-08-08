@@ -1519,7 +1519,14 @@ fn validate_github_repo_path(path: &str, source_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn portable_canonicalize(path: &Path) -> PathBuf {
+/// Return a physical path when available, using the portable spelling used by
+/// persisted configuration and human-facing paths.
+///
+/// Existing paths are canonicalized so equivalent symlinked spellings render
+/// consistently. Missing paths receive the same lexical and Windows-prefix
+/// normalization used by configuration persistence.
+#[must_use]
+pub(crate) fn portable_canonicalize(path: &Path) -> PathBuf {
     portable_path(
         &path
             .canonicalize()

@@ -17,8 +17,8 @@ use crate::config::{
     Config, ConfigBackup, ConfigRepository, FileConfigRepository, derive_salted_source_id,
     find_source_index, fold, is_builtin_name, location_from_reference, location_identity,
     location_reference, locations_equal, manager_home, normalize_target_template, paths_equal,
-    portable_path, resolved_targets, resolved_targets_for_scope, set_source_location,
-    source_from_reference, source_location, source_reference,
+    portable_canonicalize, portable_path, resolved_targets, resolved_targets_for_scope,
+    set_source_location, source_from_reference, source_location, source_reference,
 };
 use crate::domain::{
     ResolvedSource, Scope, ScopedTarget, SkillCandidate, SourceEntry, SourceLocation, SourceMode,
@@ -1689,10 +1689,12 @@ where
             self.reporter.human("")?;
             self.reporter.human(&format!(
                 "  Deployment path   {}",
-                selection.deployment.display()
+                portable_canonicalize(&selection.deployment).display()
             ))?;
-            self.reporter
-                .human(&format!("  Source path       {}", destination.display()))?;
+            self.reporter.human(&format!(
+                "  Source path       {}",
+                portable_canonicalize(destination).display()
+            ))?;
         }
         self.reporter.human("")?;
         self.reporter.human(&styled_heading("Changes", color))?;
