@@ -4,6 +4,9 @@ export RUSTDOCFLAGS := "-D warnings"
 
 crate := "skill-manager"
 
+run *args:
+    cargo run --locked -- {{args}}
+
 format:
     cargo fmt
 

@@ -67,4 +67,18 @@ backups, and target templates.
 
 ## Development
 
-From the repository root, run `just skill-manager-check`. `just skill-manager-format` is the only recipe that rewrites formatting. The [architecture note](docs/architecture.md) and [contributor guide](docs/development.md) explain the design and release checks.
+Run the development CLI without a separate build from `clis/skill-manager`:
+
+```console
+$ just run --version
+$ just run configs
+```
+
+From the repository root, use the registered module:
+
+```console
+$ just skill-manager run --version
+$ just skill-manager run configs
+```
+
+Run `just skill-manager check` from the repository root for the same checks CI applies. `just skill-manager format` is the only recipe that rewrites formatting. The [architecture note](docs/architecture.md) and [contributor guide](docs/development.md) explain the design and release checks.

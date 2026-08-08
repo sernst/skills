@@ -1,6 +1,6 @@
 # Development and release
 
-The repository registers independent CLI components through `clis/registry.just`. The skill-manager module supplies format, format-check, lint, build, test, coverage, docs, deny, check, metadata, build-target, test-target, and package recipes. Run the root aggregation recipe for the same checks CI applies.
+The repository registers independent CLI components through `clis/registry.just`. The skill-manager module supplies run, format, format-check, lint, build, test, coverage, docs, deny, check, metadata, build-target, test-target, and package recipes. Run the development CLI locally with `just run --version` or `just run configs` from `clis/skill-manager`; from the repository root, use `just skill-manager run --version` or `just skill-manager run configs`. Run `just skill-manager check` from the repository root for the same checks CI applies.
 
 The quality gate uses `cargo fmt --check`, strict pedantic Clippy with warnings denied, rustdoc warnings denied, dependency policy checks, and an 85% line coverage threshold. Production code forbids unsafe and unchecked unwrap/expect/panic-style exits; narrow allowances must explain why they are safe. Exact auxiliary-tool versions are stored centrally and bootstrap scripts install locked versions.
 
