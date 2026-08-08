@@ -24,7 +24,8 @@ Global options can appear before or after subcommands:
 | `--json-input` | Read one recipe object from stdin and emit NDJSON. |
 | `--input FILE` | Read one recipe object from a file and emit NDJSON. |
 | `--no-input` | Disable prompts; fail when a choice is required. |
-| `--color auto\|always\|never` | Human-output color policy; `NO_COLOR` also disables color. |
+| `--color auto\|always\|never` | `auto` colors a TTY and honors `NO_COLOR`; `always` colors redirected output too; `never` is plain. |
+| `--verbose` | Show advanced human details and full import paths; JSON is unchanged. |
 | `-h`, `--help` | Show help. |
 | `-V`, `--version` | Show version. |
 
@@ -58,7 +59,9 @@ target; only an explicit `--target NAME` may do so.
 Global scope (`--global`, `-g`) resolves below the manager home. Project scope
 (`--project`, `-p`) resolves below the exact CWD; there is no Git-root search.
 The flags conflict. A project deployment takes precedence over global when both
-exist.
+exist. At the manager home, project scope is unavailable: unscoped commands use
+global only and explicit `--project` fails before writes. Subdirectories of home
+remain valid projects.
 
 ## Common workflows
 
@@ -85,11 +88,12 @@ exist.
 skill-manager load [SOURCE_OR_PATTERN ...] [OPTIONS]
 skill-manager install [SOURCE_OR_PATTERN ...] [OPTIONS]
 skill-manager update [SOURCE_OR_PATTERN ...] [OPTIONS] [--yes]
+skill-manager up [SOURCE_OR_PATTERN ...] [OPTIONS] [--yes]
 ```
 
 `load` creates or replaces deployments; `install` is a visible alias for it and
-accepts the identical options. `update` changes only skills already deployed in
-eligible targets/scopes; it never creates a new deployment.
+accepts the identical options. `update` (`up`) changes only skills already
+deployed in eligible targets/scopes; it never creates a new deployment.
 
 | Option | Meaning |
 | --- | --- |
@@ -105,19 +109,21 @@ eligible targets/scopes; it never creates a new deployment.
 | `--refresh` | Force GitHub cache refresh. |
 | `--yes`/`-y` (`update` only) | Skip the plan confirmation; the plan still prints. |
 
-Interactive `update` prints a change plan first—one `update`, `load`, or `skip`
-line per skill/target/scope with its file and line deltas—and then asks once
-before deploying. Declining cancels with exit `0` and no deployment. `--yes`
-and `--dry-run` print the same plan without prompting, and machine mode keeps
-its event-only contract.
+Interactive `update` uses enabled targets without a preliminary question. Its
+plan omits unchanged skills and shows one row per changed skill with selected
+target columns whose cells say global, project, both, or no action. Divergent
+target deltas remain visible in compact details below the row. Summaries call
+implicit targets enabled and explicit targets selected. A no-op prints one
+concise line and asks nothing. Declining a changed plan cancels with exit `0` and
+no deployment. `--yes` and `--dry-run` print the same plan without prompting,
+and machine mode keeps its event-only contract.
 
 In interactive `load`, scope defaults to project when a selected target's
 leading directory already exists in CWD; otherwise global. Non-interactive
-`load`, including dry-run, requires an explicit scope. Unscoped `update` infers
-all existing deployments, preferring a project copy when both exist. A
-committed non-interactive `load` or `update` must explicitly select targets with
-one or more built-in selectors, `--all`, or `--target NAME`; dry-run may
-implicitly preview enabled targets.
+`load`, including dry-run, requires an explicit scope outside the manager home;
+at home it safely uses global. Unscoped `update` infers all existing deployments,
+including both scopes. `load` in non-interactive mode must explicitly select
+targets; update uses enabled targets when none are specified.
 
 ### `import`
 
@@ -143,15 +149,22 @@ copies that differ from the source; identical copies are never candidates, and
 having none is a clean success. One candidate is preselected, and several
 require an interactive choice or narrower target/scope flags.
 
-Before writing, `import` prints a `from` deployment, a `to` source path, a
+Before writing, `import` prints concise source and `target · scope` names, a
 git-style per-file summary (`added`/`modified`/`deleted` with `+N/-N`, or a byte
-delta for binary content), and a totals line. The confirmation defaults to no.
+delta for binary content), and a totals line; `--verbose` adds full paths. The
+confirmation defaults to no.
 Applying it makes the source directory byte-identical to the chosen deployed
 copy, including deleting source files the deployment no longer has, through the
 same staged, journaled transaction used for deployments.
 
+After a successful interactive import, other enabled installed copies that are
+now outdated can be reviewed in the standard update plan and synchronized after
+a second confirmation. This includes another scope of the imported target.
+Nothing is offered when every other copy is current, or in JSON, `--no-input`,
+or `--dry-run` mode. Import `--yes` never approves this follow-up implicitly.
+
 Import writes to local source checkouts only. A GitHub-backed source needs a
-local alternate location and an interactive confirmation naming that path;
+local alternate location and an interactive confirmation;
 without a resolvable local destination the command fails rather than guessing.
 Both only apply once a candidate exists, so an up-to-date source never prompts.
 
@@ -254,9 +267,9 @@ skill-manager configs reset [--yes]
 skill-manager configs restore [BACKUP_ID] [--yes]
 ```
 
-`configs` shows active storage, global/project roots, schema and persistence,
-sources, targets and resolved locations, exclusions, unknown preserved fields,
-and backups. In JSON mode it emits `config.shown`.
+`configs` shows an explanatory summary plus aligned Sources, Targets, and
+Backups sections. `--verbose` adds IDs, templates, alternates, overrides,
+exclusions, and extension fields. In JSON mode it emits unchanged `config.shown`.
 
 `configs --raw` writes exact active configuration bytes and is incompatible
 with all JSON recipe/output carriers. It is a recovery tool that can read

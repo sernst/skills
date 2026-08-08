@@ -16,9 +16,9 @@ use crate::cli::{
 use crate::config::{
     Config, ConfigBackup, ConfigRepository, FileConfigRepository, derive_salted_source_id,
     find_source_index, fold, is_builtin_name, location_from_reference, location_identity,
-    location_reference, locations_equal, manager_home, normalize_target_template, portable_path,
-    resolved_targets, resolved_targets_for_scope, set_source_location, source_from_reference,
-    source_location, source_reference,
+    location_reference, locations_equal, manager_home, normalize_target_template, paths_equal,
+    portable_path, resolved_targets, resolved_targets_for_scope, set_source_location,
+    source_from_reference, source_location, source_reference,
 };
 use crate::domain::{
     ResolvedSource, Scope, ScopedTarget, SkillCandidate, SourceEntry, SourceLocation, SourceMode,
@@ -27,7 +27,7 @@ use crate::domain::{
 use crate::error::{Result, SkillManagerError};
 use crate::event::{Level, Reporter};
 use crate::plan::{
-    DiffStat, PlanAction, PlanEntry, diff_directories, file_change_lines, plan_summary, plan_table,
+    DiffStat, GroupedUpdateEntry, diff_directories, file_change_lines, grouped_update_table,
     totals_line,
 };
 use crate::prompt::Prompt;
@@ -37,8 +37,8 @@ use crate::skills::{
     validate_skill_name,
 };
 use crate::status::{
-    DeploymentDetail, SkillLocation, SkillRow, SourceRow, skill_table, source_table,
-    status_summary_counts, status_summary_with_counts,
+    DeploymentDetail, SkillLocation, SkillRow, SourceRow, display_width, join_columns, padded,
+    separator, skill_table, source_table, status_summary_counts, status_summary_with_counts,
 };
 use crate::storage_migration::LayoutMigrationResult;
 use crate::transaction::{TransactionHook, deploy_skill, import_skill, remove_skill};
@@ -53,12 +53,35 @@ struct SyncStep {
     same: bool,
 }
 
+type TargetSpecificChangeDetails = Vec<(String, Vec<(String, Scope, String)>)>;
+
 /// One deployed copy that differs from its source and can be imported.
+#[derive(Clone)]
 struct ImportCandidate {
     target: Target,
     scope: Scope,
     deployment: PathBuf,
     stat: DiffStat,
+}
+
+/// Scope roots and whether the current directory represents a real project.
+struct ScopeContext {
+    project_root: PathBuf,
+    project_available: bool,
+}
+
+#[derive(Clone, Copy)]
+struct UpdatePlanOptions {
+    implicit_targets: bool,
+    dry_run: bool,
+    confirmed: bool,
+    context: UpdatePlanContext,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum UpdatePlanContext {
+    Direct,
+    ImportFollowUp,
 }
 
 /// Outcome converted to the executable exit code.
@@ -117,6 +140,7 @@ where
     /// Returns a typed error when command validation, persistence, transport,
     /// prompting, reporting, or a filesystem operation fails.
     pub fn run(&mut self, command: Command) -> Result<RunOutcome> {
+        self.validate_project_scope(&command)?;
         if let Command::Configs(args) = command {
             return self.run_configs(&args);
         }
@@ -165,6 +189,27 @@ where
             }
         }
         Ok(RunOutcome::Success)
+    }
+
+    /// Reject a project scope that would alias the global manager home.
+    fn validate_project_scope(&self, command: &Command) -> Result<()> {
+        let selection = match command {
+            Command::Load(args) => Some(&args.scope),
+            Command::Update(args) => Some(&args.sync.scope),
+            Command::Import(args) => Some(&args.scope),
+            Command::Remove(args) => Some(&args.scope),
+            Command::Status(args) => Some(&args.scope),
+            _ => None,
+        };
+        if selection.is_some_and(|scope| scope.project)
+            && !scope_context(&self.home)?.project_available
+        {
+            return Err(SkillManagerError::InvalidInput(
+                "project scope is unavailable because the current directory is your global home; use --global or run this command from a project directory"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     fn run_configs(&mut self, args: &ConfigsArgs) -> Result<RunOutcome> {
@@ -266,9 +311,10 @@ where
     // Configuration display deliberately coordinates every human and machine section here.
     #[allow(clippy::too_many_lines)]
     fn show_config(&mut self, config: &Config, persisted: bool) -> Result<()> {
-        let project_root = current_project_root()?;
-        let global = resolved_targets_for_scope(config, &self.home, &project_root, Scope::Global);
-        let project = resolved_targets_for_scope(config, &self.home, &project_root, Scope::Project);
+        let scope_context = scope_context(&self.home)?;
+        let project_root = &scope_context.project_root;
+        let global = resolved_targets_for_scope(config, &self.home, project_root, Scope::Global);
+        let project = resolved_targets_for_scope(config, &self.home, project_root, Scope::Project);
         let targets = global
             .iter()
             .filter_map(|(name, global_target)| {
@@ -289,72 +335,224 @@ where
         let backups = self.repository.list_backups()?;
         let backup_values = backups.iter().map(backup_data).collect::<Vec<_>>();
 
+        let color = self.reporter.color_enabled();
+        let verbose = self.reporter.verbose();
+        self.reporter
+            .human(&styled_heading("Configuration", color))?;
+        self.reporter.human("")?;
         self.reporter.human(&format!(
-            "Configuration: {} ({})",
+            "  Config file   {} ({})",
             self.repository.config_path().display(),
             if persisted {
                 "persisted"
             } else {
-                "unpersisted default"
+                "using defaults"
             }
         ))?;
         self.reporter.human(&format!(
-            "Storage: {}",
+            "  Storage       {}",
             self.repository.storage_root().display()
         ))?;
         self.reporter
-            .human(&format!("Home: {}", self.home.display()))?;
-        self.reporter
-            .human(&format!("Project: {}", project_root.display()))?;
-        self.reporter.human(&format!(
-            "Schema: {}  Sources: {}  Targets: {}  Backups: {}",
-            config.schema_version,
-            config.sources.len(),
-            targets.len(),
-            backups.len()
-        ))?;
-        self.reporter.human("")?;
-        self.reporter.human("Configuration document:")?;
-        let rendered = serde_json::to_string_pretty(config)
-            .map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
-        for line in rendered.lines() {
-            self.reporter.human(line)?;
-        }
-        self.reporter.human("")?;
-        self.reporter.human("Resolved targets:")?;
-        for target in &targets {
-            self.reporter.human(&format!(
-                "{}\t{}\tglobal={}\tproject={}\t{}",
-                target["name"].as_str().unwrap_or_default(),
-                target["template"].as_str().unwrap_or_default(),
-                target["global_path"].as_str().unwrap_or_default(),
-                target["project_path"].as_str().unwrap_or_default(),
-                if target["enabled"].as_bool().unwrap_or(false) {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            ))?;
-        }
-        self.reporter.human("")?;
-        self.reporter.human("Backups:")?;
-        if backups.is_empty() {
-            self.reporter.human("none")?;
+            .human(&format!("  Global home   {}", self.home.display()))?;
+        if scope_context.project_available {
+            self.reporter
+                .human(&format!("  Project       {}", project_root.display()))?;
         } else {
-            for backup in &backups {
-                self.reporter.human(&format!(
-                    "{}\t{}\t{}\t{}",
-                    backup.metadata.id,
-                    backup.metadata.created_at.to_rfc3339(),
-                    backup.metadata.reason,
-                    if backup.metadata.valid {
-                        "valid"
+            self.reporter
+                .human("  Project       unavailable — current directory is the global home")?;
+        }
+        let enabled_targets = global
+            .values()
+            .filter(|target| target.target.enabled)
+            .count();
+        self.reporter.human("")?;
+        self.reporter.human(&format!(
+            "  Schema v{} · {} · {} · {}",
+            config.schema_version,
+            counted_noun(config.sources.len(), "source"),
+            enabled_target_label(enabled_targets),
+            counted_noun(backups.len(), "backup")
+        ))?;
+
+        self.reporter.human("")?;
+        self.reporter.human(&styled_heading("Sources", color))?;
+        self.reporter.human("")?;
+        if config.sources.is_empty() {
+            self.reporter.human("  No sources configured.")?;
+        } else {
+            let source_rows = config
+                .sources
+                .iter()
+                .map(|source| {
+                    let display = if source.label.is_empty() || source.label == source.name {
+                        source.name.clone()
                     } else {
-                        "invalid"
+                        format!("{} ({})", source.label, source.name)
+                    };
+                    let mut notes = Vec::new();
+                    if !source.exclude.is_empty() {
+                        notes.push(format!("excludes {}", source.exclude.join(", ")));
                     }
-                ))?;
+                    if let Some(alternate) = &source.alternate {
+                        if verbose {
+                            notes.push(format!("alternate: {}", location_reference(alternate)));
+                        } else {
+                            notes.push("alternate available".into());
+                        }
+                    }
+                    let source_type = match source.source_type {
+                        SourceType::Local => "local",
+                        SourceType::GitHub => "GitHub",
+                    };
+                    let mut row = vec![display];
+                    if verbose {
+                        row.push(source.id.clone());
+                    }
+                    row.extend([
+                        source_type.into(),
+                        source_reference(source),
+                        if notes.is_empty() {
+                            "—".into()
+                        } else {
+                            notes.join("; ")
+                        },
+                    ]);
+                    row
+                })
+                .collect::<Vec<_>>();
+            let source_headers = if verbose {
+                vec!["source", "id", "type", "location", "notes"]
+            } else {
+                vec!["source", "type", "location", "notes"]
+            };
+            for line in aligned_table(&source_headers, &source_rows) {
+                self.reporter.human(&line)?;
             }
         }
+
+        self.reporter.human("")?;
+        self.reporter.human(&styled_heading("Targets", color))?;
+        self.reporter.human("")?;
+        let target_rows = global
+            .iter()
+            .filter_map(|(name, global_target)| {
+                project.get(name).map(|project_target| {
+                    let mut row = vec![
+                        name.clone(),
+                        if global_target.target.enabled {
+                            "enabled".into()
+                        } else {
+                            "disabled".into()
+                        },
+                    ];
+                    if verbose {
+                        row.push(global_target.template.display().to_string());
+                    }
+                    row.push(global_target.target.path.display().to_string());
+                    if scope_context.project_available {
+                        row.push(project_target.target.path.display().to_string());
+                    }
+                    if verbose {
+                        let mut notes = Vec::new();
+                        if global_target.target.builtin {
+                            notes.push("built-in");
+                        }
+                        if global_target.target.legacy_override {
+                            notes.push("legacy override");
+                        }
+                        row.push(if notes.is_empty() {
+                            "custom".into()
+                        } else {
+                            notes.join(", ")
+                        });
+                    }
+                    row
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut target_headers = vec!["target", "status"];
+        if verbose {
+            target_headers.push("template");
+        }
+        target_headers.push("global directory");
+        if scope_context.project_available {
+            target_headers.push("project directory");
+        }
+        if verbose {
+            target_headers.push("notes");
+        }
+        for line in aligned_table_with_status(&target_headers, &target_rows, 1, color) {
+            self.reporter.human(&line)?;
+        }
+
+        self.reporter.human("")?;
+        self.reporter.human(&styled_heading("Backups", color))?;
+        self.reporter.human("")?;
+        if backups.is_empty() {
+            self.reporter.human("  No configuration backups.")?;
+        } else {
+            let backup_rows = backups
+                .iter()
+                .map(|backup| {
+                    let mut row = Vec::new();
+                    if verbose {
+                        row.push(backup.metadata.id.clone());
+                    }
+                    row.extend([
+                        backup
+                            .metadata
+                            .created_at
+                            .format("%Y-%m-%d %H:%M:%SZ")
+                            .to_string(),
+                        backup.metadata.reason.replace('-', " "),
+                        if backup.metadata.valid {
+                            "valid".into()
+                        } else {
+                            "invalid".into()
+                        },
+                    ]);
+                    if verbose {
+                        row.push(
+                            backup
+                                .metadata
+                                .schema_version
+                                .map_or_else(|| "unknown".into(), |version| format!("v{version}")),
+                        );
+                    }
+                    row
+                })
+                .collect::<Vec<_>>();
+            let backup_headers = if verbose {
+                vec!["id", "created (UTC)", "reason", "status", "schema"]
+            } else {
+                vec!["created (UTC)", "reason", "status"]
+            };
+            let status_index = if verbose { 3 } else { 2 };
+            for line in
+                aligned_table_with_status(&backup_headers, &backup_rows, status_index, color)
+            {
+                self.reporter.human(&line)?;
+            }
+        }
+
+        if verbose {
+            self.reporter.human("")?;
+            self.reporter
+                .human(&styled_heading("Advanced settings", color))?;
+            self.reporter.human("")?;
+            for line in advanced_settings_lines(config) {
+                self.reporter.human(&line)?;
+            }
+        }
+
+        self.reporter.human("")?;
+        if !verbose {
+            self.reporter
+                .human("Use --verbose for IDs, templates, alternates, and overrides.")?;
+        }
+        self.reporter
+            .human("Use --raw for the exact configuration document.")?;
         self.reporter.event(
             "config.shown",
             Level::Info,
@@ -932,30 +1130,24 @@ where
         let discovery = discover_skills(&sources, &[], &config.exclude)?;
         self.emit_collisions(&discovery.collisions)?;
         let target_templates =
-            self.select_target_templates(config, &args.targets, true, args.dry_run)?;
-        let project_root = current_project_root()?;
+            self.select_target_templates(config, &args.targets, !update_only, args.dry_run)?;
+        let scope_context = scope_context(&self.home)?;
+        let project_root = &scope_context.project_root;
         let load_scope = if update_only {
             None
         } else {
-            Some(self.load_scope(config, &target_templates, &args.scope, &project_root)?)
+            Some(self.load_scope(config, &target_templates, &args.scope, project_root)?)
         };
 
-        let eligible_names = discovery
+        let candidate_names = discovery
             .winners
             .values()
-            .filter(|candidate| {
-                if !update_only {
-                    return true;
-                }
-                target_templates.iter().any(|template| {
-                    !update_scopes(template, candidate, &args.scope, &self.home, &project_root)
-                        .is_empty()
-                })
-            })
             .map(|candidate| candidate.name.as_str())
             .collect::<Vec<_>>();
-        let expansion = expand_skill_patterns(&operands.skill_patterns, eligible_names)?;
+        let expansion = expand_skill_patterns(&operands.skill_patterns, candidate_names)?;
         self.emit_unmatched_patterns(&expansion.unmatched_patterns)?;
+        let positional_matched =
+            operands.skill_patterns.is_empty() || !expansion.matched.is_empty();
         let selected = expansion
             .matched
             .iter()
@@ -973,10 +1165,17 @@ where
                 let scopes = if let Some(scope) = load_scope {
                     vec![scope]
                 } else {
-                    update_scopes(template, candidate, &args.scope, &self.home, &project_root)
+                    update_scopes(
+                        template,
+                        candidate,
+                        &args.scope,
+                        &self.home,
+                        project_root,
+                        scope_context.project_available,
+                    )
                 };
                 for scope in scopes {
-                    let target = scoped_target(template, scope, &self.home, &project_root);
+                    let target = scoped_target(template, scope, &self.home, project_root);
                     let destination = target.target.path.join(&candidate.name);
                     let existed = destination.is_dir();
                     if update_only && !existed {
@@ -995,8 +1194,40 @@ where
             }
         }
 
-        if update_only && !self.confirm_update_plan(&steps, args.dry_run, confirmed)? {
+        let target_names = target_templates
+            .iter()
+            .map(|target| target.target.name.clone())
+            .collect::<Vec<_>>();
+        let implicit_targets = !args.targets.is_explicit();
+        if update_only && steps.is_empty() && positional_matched && !self.reporter.is_json() {
+            let message = if target_templates.is_empty() {
+                if implicit_targets {
+                    "No enabled targets are available for update."
+                } else {
+                    "No selected targets are available for update."
+                }
+            } else {
+                "No installed skills matched this update."
+            };
+            self.reporter.human(message)?;
+        }
+        if update_only
+            && !self.confirm_update_plan(
+                &steps,
+                &target_names,
+                UpdatePlanOptions {
+                    implicit_targets,
+                    dry_run: args.dry_run,
+                    confirmed,
+                    context: UpdatePlanContext::Direct,
+                },
+            )?
+        {
             return Ok(false);
+        }
+
+        if update_only && !self.reporter.is_json() && steps.iter().any(|step| !step.same) {
+            self.reporter.human("")?;
         }
 
         let mut changed = 0_usize;
@@ -1059,7 +1290,7 @@ where
                 ),
             )?;
         }
-        if !operands.skill_patterns.is_empty() && changed + skipped == 0 {
+        if !positional_matched {
             return Err(SkillManagerError::NotFound {
                 kind: "skill matching positional pattern",
                 reference: operands.skill_patterns.join(", "),
@@ -1086,49 +1317,82 @@ where
     fn confirm_update_plan(
         &mut self,
         steps: &[SyncStep],
-        dry_run: bool,
-        confirmed: bool,
+        target_names: &[String],
+        options: UpdatePlanOptions,
     ) -> Result<bool> {
         if self.reporter.is_json() || steps.is_empty() {
             return Ok(true);
         }
-        let mut entries = Vec::with_capacity(steps.len());
-        for step in steps {
-            let action = if step.same {
-                PlanAction::Skip
-            } else if step.existed {
-                PlanAction::Update
+        let actionable = steps.iter().filter(|step| !step.same).collect::<Vec<_>>();
+        if actionable.is_empty() {
+            let skills = steps
+                .iter()
+                .map(|step| step.candidate.name.as_str())
+                .collect::<BTreeSet<_>>();
+            let message = if skills.len() == 1 {
+                format!(
+                    "{} is up to date across {}.",
+                    skills
+                        .iter()
+                        .next()
+                        .copied()
+                        .unwrap_or("The selected skill"),
+                    target_selection_label(target_names.len(), options.implicit_targets)
+                )
             } else {
-                PlanAction::Load
+                format!(
+                    "All installed skills are up to date across {}.",
+                    target_selection_label(target_names.len(), options.implicit_targets)
+                )
             };
-            let stat = if step.same {
-                DiffStat::default()
-            } else {
-                diff_directories(&step.destination, &step.candidate.path)?
-            };
-            entries.push(PlanEntry {
-                action,
-                skill: step.candidate.name.clone(),
-                location: format!("{} ({})", step.target.name, step.scope.as_str()),
-                stat,
-            });
+            self.reporter.human(&message)?;
+            return Ok(true);
         }
-        let symbols = self.reporter.is_interactive();
-        let color = self.reporter.color_enabled();
-        self.reporter.human("Update plan:")?;
-        for line in plan_table(&entries, symbols, color) {
+
+        let (entries, target_specific_details) = grouped_update_entries(&actionable, target_names)?;
+        if options.context == UpdatePlanContext::ImportFollowUp {
+            self.reporter.human("")?;
+        }
+        self.reporter.human(&styled_heading(
+            "Update plan",
+            self.reporter.color_enabled(),
+        ))?;
+        self.reporter.human("")?;
+        for line in grouped_update_table(&entries, target_names, self.reporter.color_enabled()) {
             self.reporter.human(&line)?;
         }
-        self.reporter.human(&plan_summary(&entries))?;
+        if !target_specific_details.is_empty() {
+            self.reporter.human("")?;
+            self.reporter.human("Target-specific changes")?;
+            for (skill, deployments) in target_specific_details {
+                self.reporter.human(&format!("  {skill}"))?;
+                for (target, scope, totals) in deployments {
+                    self.reporter
+                        .human(&format!("    {target} · {}  {totals}", scope.as_str()))?;
+                }
+            }
+        }
         self.reporter.human("")?;
-        let actionable = entries.iter().any(|entry| entry.action != PlanAction::Skip);
-        if dry_run || confirmed || !actionable || self.no_input {
+        self.reporter.human(&format!(
+            "{} across {}",
+            counted_noun(actionable.len(), "update"),
+            target_selection_label(target_names.len(), options.implicit_targets)
+        ))?;
+        if options.dry_run || options.confirmed || self.no_input {
             return Ok(true);
         }
-        if self.prompt.confirm("Apply this update plan?", true)? {
+        if self.prompt.confirm(
+            &format!(
+                "Apply this update plan to {}?",
+                target_selection_label(target_names.len(), options.implicit_targets)
+            ),
+            true,
+        )? {
             return Ok(true);
         }
-        self.report_cancelled("update")?;
+        if options.context == UpdatePlanContext::Direct {
+            self.report_cancelled("update")?;
+        }
         Ok(false)
     }
 
@@ -1221,13 +1485,13 @@ where
         // where an import would have been written.
         let target_templates =
             self.select_target_templates(config, &args.targets, false, args.dry_run)?;
-        let project_root = current_project_root()?;
-        let inspected_scopes = explicit_scope(&args.scope)
-            .map_or_else(|| vec![Scope::Global, Scope::Project], |scope| vec![scope]);
+        let scope_context = scope_context(&self.home)?;
+        let project_root = &scope_context.project_root;
+        let inspected_scopes = available_scopes(&args.scope, scope_context.project_available);
         let mut detected = Vec::new();
         for template in &target_templates {
             for scope in &inspected_scopes {
-                let target = scoped_target(template, *scope, &self.home, &project_root);
+                let target = scoped_target(template, *scope, &self.home, project_root);
                 let deployment = target.target.path.join(&candidate.name);
                 if !deployment.is_dir() || directories_equal(&candidate.path, &deployment)? {
                     continue;
@@ -1264,17 +1528,26 @@ where
                 });
             }
             let index = self.select_import_candidate(&candidate.name, &candidates)?;
-            let selection = candidates.get(index).ok_or_else(|| {
+            let selection = candidates.get(index).cloned().ok_or_else(|| {
                 SkillManagerError::InvalidInput("import selection is out of range".into())
             })?;
-            self.render_import_plan(&candidate, selection, &destination)?;
+            self.render_import_plan(&candidate, &selection, &destination)?;
             self.reporter.event(
                 "skill.import-planned",
                 Level::Info,
-                skill_import_data(&candidate, selection, &destination, args.dry_run, "planned"),
+                skill_import_data(
+                    &candidate,
+                    &selection,
+                    &destination,
+                    args.dry_run,
+                    "planned",
+                ),
             )?;
-            if !self.confirm_import(selection, &destination, args.dry_run, args.yes)? {
+            if !self.confirm_import(&candidate, &selection, args.dry_run, args.yes)? {
                 return Ok(false);
+            }
+            if !args.dry_run && !args.yes && !self.no_input {
+                self.reporter.human("")?;
             }
             if !args.dry_run {
                 import_skill(
@@ -1285,12 +1558,13 @@ where
                 )?;
             }
             imported = 1;
+            let source_label = source_display_name(&candidate.source.entry);
             self.reporter.human(&format!(
-                "Imported {} from {} ({}) into {}{}",
+                "Imported {} from {} · {} into {} (source){}.",
                 candidate.name,
                 selection.target.name,
                 selection.scope.as_str(),
-                destination.display(),
+                source_label,
                 if args.dry_run { " (dry-run)" } else { "" }
             ))?;
             self.reporter.event(
@@ -1298,12 +1572,15 @@ where
                 Level::Info,
                 skill_import_data(
                     &candidate,
-                    selection,
+                    &selection,
                     &destination,
                     args.dry_run,
                     "imported",
                 ),
             )?;
+            if !args.dry_run && !self.no_input && !self.reporter.is_json() {
+                self.offer_import_sync(config, &candidate, &selection, &destination)?;
+            }
         }
         self.reporter.event(
             "summary",
@@ -1342,17 +1619,15 @@ where
         });
         if self.no_input {
             return Err(SkillManagerError::InteractionRequired(format!(
-                "'{}' is GitHub-backed; importing into its local alternate {} requires interactive confirmation",
-                entry.name,
-                destination.display()
+                "'{}' is GitHub-backed; importing into its local alternate requires interactive confirmation",
+                entry.name
             )));
         }
         if self.prompt.confirm(
             &format!(
-                "'{}' is GitHub-backed ({}); import into its local alternate {} instead?",
+                "'{}' is GitHub-backed ({}); import into its local alternate instead?",
                 entry.name,
-                source_reference(entry),
-                destination.display()
+                source_reference(entry)
             ),
             false,
         )? {
@@ -1381,7 +1656,7 @@ where
             .iter()
             .map(|item| {
                 format!(
-                    "{} ({}) - {}",
+                    "{} · {}  {}",
                     item.target.name,
                     item.scope.as_str(),
                     totals_line(&item.stat)
@@ -1399,36 +1674,31 @@ where
         selection: &ImportCandidate,
         destination: &Path,
     ) -> Result<()> {
-        let symbols = self.reporter.is_interactive();
         let color = self.reporter.color_enabled();
-        let location = format!("{} ({})", selection.target.name, selection.scope.as_str());
-        let source_label = format!("{} (source)", candidate.source.entry.name);
-        let width = location.len().max(source_label.len());
-        self.reporter
-            .human(&format!("Import plan for {}:", candidate.name))?;
-        self.reporter.human(&format!(
-            "  from  {:width$}  {}",
-            location,
-            selection.deployment.display()
-        ))?;
-        self.reporter.human(&format!(
-            "  to    {:width$}  {}",
-            source_label,
-            destination.display()
+        let location = format!("{} · {}", selection.target.name, selection.scope.as_str());
+        let source_label = format!("{} (source)", source_display_name(&candidate.source.entry));
+        self.reporter.human("")?;
+        self.reporter.human(&styled_heading(
+            &format!("Import {}", candidate.name),
+            color,
         ))?;
         self.reporter.human("")?;
-        let entry = PlanEntry {
-            action: PlanAction::Import,
-            skill: candidate.name.clone(),
-            location,
-            stat: selection.stat.clone(),
-        };
-        for line in plan_table(std::slice::from_ref(&entry), symbols, color) {
-            self.reporter.human(&line)?;
+        self.reporter.human(&format!("  From   {location}"))?;
+        self.reporter.human(&format!("  Into   {source_label}"))?;
+        if self.reporter.verbose() {
+            self.reporter.human("")?;
+            self.reporter.human(&format!(
+                "  Deployment path   {}",
+                selection.deployment.display()
+            ))?;
+            self.reporter
+                .human(&format!("  Source path       {}", destination.display()))?;
         }
+        self.reporter.human("")?;
+        self.reporter.human(&styled_heading("Changes", color))?;
         if !selection.stat.is_empty() {
             self.reporter.human("")?;
-            for line in file_change_lines(&selection.stat, symbols, color) {
+            for line in file_change_lines(&selection.stat, self.reporter.is_interactive(), color) {
                 self.reporter.human(&line)?;
             }
         }
@@ -1439,8 +1709,8 @@ where
     /// Confirm the destructive source overwrite unless it was pre-approved.
     fn confirm_import(
         &mut self,
+        candidate: &SkillCandidate,
         selection: &ImportCandidate,
-        destination: &Path,
         dry_run: bool,
         confirmed: bool,
     ) -> Result<bool> {
@@ -1454,8 +1724,8 @@ where
         }
         if self.prompt.confirm(
             &format!(
-                "Replace {} with the {} ({}) copy?",
-                destination.display(),
+                "Replace {} (source) with the {} · {} copy?",
+                source_display_name(&candidate.source.entry),
                 selection.target.name,
                 selection.scope.as_str()
             ),
@@ -1467,19 +1737,121 @@ where
         Ok(false)
     }
 
+    /// Offer to propagate freshly imported content to every other installed,
+    /// enabled deployment that is now outdated.
+    fn offer_import_sync(
+        &mut self,
+        config: &Config,
+        candidate: &SkillCandidate,
+        imported: &ImportCandidate,
+        destination: &Path,
+    ) -> Result<()> {
+        let templates =
+            self.select_target_templates(config, &TargetSelection::default(), false, false)?;
+        let target_names = templates
+            .iter()
+            .map(|target| target.target.name.clone())
+            .collect::<Vec<_>>();
+        let context = scope_context(&self.home)?;
+        let scopes = available_scopes(&ScopeSelection::default(), context.project_available);
+        let mut imported_candidate = candidate.clone();
+        imported_candidate.path = destination.to_path_buf();
+        let mut steps = Vec::new();
+        for template in &templates {
+            for scope in &scopes {
+                if fold(&template.target.name) == fold(&imported.target.name)
+                    && *scope == imported.scope
+                {
+                    continue;
+                }
+                let target = scoped_target(template, *scope, &self.home, &context.project_root);
+                let deployment = target.target.path.join(&candidate.name);
+                if !deployment.is_dir() || directories_equal(destination, &deployment)? {
+                    continue;
+                }
+                steps.push(SyncStep {
+                    candidate: imported_candidate.clone(),
+                    target: target.target,
+                    scope: *scope,
+                    destination: deployment,
+                    existed: true,
+                    same: false,
+                });
+            }
+        }
+        if steps.is_empty() {
+            return Ok(());
+        }
+
+        self.reporter.human("")?;
+        let deployments = counted_noun(steps.len(), "other installed deployment");
+        let verb = if steps.len() == 1 { "needs" } else { "need" };
+        if !self.prompt.confirm(
+            &format!("{deployments} {verb} this change. Review an update plan?"),
+            true,
+        )? {
+            self.reporter
+                .human("Other installed deployments were not updated.")?;
+            return Ok(());
+        }
+        if !self.confirm_update_plan(
+            &steps,
+            &target_names,
+            UpdatePlanOptions {
+                implicit_targets: true,
+                dry_run: false,
+                confirmed: false,
+                context: UpdatePlanContext::ImportFollowUp,
+            },
+        )? {
+            self.reporter.human("")?;
+            self.reporter
+                .human("Imported successfully; other installed deployments were not updated.")?;
+            return Ok(());
+        }
+        self.reporter.human("")?;
+        for step in &steps {
+            deploy_skill(
+                &step.candidate.path,
+                &step.target.path,
+                self.repository.cache_root(),
+                self.hook,
+            )?;
+            self.reporter.human(&format!(
+                "Updated {} -> {} ({})",
+                step.candidate.name,
+                step.target.name,
+                step.scope.as_str()
+            ))?;
+            self.reporter.event(
+                "skill.updated",
+                Level::Info,
+                skill_action_data(
+                    &step.candidate,
+                    &step.target,
+                    Some(step.scope),
+                    &step.destination,
+                    false,
+                    "updated",
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
     // Resolution, confirmation, execution, and reporting form one ordered
     // partial-commit operation and are therefore deliberately colocated.
     #[allow(clippy::too_many_lines)]
     fn run_remove(&mut self, config: &Config, args: &RemoveArgs) -> Result<bool> {
         let target_templates =
             self.select_target_templates(config, &args.targets, false, args.dry_run)?;
-        let project_root = current_project_root()?;
-        let inspected_scopes = explicit_scope(&args.scope)
-            .map_or_else(|| vec![Scope::Global, Scope::Project], |scope| vec![scope]);
+        let scope_context = scope_context(&self.home)?;
+        let project_root = &scope_context.project_root;
+        let inspected_scopes = available_scopes(&args.scope, scope_context.project_available);
         let mut deployed_names = BTreeMap::<String, String>::new();
         for template in &target_templates {
             for scope in &inspected_scopes {
-                let scoped = scoped_target(template, *scope, &self.home, &project_root);
+                let scoped = scoped_target(template, *scope, &self.home, project_root);
                 for (identity, name) in deployed_skills(&scoped.target.path)? {
                     deployed_names.entry(identity).or_insert(name);
                 }
@@ -1553,16 +1925,17 @@ where
         for name in names.values() {
             for template in &target_templates {
                 if let Some(scope) = explicit_scope(&args.scope) {
-                    let target = scoped_target(template, scope, &self.home, &project_root);
+                    let target = scoped_target(template, scope, &self.home, project_root);
                     if target.target.path.join(name).is_dir() {
                         plan.push((name.clone(), target.target, scope));
                     }
                     continue;
                 }
-                let global = scoped_target(template, Scope::Global, &self.home, &project_root);
-                let project = scoped_target(template, Scope::Project, &self.home, &project_root);
+                let global = scoped_target(template, Scope::Global, &self.home, project_root);
+                let project = scoped_target(template, Scope::Project, &self.home, project_root);
                 let global_exists = global.target.path.join(name).is_dir();
-                let project_exists = project.target.path.join(name).is_dir();
+                let project_exists =
+                    scope_context.project_available && project.target.path.join(name).is_dir();
                 match (global_exists, project_exists) {
                     (true, false) => plan.push((name.clone(), global.target, Scope::Global)),
                     (false, true) => plan.push((name.clone(), project.target, Scope::Project)),
@@ -1593,7 +1966,7 @@ where
             };
             for (name, template) in dual {
                 for scope in &scopes {
-                    let target = scoped_target(&template, *scope, &self.home, &project_root);
+                    let target = scoped_target(&template, *scope, &self.home, project_root);
                     plan.push((name.clone(), target.target, *scope));
                 }
             }
@@ -1680,16 +2053,16 @@ where
         let discovery = discover_skills(&sources, &[], &config.exclude)?;
         self.emit_collisions(&discovery.collisions)?;
         let target_templates = self.select_target_templates(config, &args.targets, false, false)?;
-        let project_root = current_project_root()?;
-        let inspected_scopes = explicit_scope(&args.scope)
-            .map_or_else(|| vec![Scope::Global, Scope::Project], |scope| vec![scope]);
+        let scope_context = scope_context(&self.home)?;
+        let project_root = &scope_context.project_root;
+        let inspected_scopes = available_scopes(&args.scope, scope_context.project_available);
         let mut names = BTreeMap::<String, String>::new();
         for (identity, candidate) in &discovery.winners {
             names.insert(identity.clone(), candidate.name.clone());
         }
         for template in &target_templates {
             for scope in &inspected_scopes {
-                let target = scoped_target(template, *scope, &self.home, &project_root);
+                let target = scoped_target(template, *scope, &self.home, project_root);
                 for (identity, name) in deployed_skills(&target.target.path)? {
                     names.entry(identity).or_insert(name);
                 }
@@ -1726,7 +2099,7 @@ where
                 let observations = inspected_scopes
                     .iter()
                     .map(|scope| {
-                        let target = scoped_target(template, *scope, &self.home, &project_root);
+                        let target = scoped_target(template, *scope, &self.home, project_root);
                         let installed = target.target.path.join(&name).is_dir();
                         let state = skill_state(
                             candidate.map(|value| value.path.as_path()),
@@ -2123,6 +2496,9 @@ where
         if let Some(scope) = explicit_scope(selection) {
             return Ok(scope);
         }
+        if !project_scope_available(&self.home, project_root) {
+            return Ok(Scope::Global);
+        }
         if self.no_input {
             return Err(SkillManagerError::InteractionRequired(
                 "load scope is required in noninteractive mode; pass --global or --project".into(),
@@ -2202,6 +2578,31 @@ fn current_project_root() -> Result<PathBuf> {
     std::env::current_dir().map_err(|error| SkillManagerError::io(".", error))
 }
 
+fn scope_context(home: &Path) -> Result<ScopeContext> {
+    let project_root = current_project_root()?;
+    Ok(ScopeContext {
+        project_available: project_scope_available(home, &project_root),
+        project_root,
+    })
+}
+
+fn project_scope_available(home: &Path, project_root: &Path) -> bool {
+    !paths_equal(home, project_root)
+}
+
+fn available_scopes(selection: &ScopeSelection, project_available: bool) -> Vec<Scope> {
+    explicit_scope(selection).map_or_else(
+        || {
+            if project_available {
+                vec![Scope::Global, Scope::Project]
+            } else {
+                vec![Scope::Global]
+            }
+        },
+        |scope| vec![scope],
+    )
+}
+
 fn explicit_scope(selection: &ScopeSelection) -> Option<Scope> {
     if selection.project {
         Some(Scope::Project)
@@ -2233,6 +2634,7 @@ fn update_scopes(
     selection: &ScopeSelection,
     home: &Path,
     project_root: &Path,
+    project_available: bool,
 ) -> Vec<Scope> {
     if let Some(scope) = explicit_scope(selection) {
         let target = scoped_target(template, scope, home, project_root);
@@ -2245,18 +2647,274 @@ fn update_scopes(
             .into_iter()
             .collect();
     }
-    let project = scoped_target(template, Scope::Project, home, project_root);
-    if project.target.path.join(&candidate.name).is_dir() {
-        return vec![Scope::Project];
-    }
+    let mut scopes = Vec::with_capacity(2);
     let global = scoped_target(template, Scope::Global, home, project_root);
-    global
-        .target
-        .path
-        .join(&candidate.name)
-        .is_dir()
-        .then_some(Scope::Global)
-        .into_iter()
+    if global.target.path.join(&candidate.name).is_dir() {
+        scopes.push(Scope::Global);
+    }
+    if project_available {
+        let project = scoped_target(template, Scope::Project, home, project_root);
+        if project.target.path.join(&candidate.name).is_dir() {
+            scopes.push(Scope::Project);
+        }
+    }
+    scopes
+}
+
+fn grouped_update_entries(
+    actionable: &[&SyncStep],
+    target_names: &[String],
+) -> Result<(Vec<GroupedUpdateEntry>, TargetSpecificChangeDetails)> {
+    let mut grouped = BTreeMap::<String, Vec<&SyncStep>>::new();
+    for step in actionable {
+        grouped
+            .entry(fold(&step.candidate.name))
+            .or_default()
+            .push(step);
+    }
+    let mut entries = Vec::with_capacity(grouped.len());
+    let mut target_specific_details = Vec::new();
+    for steps in grouped.values() {
+        let mut changes = BTreeSet::new();
+        let mut scopes = vec![Vec::new(); target_names.len()];
+        let mut deployment_changes = Vec::new();
+        for step in steps {
+            let totals = totals_line(&diff_directories(&step.destination, &step.candidate.path)?);
+            changes.insert(totals.clone());
+            deployment_changes.push((step.target.name.clone(), step.scope, totals));
+            if let Some(index) = target_names
+                .iter()
+                .position(|target| fold(target) == fold(&step.target.name))
+            {
+                scopes[index].push(step.scope);
+            }
+        }
+        let target_scopes = scopes
+            .into_iter()
+            .map(|scopes| match scopes.as_slice() {
+                [] => None,
+                [Scope::Global] => Some("global".into()),
+                [Scope::Project] => Some("project".into()),
+                _ => Some("both".into()),
+            })
+            .collect();
+        if changes.len() > 1 {
+            target_specific_details.push((steps[0].candidate.name.clone(), deployment_changes));
+        }
+        entries.push(GroupedUpdateEntry {
+            skill: steps[0].candidate.name.clone(),
+            change: if changes.len() == 1 {
+                changes.into_iter().next().unwrap_or_default()
+            } else {
+                format!("{} target-specific changes", changes.len())
+            },
+            target_scopes,
+        });
+    }
+    Ok((entries, target_specific_details))
+}
+
+fn styled_heading(text: &str, color: bool) -> String {
+    if color {
+        format!("\u{1b}[1;36m{text}\u{1b}[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+fn enabled_target_label(count: usize) -> String {
+    counted_noun(count, "enabled target")
+}
+
+fn target_selection_label(count: usize, implicit: bool) -> String {
+    if implicit {
+        enabled_target_label(count)
+    } else {
+        counted_noun(count, "selected target")
+    }
+}
+
+fn counted_noun(count: usize, singular: &str) -> String {
+    format!("{count} {singular}{}", if count == 1 { "" } else { "s" })
+}
+
+fn aligned_table(headers: &[&str], rows: &[Vec<String>]) -> Vec<String> {
+    let mut widths = headers
+        .iter()
+        .map(|header| display_width(header))
+        .collect::<Vec<_>>();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(display_width(cell));
+        }
+    }
+    let header = headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| padded(header, widths[index]))
+        .collect::<Vec<_>>();
+    let mut lines = vec![join_columns(&header), separator(&widths)];
+    lines.extend(rows.iter().map(|row| {
+        let columns = row
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| padded(cell, widths[index]))
+            .collect::<Vec<_>>();
+        join_columns(&columns)
+    }));
+    lines
+}
+
+fn aligned_table_with_status(
+    headers: &[&str],
+    rows: &[Vec<String>],
+    status_index: usize,
+    color: bool,
+) -> Vec<String> {
+    let mut widths = headers
+        .iter()
+        .map(|header| display_width(header))
+        .collect::<Vec<_>>();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(display_width(cell));
+        }
+    }
+    let header = headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| padded(header, widths[index]))
+        .collect::<Vec<_>>();
+    let mut lines = vec![join_columns(&header), separator(&widths)];
+    lines.extend(rows.iter().map(|row| {
+        let columns = row
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                let padding = " ".repeat(widths[index].saturating_sub(display_width(cell)));
+                if index == status_index && color {
+                    let code = match cell.as_str() {
+                        "enabled" | "valid" => Some(32),
+                        "disabled" => Some(2),
+                        "invalid" => Some(31),
+                        _ => None,
+                    };
+                    code.map_or_else(
+                        || format!("{cell}{padding}"),
+                        |code| format!("\u{1b}[{code}m{cell}\u{1b}[0m{padding}"),
+                    )
+                } else {
+                    format!("{cell}{padding}")
+                }
+            })
+            .collect::<Vec<_>>();
+        join_columns(&columns)
+    }));
+    lines
+}
+
+fn advanced_settings_lines(config: &Config) -> Vec<String> {
+    let mut lines = vec!["Global exclusions".into()];
+    if config.exclude.is_empty() {
+        lines.push("  none".into());
+    } else {
+        lines.extend(config.exclude.iter().map(|pattern| format!("  {pattern}")));
+    }
+
+    lines.push(String::new());
+    lines.push("Built-in settings".into());
+    if config.builtins.is_empty() {
+        lines.push("  none".into());
+    } else {
+        for (name, settings) in &config.builtins {
+            lines.push(format!("  {name}"));
+            let mut values = vec![("enabled".into(), settings.enabled.to_string())];
+            flatten_map(&settings.extra, &mut values);
+            lines.extend(indented_key_values(&values, 4));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Legacy target overrides".into());
+    if config.legacy_target_overrides.is_empty() {
+        lines.push("  none".into());
+    } else {
+        for (name, target) in &config.legacy_target_overrides {
+            lines.push(format!("  {name}"));
+            let mut values = vec![
+                ("path".into(), target.path.display().to_string()),
+                (
+                    "label".into(),
+                    if target.label.is_empty() {
+                        "none".into()
+                    } else {
+                        target.label.clone()
+                    },
+                ),
+                ("enabled".into(), target.enabled.to_string()),
+            ];
+            flatten_map(&target.extra, &mut values);
+            lines.extend(indented_key_values(&values, 4));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Extension fields".into());
+    if config.extra.is_empty() {
+        lines.push("  none".into());
+    } else {
+        let mut values = Vec::new();
+        flatten_map(&config.extra, &mut values);
+        lines.extend(indented_key_values(&values, 2));
+    }
+    lines
+}
+
+fn flatten_map(values: &IndexMap<String, Value>, output: &mut Vec<(String, String)>) {
+    for (key, value) in values {
+        flatten_value(key, value, output);
+    }
+}
+
+fn flatten_value(prefix: &str, value: &Value, output: &mut Vec<(String, String)>) {
+    match value {
+        Value::Object(values) if values.is_empty() => output.push((prefix.into(), "empty".into())),
+        Value::Object(values) => {
+            for (key, value) in values {
+                flatten_value(&format!("{prefix}.{key}"), value, output);
+            }
+        }
+        Value::Array(values) if values.is_empty() => output.push((prefix.into(), "none".into())),
+        Value::Array(values) if values.iter().all(Value::is_string) => output.push((
+            prefix.into(),
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+        )),
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                flatten_value(&format!("{prefix}[{}]", index + 1), value, output);
+            }
+        }
+        Value::Null => output.push((prefix.into(), "none".into())),
+        Value::Bool(value) => output.push((prefix.into(), value.to_string())),
+        Value::Number(value) => output.push((prefix.into(), value.to_string())),
+        Value::String(value) => output.push((prefix.into(), value.clone())),
+    }
+}
+
+fn indented_key_values(values: &[(String, String)], indent: usize) -> Vec<String> {
+    let width = values
+        .iter()
+        .map(|(key, _)| display_width(key))
+        .max()
+        .unwrap_or_default();
+    let prefix = " ".repeat(indent);
+    values
+        .iter()
+        .map(|(key, value)| format!("{prefix}{}  {value}", padded(key, width)))
         .collect()
 }
 
@@ -2283,6 +2941,14 @@ fn source_data(source: &SourceEntry) -> Value {
         "mode": source.mode,
         "alternate": source.alternate.as_ref().map(location_data)
     })
+}
+
+fn source_display_name(source: &SourceEntry) -> &str {
+    if source.label.is_empty() {
+        &source.name
+    } else {
+        &source.label
+    }
 }
 
 fn location_data(location: &SourceLocation) -> Value {

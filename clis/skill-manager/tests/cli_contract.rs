@@ -33,7 +33,7 @@ fn version_is_available_without_configuration() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.1.1"));
+        .stdout(predicate::str::contains("0.1.2"));
 }
 
 /// Parser misuse follows Clap's conventional usage exit code and stderr stream.
@@ -79,6 +79,25 @@ fn load_install_alias_is_accepted() {
         .success()
         .stdout(predicate::str::contains("install"))
         .stdout(predicate::str::contains("import"));
+}
+
+/// `up` is the concise update alias and global verbose output is discoverable.
+#[test]
+fn update_up_alias_and_verbose_option_are_advertised() {
+    for alias in ["update", "up"] {
+        let mut command = Command::cargo_bin("skill-manager").expect("test binary");
+        command
+            .args([alias, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--yes"));
+    }
+    let mut help = Command::cargo_bin("skill-manager").expect("test binary");
+    help.arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[alias: up]"))
+        .stdout(predicate::str::contains("--verbose"));
 }
 
 /// `import` advertises one skill operand plus target, scope, and safety flags.

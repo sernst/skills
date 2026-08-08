@@ -79,13 +79,19 @@ pub trait Reporter {
     fn color_enabled(&self) -> bool {
         false
     }
+    /// Whether advanced human-readable details were requested.
+    fn verbose(&self) -> bool {
+        false
+    }
 }
 
 /// Reporter backed by stdout and stderr.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ConsoleReporter {
     json: bool,
     color: bool,
     interactive: bool,
+    verbose: bool,
 }
 
 impl ConsoleReporter {
@@ -98,19 +104,25 @@ impl ConsoleReporter {
     /// Create a reporter with an explicit CLI color policy.
     #[must_use]
     pub fn with_color_policy(json: bool, policy: ColorChoice) -> Self {
+        Self::with_human_options(json, policy, false)
+    }
+
+    /// Create a reporter with explicit human-output options.
+    #[must_use]
+    pub fn with_human_options(json: bool, policy: ColorChoice, verbose: bool) -> Self {
         let interactive = io::stdout().is_terminal();
         let no_color = std::env::var_os("NO_COLOR").is_some();
-        let color = interactive
-            && !json
-            && !no_color
+        let color = !json
             && match policy {
-                ColorChoice::Auto | ColorChoice::Always => true,
+                ColorChoice::Auto => interactive && !no_color,
+                ColorChoice::Always => true,
                 ColorChoice::Never => false,
             };
         Self {
             json,
             color,
             interactive,
+            verbose,
         }
     }
 }
@@ -174,5 +186,9 @@ impl Reporter for ConsoleReporter {
 
     fn color_enabled(&self) -> bool {
         self.color
+    }
+
+    fn verbose(&self) -> bool {
+        self.verbose && !self.json
     }
 }

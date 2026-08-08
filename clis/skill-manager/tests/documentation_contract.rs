@@ -829,7 +829,8 @@ fn machine_requirements_and_all_target_semantics_match_production() {
         );
     }
     for required in [
-        "A committed `load` or\n`update` must explicitly select at least one target",
+        "A committed `load` must\nexplicitly select at least one target",
+        "`update` uses enabled targets when none\nare selected",
         "`all_targets:true` selects\nenabled configured targets only",
         "A machine `source.add` must include a\nnonblank `name`",
     ] {
@@ -839,7 +840,7 @@ fn machine_requirements_and_all_target_semantics_match_production() {
         );
     }
     for required in [
-        "committed non-interactive `load` or `update` must explicitly select targets",
+        "`load` in non-interactive mode must explicitly select\ntargets; update uses enabled targets",
         "Machine/non-interactive `source add` requires an explicit nonblank",
         "`--all` never opts into a disabled\ntarget",
     ] {

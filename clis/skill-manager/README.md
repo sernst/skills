@@ -20,7 +20,7 @@ Download the archive matching your operating system and CPU from the GitHub rele
 $ skill-manager source add ./my-skills --name team --label "Team skills"
 $ skill-manager load --all --global --no-input
 $ skill-manager status
-$ skill-manager update --target claude --no-input
+$ skill-manager up --target claude --no-input
 $ skill-manager import my-skill --claude --global --dry-run --no-input
 ```
 
@@ -30,7 +30,7 @@ refresh manager-owned remote cache when required, even during a dry run.
 
 ## Commands
 
-`status` is the default command and has `ls` and `list` aliases. `load`, whose visible alias is `install`, creates or replaces deployments, while `update` only changes skills already present in a target and confirms a rendered change plan first. `import` reverses `load` by adopting one deployed, possibly agent-modified copy as the new source content. `copy` copies one source to an arbitrary destination. `remove` removes deployments and needs `--yes` for unattended use. `resolve` records a collision preference by excluding the losing source's duplicate.
+`status` is the default command and has `ls` and `list` aliases. `load`, whose visible alias is `install`, creates or replaces deployments, while `update` (`up`) only changes skills already present and confirms a compact, changed-only plan first. `import` reverses `load` by adopting one deployed, possibly agent-modified copy as the new source content, then can offer to synchronize other outdated installed copies. `copy` copies one source to an arbitrary destination. `remove` removes deployments and needs `--yes` for unattended use. `resolve` records a collision preference by excluding the losing source's duplicate.
 
 `source add|remove|list|update|locate|alternate|swap` manages sources. For example, pair a development checkout with its normal remote and switch without retyping either location:
 
@@ -48,6 +48,11 @@ Manager-owned state is consolidated beneath `~/.skill-manager/`: `config.json`,
 `cache/`, `backups/`, and `locks/`. On startup, the manager safely and
 idempotently migrates recognized legacy flat configuration, cache, and backup
 locations. Schema migrations archive exact source bytes before conversion.
+
+The manager home is global-only. Running there never creates a duplicate
+project view, and explicit `--project` fails with guidance to use `--global` or
+change to a project directory. Human import output is concise by default;
+global `--verbose` exposes full paths and advanced `configs` details.
 
 Deployments are staged and journaled per skill. A later failed skill does not undo earlier committed skills; the next invocation recovers incomplete work. The manager refuses unsafe tree entries such as links and special files. Details are in [configuration and migration](docs/configuration.md) and [the canonical-deviation ledger](docs/deviations.md).
 

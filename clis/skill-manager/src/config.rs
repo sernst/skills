@@ -1527,6 +1527,26 @@ fn portable_canonicalize(path: &Path) -> PathBuf {
     )
 }
 
+/// Compare filesystem locations using physical identity when possible.
+///
+/// Existing paths are canonicalized so symlinked spellings compare equal. If
+/// canonicalization is unavailable, both paths receive the same lexical and
+/// Windows-prefix normalization used for persisted configuration paths.
+#[must_use]
+pub fn paths_equal(left: &Path, right: &Path) -> bool {
+    let left = portable_canonicalize(left);
+    let right = portable_canonicalize(right);
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
 /// Remove Windows verbatim prefixes so a path is displayed and stored plainly.
 ///
 /// `std::fs::canonicalize` can return `\\?\C:\...` or `\\?\UNC\...` spellings.
@@ -1959,9 +1979,9 @@ mod tests {
     use super::{
         BuiltinTargetSettings, Config, ConfigRepository, FileConfigRepository,
         derive_salted_source_id, derive_source_id, ensure_ascii, find_source_index,
-        is_builtin_name, locations_equal, migrate_v0, normalize_target_template, resolved_targets,
-        resolved_targets_for_scope, source_from_reference, source_location, source_reference,
-        validate_config, validate_source,
+        is_builtin_name, locations_equal, migrate_v0, normalize_target_template, paths_equal,
+        resolved_targets, resolved_targets_for_scope, source_from_reference, source_location,
+        source_reference, validate_config, validate_source,
     };
     use crate::domain::{Scope, SourceEntry, SourceLocation, SourceMode, SourceType, TargetEntry};
 
@@ -1987,6 +2007,32 @@ mod tests {
             serde_json::to_vec(&metadata).unwrap_or_else(|error| unreachable!("{error}")),
         )
         .unwrap_or_else(|error| unreachable!("{error}"));
+    }
+
+    #[test]
+    fn physical_and_lexical_path_identity_detects_home_aliases() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let child = root.path().join("child");
+        std::fs::create_dir_all(&child).unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(paths_equal(root.path(), &child.join("..")));
+        assert!(!paths_equal(root.path(), &child));
+
+        let alias = root.path().join("physical-home-alias");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.path(), &alias)
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            assert!(paths_equal(root.path(), &alias));
+        }
+
+        #[cfg(windows)]
+        {
+            let upper = std::path::PathBuf::from(root.path().to_string_lossy().to_uppercase());
+            assert!(paths_equal(root.path(), &upper));
+            if std::os::windows::fs::symlink_dir(root.path(), &alias).is_ok() {
+                assert!(paths_equal(root.path(), &alias));
+            }
+        }
     }
 
     #[test]

@@ -39,8 +39,9 @@ temporary UTF-8 JSON file and use `skill-manager --input FILE`. Delete only that
 known temporary file afterward. Use inline `--json=OBJECT` only when quoting is
 demonstrably safe.
 
-Treat every recipe invocation as non-interactive. A committed `load` or
-`update` must explicitly select at least one target. A committed `import`
+Treat every recipe invocation as non-interactive. A committed `load` must
+explicitly select at least one target; `update` uses enabled targets when none
+are selected. A committed `import`
 requires `yes:true`, must name exactly one skill, and must narrow target and
 scope selection whenever more than one deployment differs from its source;
 a GitHub-backed source cannot be imported non-interactively at all. `all_targets:true` selects
@@ -48,6 +49,9 @@ enabled configured targets only; select a disabled target explicitly by name
 when the user intends that override. A machine `source.add` must include a
 nonblank `name`. Supply an explicit scope whenever required. Never answer
 prompts, depend on TTY behavior, or use `--color` for machine work.
+
+The manager home is global-only. Never request project scope when CWD resolves
+to the manager home; use global scope or change to a project directory.
 
 Parse every stdout line as an independent NDJSON event and check the process
 exit code. Preserve event order. A failure after action events can mean a

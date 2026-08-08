@@ -41,6 +41,11 @@ resolved beneath either the global manager home or the exact process CWD for
 project scope. Built-ins use `.claude/skills`, `.agents/skills`, and
 `.gemini/antigravity/skills`.
 
+The normalized physical manager home is global-only. If it is also CWD, the
+project root is unavailable rather than resolved to the same directories;
+explicit project operations fail before writes. A child directory of home is
+still a distinct project root.
+
 New templates (including recipe target paths) are normalized by removing a
 leading `~/`, normalizing separators and `.` components, and requiring a
 non-empty path under the selected root. `~user`, absolute paths, and traversal

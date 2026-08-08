@@ -19,7 +19,7 @@ use skill_manager::transaction::NoopTransactionHook;
 fn main() -> ExitCode {
     let mut cli = Cli::parse();
     let machine_mode = cli.machine_mode();
-    let mut reporter = ConsoleReporter::with_color_policy(machine_mode, cli.color);
+    let mut reporter = ConsoleReporter::with_human_options(machine_mode, cli.color, cli.verbose);
     if machine_mode
         && matches!(
             cli.command.as_ref(),

@@ -291,6 +291,71 @@ pub struct PlanEntry {
     pub stat: DiffStat,
 }
 
+/// One changed skill in a grouped update plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupedUpdateEntry {
+    /// Portable skill name.
+    pub skill: String,
+    /// Human-readable aggregate change description.
+    pub change: String,
+    /// One cell per selected target, containing the affected scope label.
+    pub target_scopes: Vec<Option<String>>,
+}
+
+/// Render an update plan with one row per changed skill and one column per target.
+#[must_use]
+pub fn grouped_update_table(
+    entries: &[GroupedUpdateEntry],
+    target_names: &[String],
+    color: bool,
+) -> Vec<String> {
+    let mut headers = vec!["skill".to_owned(), "change".to_owned()];
+    headers.extend(target_names.iter().cloned());
+    let mut widths = headers
+        .iter()
+        .map(|header| display_width(header))
+        .collect::<Vec<_>>();
+    let cells = entries
+        .iter()
+        .map(|entry| {
+            let mut row = vec![entry.skill.clone(), entry.change.clone()];
+            row.extend(entry.target_scopes.iter().map(|scope| {
+                scope
+                    .as_ref()
+                    .map_or_else(|| "—".to_owned(), |scope| format!("↑ {scope}"))
+            }));
+            row
+        })
+        .collect::<Vec<_>>();
+    for row in &cells {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(display_width(cell));
+        }
+    }
+    let header = headers
+        .iter()
+        .enumerate()
+        .map(|(index, value)| padded(value, widths[index]))
+        .collect::<Vec<_>>();
+    let mut lines = vec![join_columns(&header), separator(&widths)];
+    for row in cells {
+        let columns = row
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                let padding = " ".repeat(widths[index].saturating_sub(display_width(cell)));
+                if index >= 2 && cell.starts_with('↑') {
+                    format!("{}{padding}", styled(cell, Some(33), color))
+                } else {
+                    format!("{cell}{padding}")
+                }
+            })
+            .collect::<Vec<_>>();
+        lines.push(join_columns(&columns));
+    }
+    lines
+}
+
 /// Render the shared action table used by `import` and `update`.
 #[must_use]
 pub fn plan_table(entries: &[PlanEntry], symbols: bool, color: bool) -> Vec<String> {

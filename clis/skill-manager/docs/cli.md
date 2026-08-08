@@ -3,14 +3,14 @@
 ## Common behavior
 
 Running without a command is `status`; `ls` and `list` are aliases. `--json`
-emits NDJSON and implies `--no-input`. Non-TTY human output is ANSI-free plain
-text; interactive status tables use compact symbols. `--color auto|always|never`
-controls color and `NO_COLOR` disables it.
+emits NDJSON and implies `--no-input`. `--verbose` adds advanced human details
+and full import paths without changing JSON. `--color auto` colors only a TTY
+and honors `NO_COLOR`; `always` colors even redirected output; `never` is plain.
 
 | Command | Purpose |
 | --- | --- |
 | `load [SOURCE_OR_PATTERN...]` | Discover and deploy skills, replacing existing copies; alias: `install`. |
-| `update [SOURCE_OR_PATTERN...]` | Update skills already deployed in the selected or inferred scope, after one plan confirmation. |
+| `update [SOURCE_OR_PATTERN...]` | Update skills already deployed in the selected or inferred scope, after one plan confirmation; alias: `up`. |
 | `import SKILL` | Adopt one deployed, possibly agent-modified copy as the new source content. |
 | `copy SOURCE DEST` | Copy discovered skills to an arbitrary destination. |
 | `remove [SKILL_OR_PATTERN...]` | Remove selected or auto-detected deployments. |
@@ -39,17 +39,24 @@ and effective-skill selection.
 
 The scope flags are mutually exclusive.
 
+When the physical, normalized CWD is the manager home, project scope is
+unavailable: unscoped commands inspect only global deployments, `load` defaults
+to global, and `configs` explains the unavailable project. Explicit `--project`
+fails before any write and directs the user to `--global` or a project directory.
+A directory below home remains a normal project.
+
 | Command | Scope without an explicit flag |
 | --- | --- |
 | `load` | Prompts once for a scope. The default is project when an enabled selected target's leading directory exists in CWD (such as `.claude`, `.agents`, or `.gemini`); otherwise global. |
-| `update` | Infers scope for every existing skill/target deployment. A project copy wins when both exist; `-g` or `-p` restricts the eligible deployments. |
+| `update` | Infers every existing skill/target deployment, including both scopes when both exist; `-g` or `-p` restricts the eligible deployments. |
 | `import` | Scans both scopes for changed deployments. When more than one differs from the source, it prompts for the copy to import; `-g` or `-p` restricts the scan. |
 | `remove` | Removes an unambiguous existing scope. When any selected skill exists in both scopes, it prompts once for project, global, or both; an explicit flag restricts it. |
 | `status` | Inspects both scopes by default; `-g` or `-p` narrows the report. |
 
 `--json`, recipe input (`--json=…`, `--json-input`, or `--input`), and
-`--no-input` are non-interactive. `load` needs an explicit scope in these modes,
-including for `--dry-run`; an ambiguous `remove` also needs one. The command
+`--no-input` are non-interactive. Outside the manager home, `load` needs an
+explicit scope in these modes, including for `--dry-run`; an ambiguous `remove`
+also needs one. At home, the only available scope is global. The command
 fails with an interaction-required error rather than guessing. `--yes` bypasses
 the destructive removal confirmation only—it never chooses a scope.
 
@@ -60,9 +67,13 @@ spelling for configured-source-only behavior.
 
 ## Change plans for update and import
 
-Interactive `update` renders a change plan before it deploys anything: one
-`update`, `load`, or `skip` row per skill, target, and scope, each with the
-files and text lines that row would change, followed by a count summary and one
+Interactive `update` immediately uses all enabled targets unless selectors
+narrow them. Its plan omits unchanged skills and groups each changed skill into
+one row with a column per selected target (all enabled targets when selectors
+are omitted); cells identify `global`, `project`, `both`, or no action. When
+deployments have different file/line totals, compact target-specific details
+preserve every delta below the grouped row. A no-op prints one concise result
+without a table or confirmation. Changed plans end with a count summary and one
 confirmation defaulting to yes. Declining cancels with exit `0`, emits
 `command.cancelled`, and deploys nothing. `--yes`/`-y` and `--dry-run` print the
 same plan without prompting. `load` never adds this confirmation, and machine
@@ -83,9 +94,19 @@ directory byte-identical to the chosen deployed copy, including deleting source
 files the deployment no longer has, using the same staged, journaled, locked
 transaction as a deployment. `--dry-run` renders the plan and writes nothing.
 
+After a real interactive import, if another enabled, installed deployment is
+now outdated—including another scope of the same target—the CLI defaults to
+offering a review. Accepting shows the standard changed-only update plan and a
+second default-yes confirmation before synchronizing. The invitation is absent
+when nothing remains and is skipped for JSON, `--no-input`, and `--dry-run`.
+Declining that optional second confirmation leaves the successful source import
+in place and explicitly reports that the other deployments were not updated.
+Import `--yes` approves only the source replacement and never silently fans out.
+Normal output uses source and `target · scope` names; `--verbose` adds full paths.
+
 Import writes to local source checkouts only. When the resolved source is
 GitHub-backed, it requires a configured local alternate location and an
-interactive confirmation naming that path, and it imports into that alternate.
+interactive confirmation, and it imports into that alternate.
 Without a resolvable local destination—including in non-interactive mode—it
 fails with an actionable error instead of guessing. That destination is resolved
 only after a candidate is found, so a source that is already up to date never
@@ -171,10 +192,12 @@ unconfigured sources use a deterministic disambiguated short name.
 
 ## Configuration commands
 
-`skill-manager configs` gives an interactive-readable view of the storage,
-global-home, and project roots; schema/persistence state; sources; target
-templates and both resolved locations; exclusions; cache settings; preserved
-unknown fields; and backup metadata. In JSON mode it emits `config.shown`.
+`skill-manager configs` gives a beginner-oriented summary followed by aligned
+Sources, Targets, and Backups sections. It explains storage and scope roots,
+including an unavailable project at home, while hiding internal IDs and schema
+mechanics. `--verbose` adds IDs, target templates, alternate locations,
+overrides, exclusions, and extension fields. In JSON mode it emits the unchanged
+`config.shown` contract.
 
 `configs --raw` is CLI-only and writes the exact active configuration bytes,
 even if they are malformed. It conflicts with JSON and recipe input carriers.

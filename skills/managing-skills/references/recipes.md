@@ -62,7 +62,8 @@ Deploy discovered skills, replacing existing deployments. The recipe alias
 Fields: `command:"load"`; `sources`/`source` (`string|string[]`);
 `filters`/`filter`; source, target, and scope selection; `dry_run` and `refresh`
 (`bool`); `no_input`. A non-interactive call must choose `global:true` or
-`project:true`. A committed non-interactive call must also explicitly select at
+`project:true` outside the manager home. At home, only global is available.
+A committed non-interactive call must also explicitly select at
 least one target using a built-in target boolean, `all_targets:true`, or
 `targets`; a dry run may implicitly preview enabled targets.
 
@@ -73,10 +74,11 @@ least one target using a built-in target boolean, `all_targets:true`, or
 <!-- recipe-command: update fields: all,all_targets,antigravity,cd,cd_only,claude,command,dry_run,filter,filters,global,no_cd,no_input,project,refresh,shared,source,sources,target,targets,yes -->
 ### `update`
 
-Refresh only existing deployments. Fields match `load` plus `yes` (`bool`). A
-committed non-interactive call must explicitly select at least one target; a
-dry run may implicitly preview enabled targets. Without an explicit scope it
-infers each existing deployment; specify a scope to restrict it. The human
+Refresh only existing deployments. Fields match `load` plus `yes` (`bool`).
+The recipe alias `up` canonicalizes to `update`; emit `"command":"update"`.
+When targets are omitted, update uses enabled targets in both committed and dry
+runs. Without an explicit scope it infers each existing deployment; specify a
+scope to restrict it. The human
 pre-confirmation plan and its `yes` bypass are interactive-only; recipe
 carriers are already non-interactive and never prompt.
 

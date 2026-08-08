@@ -142,7 +142,8 @@ sources -> discovered skills -> targets
   (`.gemini/antigravity/skills`).
 - A **scope** resolves a target beneath the manager home (`global`) or the exact
   current working directory (`project`). A project deployment takes precedence
-  over a global deployment.
+  over a global deployment. When CWD is the manager home, only global scope is
+  available; explicit `--project` is rejected instead of aliasing global files.
 
 Manager-owned configuration, cache, backups, and locks live beneath
 `~/.skill-manager/` by default. Set `SKILL_MANAGER_HOME` to isolate that state.

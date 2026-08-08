@@ -729,7 +729,7 @@ fn command_name(command: &Command) -> &'static str {
 fn canonical_command(value: &str) -> Result<&'static str> {
     match value {
         "load" | "install" => Ok("load"),
-        "update" => Ok("update"),
+        "update" | "up" => Ok("update"),
         "import" => Ok("import"),
         "copy" => Ok("copy"),
         "remove" => Ok("remove"),

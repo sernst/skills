@@ -29,6 +29,9 @@ pub struct Cli {
     /// Color policy for human output.
     #[arg(long, global = true, value_enum, default_value_t = ColorChoice::Auto)]
     pub color: ColorChoice,
+    /// Show advanced details and full paths in human output.
+    #[arg(long, global = true)]
+    pub verbose: bool,
     /// Requested operation; omitted means `status`.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -60,7 +63,8 @@ pub enum Command {
     /// Deploy source skills, replacing existing deployments.
     #[command(visible_alias = "install")]
     Load(SyncArgs),
-    /// Refresh only skills already deployed.
+    /// Refresh only skills already deployed. Alias: up.
+    #[command(visible_alias = "up")]
     Update(UpdateArgs),
     /// Adopt a deployed skill copy as the new source content.
     Import(ImportArgs),

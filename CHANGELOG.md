@@ -2,6 +2,14 @@
 
 All notable changes to the downloadable CLIs are documented here.
 
+## 0.1.2 - 2026-08-08
+
+- Treats the manager home as global-only across every scoped command, preventing duplicate project deployments and rejecting explicit `--project` use there with clear guidance.
+- Redesigns import output around concise source and target labels, with full paths available through the new global `--verbose` option, and offers an explicitly reviewed update of other outdated installed copies after interactive imports.
+- Adds `up` as an alias for `update` and replaces noisy per-deployment plans with changed-only, one-row-per-skill target matrices and concise no-op results.
+- Reworks `configs` into beginner-friendly configuration, source, target, and backup sections while retaining exact `--raw` output and exposing advanced details through `--verbose`.
+- Makes `--color always` work when output is redirected while preserving TTY-only `auto` behavior and ANSI-free `never` output.
+
 ## 0.1.1 - 2026-08-07
 
 - Added `import`, which adopts an agent-modified deployed skill copy as the new canonical source content after showing a git-style change plan.

@@ -100,7 +100,7 @@ fn recipe_overlay_covers_transfer_command_shapes() {
 
 /// `install` is an alias for `load`, and `import` is its own strict shape.
 #[test]
-fn recipe_overlay_covers_the_install_alias_and_import_command() {
+fn recipe_overlay_covers_sync_aliases_and_import_command() {
     let installed = recipe(&serde_json::json!({
         "command": "install",
         "sources": ["primary"],
@@ -122,6 +122,15 @@ fn recipe_overlay_covers_the_install_alias_and_import_command() {
     .expect("parse install alias");
     apply_recipe(&mut argv_alias).expect("install alias matches the load command");
     assert!(matches!(argv_alias.command, Some(Command::Load(_))));
+
+    let updated = recipe(&serde_json::json!({
+        "command": "up",
+        "filters": ["alpha"]
+    }));
+    let Some(Command::Update(args)) = updated.command else {
+        unreachable!("up must canonicalize to update")
+    };
+    assert_eq!(args.sync.filters, ["alpha"]);
 
     let imported = recipe(&serde_json::json!({
         "command": "import",
