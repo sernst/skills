@@ -36,22 +36,41 @@ model), that request overrides this default.
 
 **Identify your harness once, then apply exactly one of the profiles below.**
 Determine which harness you are running in and apply only the matching
-profile — entirely ignore the other three; rules written for a profile that
+profile — entirely ignore the other four; rules written for a profile that
 isn't yours must never influence your decisions.
+
+## Cursor
+
+This profile applies only if you are running in the Cursor product family
+(Cursor Desktop, Cursor CLI, or Cursor Cloud Agents / background agents). If
+that is not you, skip this profile entirely. Match on the Cursor harness, not
+on the parent model's brand — a Claude- or GPT-family parent in Cursor still
+uses this profile.
+
+Left unspecified, Cursor subagents default to the parent model. You must
+explicitly pass a `model` slug on every subagent dispatch, matching tier
+weight to task complexity as a judgment call. Effort / thinking level is
+controlled only via that slug (for example light/fast presets versus heavier
+thinking/sol-style presets); do not invent a separate effort parameter, and do
+not omit `model` or pass `inherit` as a cost-control strategy. Exact
+identifiers vary by account and change over time — use whatever matching
+latest generally-available class your harness exposes for the weight you
+chose; do not treat any example slug as canonical, and do not default to
+`auto`.
 
 ## Claude family
 
 This profile applies only if you are a Claude-family agent (Claude Code,
-Claude via the native API, or similar). If that is not you, skip this profile
-entirely. Claude harnesses already handle subagent tier selection natively and
-implicitly, so no additional tier-selection mechanics apply beyond the general
-rules above.
+Claude via the native API, or similar) and not running in Cursor. If that is
+not you, skip this profile entirely. Claude harnesses already handle
+subagent tier selection natively and implicitly, so no additional
+tier-selection mechanics apply beyond the general rules above.
 
 ## GPT/Codex family outside GitHub Copilot
 
 This profile applies only if you are a GPT/Codex-family agent running outside
-GitHub Copilot (an OpenAI model via the native API, Codex CLI, or ChatGPT). If
-that is not you, skip this profile entirely.
+GitHub Copilot (an OpenAI model via the native API, Codex CLI, or ChatGPT)
+and not running in Cursor. If that is not you, skip this profile entirely.
 
 Unlike Claude, you will not automatically launch subagents on a lighter
 tier — left unspecified, your subagents default to your own model. You must
@@ -95,7 +114,7 @@ on failure.
 ## Any other harness
 
 This profile applies only if you are running in a harness not covered by the
-three profiles above. If that is not you, skip this profile entirely. Apply
+four profiles above. If that is not you, skip this profile entirely. Apply
 the general rules only, and do not import rules from the other profiles.
 Determine whether this harness's subagents inherit the parent model by
 default; if they do, explicitly pick an appropriately light tier per sub-task
