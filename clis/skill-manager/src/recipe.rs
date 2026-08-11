@@ -266,6 +266,7 @@ fn overlay_remove(args: &mut RemoveArgs, object: &Map<String, Value>, base: &Pat
             "yes",
             "global",
             "project",
+            "both",
         ],
     )?;
     overlay_references(&mut args.skills, object, &["skills", "skill"], base)?;
@@ -273,9 +274,16 @@ fn overlay_remove(args: &mut RemoveArgs, object: &Map<String, Value>, base: &Pat
     overlay_source_selection(&mut args.source_selection, object)?;
     overlay_target_selection(&mut args.targets, object)?;
     overlay_scope_selection(&mut args.scope, object)?;
+    overlay_bool(&mut args.both, object.get("both"))?;
     overlay_bool(&mut args.dry_run, object.get("dry_run"))?;
     overlay_bool(&mut args.refresh, object.get("refresh"))?;
-    overlay_bool(&mut args.yes, object.get("yes"))
+    overlay_bool(&mut args.yes, object.get("yes"))?;
+    if args.both && args.scope.is_explicit() {
+        return Err(SkillManagerError::InvalidInput(
+            "both is mutually exclusive with global and project".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn overlay_status(args: &mut StatusArgs, object: &Map<String, Value>) -> Result<()> {

@@ -1807,7 +1807,9 @@ fn human_prompts_cover_text_confirmation_cancellation_and_invalid_answers() {
         .write_stdin("n\n")
         .assert()
         .success()
-        .stderr(predicate::str::contains("Remove 1 skill deployment(s)?"));
+        .stderr(predicate::str::contains(
+            "Remove this deployment from 1 selected target?",
+        ));
     assert!(target.join("alpha/SKILL.md").is_file());
 
     cli(home.path())
@@ -1815,7 +1817,9 @@ fn human_prompts_cover_text_confirmation_cancellation_and_invalid_answers() {
         .write_stdin("y\n")
         .assert()
         .success()
-        .stderr(predicate::str::contains("Remove 1 skill deployment(s)?"));
+        .stderr(predicate::str::contains(
+            "Remove this deployment from 1 selected target?",
+        ));
     assert!(!target.join("alpha").exists());
 }
 
@@ -2258,7 +2262,9 @@ fn project_scope_overrides_global_and_update_remove_infer_existing_scope() {
         .args(["--json", "remove", "alpha", "--target", "custom", "--yes"])
         .assert()
         .failure()
-        .stdout(predicate::str::contains("--global or --project"));
+        .stdout(predicate::str::contains(
+            "choose --project, --global, or --both",
+        ));
 
     let mut project_remove = cli(home.path());
     project_remove.current_dir(&project);
@@ -6549,5 +6555,1053 @@ fn load_with_no_positional_operands_still_deploys_everything() {
         names,
         BTreeSet::from(["alpha", "beta"]),
         "no-operand load must deploy every discovered skill"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `remove`: plan-first review, scope-ambiguity selection, and preserved
+// blast-radius contracts (Stage 3).
+// ---------------------------------------------------------------------------
+
+/// `teach` deployed to `claude`+`shared` at both global and project scope:
+/// the canonical scope-ambiguity fixture for the removal-scope branch.
+/// Returns the home sandbox and its `project` subdirectory; the ambiguity is
+/// only visible once the working directory is under `project`, mirroring how
+/// project scope is discovered elsewhere in this suite.
+fn remove_ambiguous_fixture() -> (TempDir, PathBuf) {
+    let home = sandbox();
+    let source = home.path().join("source");
+    let project = home.path().join("project");
+    fs::create_dir_all(&project).expect("create project directory");
+    create_skill(&source, "teach", "# teach");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args([
+            "--json", "load", "teach", "--claude", "--shared", "--global",
+        ])
+        .assert()
+        .success();
+    let mut project_load = cli(home.path());
+    project_load.current_dir(&project);
+    project_load
+        .args([
+            "--json",
+            "load",
+            "teach",
+            "--claude",
+            "--shared",
+            "--project",
+        ])
+        .assert()
+        .success();
+    (home, project)
+}
+
+/// The rendered scope-branch table shared by every ambiguous-`teach` test:
+/// availability evidence, then the three numbered alternatives with their own
+/// blast radius, before any prompt is asked. Ends with exactly one trailing
+/// newline, mirroring `UPDATE_REVIEW_PLAN`'s convention, so callers splice
+/// their own conclusion after it.
+const REMOVE_BRANCH_TABLE: &str = "\
+Remove plan
+
+Available deployments
+
+skill  files/deploy  claude  shared
+-----  ------------  ------  ------
+teach  1             both    both
+
+  1  Remove project copies  − 2 deployments, 2 files
+  2  Remove global copies   − 2 deployments, 2 files
+  3  Remove both copies     − 4 deployments, 4 files
+";
+
+/// The both-scopes branch renders every alternative's blast radius before
+/// asking anything, and a dry run enumerates them without offering to
+/// cancel, per the Stage 1 fixture
+/// (`a_dry_run_remove_enumerates_alternatives_without_offering_to_cancel`).
+#[test]
+fn remove_dry_run_enumerates_scope_alternatives_without_offering_to_cancel() {
+    let (home, project) = remove_ambiguous_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let output = remove
+        .args(["remove", "teach", "--claude", "--shared", "--dry-run"])
+        .output()
+        .expect("run ambiguous dry-run remove");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output.clone()),
+        format!(
+            "{REMOVE_BRANCH_TABLE}\n\
+Dry run — 3 alternatives shown; no option selected and no changes were made.\n"
+        )
+    );
+    assert!(stderr_of(&output).is_empty(), "a dry run never prompts");
+}
+
+/// Cancelling the numbered selection (`c`) exits 0 with no writes and prints
+/// exactly `Cancelled.`, no hint: the branch itself just taught the scope
+/// decision, so there is nothing left to teach.
+#[test]
+fn remove_scope_selection_cancels_with_no_hint_and_no_writes() {
+    let (home, project) = remove_ambiguous_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let output = remove
+        .args(["remove", "teach", "--claude", "--shared"])
+        .write_stdin("c\n")
+        .output()
+        .expect("run cancelled selection remove");
+    assert!(output.status.success(), "cancelling is not a failure");
+    assert_eq!(
+        stdout_of(output.clone()),
+        format!("{REMOVE_BRANCH_TABLE}  c  Cancel\n\nCancelled.\n")
+    );
+    assert_eq!(
+        stderr_of(&output),
+        "Select removal scope [1-3, c to cancel]: "
+    );
+    assert!(
+        home.path().join(".claude/skills/teach/SKILL.md").is_file(),
+        "cancelling writes nothing"
+    );
+    assert!(
+        project.join(".claude/skills/teach/SKILL.md").is_file(),
+        "cancelling writes nothing"
+    );
+}
+
+/// Two empty answers and one invalid token all reprompt with the exact same
+/// instruction; the selection never auto-picks an option, and only the final
+/// `c` resolves it.
+#[test]
+fn remove_scope_selection_reprompts_on_invalid_and_empty_input_without_auto_selecting() {
+    let (home, project) = remove_ambiguous_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let output = remove
+        .args(["remove", "teach", "--claude", "--shared"])
+        .write_stdin("\nbogus\nc\n")
+        .output()
+        .expect("run reprompted selection remove");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output.clone()),
+        format!("{REMOVE_BRANCH_TABLE}  c  Cancel\n\nCancelled.\n")
+    );
+    assert_eq!(
+        stderr_of(&output),
+        "Select removal scope [1-3, c to cancel]: Enter 1, 2, 3, or c.\n\
+Select removal scope [1-3, c to cancel]: Enter 1, 2, 3, or c.\n\
+Select removal scope [1-3, c to cancel]: "
+    );
+}
+
+/// Selecting `1` at the branch removes only the project copies, leaving the
+/// global copies untouched.
+#[test]
+fn remove_scope_selection_option_1_removes_only_project_copies() {
+    let (home, project) = remove_ambiguous_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let output = remove
+        .args(["remove", "teach", "--claude", "--shared"])
+        .write_stdin("1\n")
+        .output()
+        .expect("run project-only selection remove");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output),
+        format!(
+            "{REMOVE_BRANCH_TABLE}  c  Cancel\n\n\n\
+Removed teach from claude (project)\n\
+Removed teach from shared (project)\n\
+\n\
+completed: 2 deployments removed (1 skill, 2 files)\n"
+        )
+    );
+    assert!(
+        home.path().join(".claude/skills/teach/SKILL.md").is_file(),
+        "the global copy survives choosing the project-only option"
+    );
+    assert!(
+        !project.join(".claude/skills/teach").exists(),
+        "the project copy is gone"
+    );
+}
+
+/// Selecting `2` at the branch removes only the global copies, leaving the
+/// project copies untouched.
+#[test]
+fn remove_scope_selection_option_2_removes_only_global_copies() {
+    let (home, project) = remove_ambiguous_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let output = remove
+        .args(["remove", "teach", "--claude", "--shared"])
+        .write_stdin("2\n")
+        .output()
+        .expect("run global-only selection remove");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output),
+        format!(
+            "{REMOVE_BRANCH_TABLE}  c  Cancel\n\n\n\
+Removed teach from claude (global)\n\
+Removed teach from shared (global)\n\
+\n\
+completed: 2 deployments removed (1 skill, 2 files)\n"
+        )
+    );
+    assert!(
+        !home.path().join(".claude/skills/teach").exists(),
+        "the global copy is gone"
+    );
+    assert!(
+        project.join(".claude/skills/teach/SKILL.md").is_file(),
+        "the project copy survives choosing the global-only option"
+    );
+}
+
+/// Selecting `3` at the branch removes both copies.
+#[test]
+fn remove_scope_selection_option_3_removes_both_copies() {
+    let (home, project) = remove_ambiguous_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let output = remove
+        .args(["remove", "teach", "--claude", "--shared"])
+        .write_stdin("3\n")
+        .output()
+        .expect("run both-scopes selection remove");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output),
+        format!(
+            "{REMOVE_BRANCH_TABLE}  c  Cancel\n\n\n\
+Removed teach from claude (global)\n\
+Removed teach from claude (project)\n\
+Removed teach from shared (global)\n\
+Removed teach from shared (project)\n\
+\n\
+completed: 4 deployments removed (1 skill, 4 files)\n"
+        )
+    );
+    assert!(!home.path().join(".claude/skills/teach").exists());
+    assert!(!project.join(".claude/skills/teach").exists());
+}
+
+/// The remove-only `--both` flag reaches the same both-scopes outcome
+/// noninteractively, collapsing the branch to a plain action table (each
+/// cell annotated `remove both`, since the destination still spans both
+/// scopes even though the choice is no longer open).
+#[test]
+fn remove_both_flag_collapses_the_branch_and_removes_both_copies_noninteractively() {
+    let (home, project) = remove_ambiguous_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let output = remove
+        .args(["remove", "teach", "--claude", "--shared", "--both", "--yes"])
+        .output()
+        .expect("run --both --yes remove");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output),
+        "\
+Remove plan
+
+skill  files/deploy  claude       shared
+-----  ------------  -----------  -----------
+teach  1             remove both  remove both
+
+4 deployment removals across 2 selected targets: 4 remove; 1 skill, 4 files
+
+Removed teach from claude (global)
+Removed teach from claude (project)
+Removed teach from shared (global)
+Removed teach from shared (project)
+
+completed: 4 deployments removed (1 skill, 4 files)
+"
+    );
+    assert!(!home.path().join(".claude/skills/teach").exists());
+    assert!(!project.join(".claude/skills/teach").exists());
+}
+
+/// Without `--yes`/`--both`, `--no-input` refuses a genuinely ambiguous
+/// remove rather than silently guessing a scope — the plan still renders
+/// (without the interactive `c Cancel` row, since nothing will be asked),
+/// and nothing is written.
+#[test]
+fn remove_no_input_refuses_an_ambiguous_scope_without_yes_or_both() {
+    let (home, project) = remove_ambiguous_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let output = remove
+        .args(["remove", "teach", "--claude", "--shared", "--no-input"])
+        .output()
+        .expect("run no-input ambiguous remove");
+    assert!(!output.status.success());
+    assert_eq!(
+        stdout_of(output.clone()),
+        format!("{REMOVE_BRANCH_TABLE}\n")
+    );
+    assert_eq!(
+        stderr_of(&output),
+        "Error: selected skills exist in both scopes; choose --project, --global, or --both before using --yes.\n"
+    );
+    assert!(home.path().join(".claude/skills/teach/SKILL.md").is_file());
+    assert!(project.join(".claude/skills/teach/SKILL.md").is_file());
+}
+
+/// `--yes` alone (no `--project`/`--global`/`--both`) is refused the same
+/// way: `remove` never auto-picks a scope just because the user pre-approved
+/// applying the plan.
+#[test]
+fn remove_yes_without_a_scope_refuses_when_genuinely_ambiguous() {
+    let (home, project) = remove_ambiguous_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let output = remove
+        .args(["remove", "teach", "--claude", "--shared", "--yes"])
+        .output()
+        .expect("run --yes ambiguous remove");
+    assert!(!output.status.success());
+    assert_eq!(
+        stdout_of(output.clone()),
+        format!("{REMOVE_BRANCH_TABLE}\n")
+    );
+    assert_eq!(
+        stderr_of(&output),
+        "Error: selected skills exist in both scopes; choose --project, --global, or --both before using --yes.\n"
+    );
+    assert!(home.path().join(".claude/skills/teach/SKILL.md").is_file());
+    assert!(project.join(".claude/skills/teach/SKILL.md").is_file());
+}
+
+/// An explicit scope collapses the branch entirely: the plan is a plain
+/// action table, authorized by a `[y/N]` confirmation defaulting to No.
+/// `--yes` still renders the plan before applying it.
+#[test]
+fn remove_explicit_scope_collapses_to_a_plain_action_table_and_yes_applies_it() {
+    let (home, project) = remove_ambiguous_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let output = remove
+        .args([
+            "remove", "teach", "--claude", "--shared", "--global", "--yes",
+        ])
+        .output()
+        .expect("run explicit-scope --yes remove");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output),
+        "\
+Remove plan
+
+skill  files/deploy  claude  shared
+-----  ------------  ------  ------
+teach  1             remove  remove
+
+2 deployment removals across 2 selected targets: 2 remove; 1 skill, 2 files
+
+Removed teach from claude (global)
+Removed teach from shared (global)
+
+completed: 2 deployments removed (1 skill, 2 files)
+"
+    );
+    assert!(!home.path().join(".claude/skills/teach").exists());
+    assert!(
+        project.join(".claude/skills/teach/SKILL.md").is_file(),
+        "an explicit --global scope must never touch the project copy"
+    );
+}
+
+/// Cancelling the plain `[y/N]` confirmation for an explicit, unambiguous
+/// scope prints `Cancelled.` with no hint: nothing was inferred, so there is
+/// no flag left to teach.
+#[test]
+fn remove_explicit_scope_cancel_prints_no_hint_when_nothing_was_inferred() {
+    let (home, project) = remove_ambiguous_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let output = remove
+        .args(["remove", "teach", "--claude", "--shared", "--global"])
+        .write_stdin("n\n")
+        .output()
+        .expect("run explicit-scope cancel remove");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output.clone()),
+        "\
+Remove plan
+
+skill  files/deploy  claude  shared
+-----  ------------  ------  ------
+teach  1             remove  remove
+
+2 deployment removals across 2 selected targets: 2 remove; 1 skill, 2 files
+Cancelled.
+"
+    );
+    assert_eq!(
+        stderr_of(&output),
+        "Remove these 2 deployments from 2 selected targets? [y/N] "
+    );
+    assert!(home.path().join(".claude/skills/teach/SKILL.md").is_file());
+    assert!(project.join(".claude/skills/teach/SKILL.md").is_file());
+}
+
+/// Cancelling the plain `[y/N]` confirmation when targets and scope were
+/// *inferred* (not stated) teaches exactly which flags to add next time,
+/// mirroring `update`'s and `load`'s cancel hints.
+#[test]
+fn remove_cancel_teaches_inferred_target_and_scope_hints() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "solo-skill", "# solo");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args(["--json", "load", "solo-skill", "--claude", "--global"])
+        .assert()
+        .success();
+
+    let output = cli(home.path())
+        .args(["remove", "solo-skill"])
+        .write_stdin("n\n")
+        .output()
+        .expect("run inferred-target cancel remove");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output.clone()),
+        "\
+Remove plan
+
+remove solo-skill from claude: 1 file
+
+1 deployment removal across 1 target: 1 remove; 1 skill, 1 file
+Cancelled.
+Hint: targets and deployed scopes were inferred. Re-run with --claude, --shared, --antigravity, --all, or --target NAME, and --global or --project, to narrow this plan.
+"
+    );
+    assert_eq!(
+        stderr_of(&output),
+        "Remove this deployment from 1 target? [y/N] "
+    );
+    assert!(
+        home.path()
+            .join(".claude/skills/solo-skill/SKILL.md")
+            .is_file(),
+        "cancelling writes nothing"
+    );
+}
+
+/// `teach` (ambiguous, both scope), plus two unrelated deployed skills and a
+/// skill deployed to only one scope: the shared fixture for the bare-remove
+/// full-blast-radius test and the originating-scenario regression.
+fn remove_originating_scenario_fixture() -> (TempDir, PathBuf) {
+    let home = sandbox();
+    let source = home.path().join("source");
+    let project = home.path().join("project");
+    fs::create_dir_all(&project).expect("create project directory");
+    for name in ["teach", "solo-skill", "other-one", "other-two"] {
+        create_skill(&source, name, &format!("# {name}"));
+    }
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args([
+            "--json", "load", "teach", "--claude", "--shared", "--global",
+        ])
+        .assert()
+        .success();
+    let mut project_load = cli(home.path());
+    project_load.current_dir(&project);
+    project_load
+        .args([
+            "--json",
+            "load",
+            "teach",
+            "--claude",
+            "--shared",
+            "--project",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args(["--json", "load", "solo-skill", "--claude", "--global"])
+        .assert()
+        .success();
+    for name in ["other-one", "other-two"] {
+        cli(home.path())
+            .args(["--json", "load", name, "--claude", "--shared", "--global"])
+            .assert()
+            .success();
+    }
+    (home, project)
+}
+
+/// **Originating-scenario regression.** A single named skill that exists
+/// across many deployments — while other, unrelated skills are also
+/// deployed — must render a plan naming exactly that skill and its real
+/// deployments: never a bare aggregate count (`Remove 30 skill
+/// deployment(s)?`), and never the other skills. This is the exact defect
+/// that triggered this whole effort.
+#[test]
+fn remove_originating_scenario_names_exactly_the_requested_skill_and_its_deployments() {
+    let (home, project) = remove_originating_scenario_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let output = remove
+        .args(["remove", "teach", "--claude", "--shared", "--dry-run"])
+        .output()
+        .expect("run originating-scenario dry-run remove");
+    assert!(output.status.success());
+    let stdout = stdout_of(output);
+    assert_eq!(
+        stdout,
+        format!(
+            "{REMOVE_BRANCH_TABLE}\n\
+Dry run — 3 alternatives shown; no option selected and no changes were made.\n"
+        ),
+        "the plan must name exactly teach and its own deployments, \
+         never a bare count and never the other deployed skills:\n{stdout}"
+    );
+    assert!(!stdout.contains("solo-skill"));
+    assert!(!stdout.contains("other-one"));
+    assert!(!stdout.contains("other-two"));
+    assert!(
+        !stdout.contains("skill deployment(s)"),
+        "the bare-count prompt that triggered this effort must never reappear"
+    );
+}
+
+/// A literal skill name that is not deployed anywhere reports precisely
+/// that, exits 0, and renders neither a table nor a prompt.
+#[test]
+fn remove_names_a_literal_skill_that_is_not_deployed_anywhere() {
+    let (home, _project) = remove_originating_scenario_fixture();
+    let output = cli(home.path())
+        .args(["remove", "nonexistent-skill"])
+        .output()
+        .expect("run undeployed-literal remove");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output),
+        "nonexistent-skill is not deployed to any enabled target in global or project scope.\n"
+    );
+}
+
+/// A syntactically valid pattern matching nothing keeps the existing
+/// `NotFound` contract: nonzero exit, and no plan is ever rendered.
+#[test]
+fn remove_names_an_unmatched_glob_pattern_as_not_found() {
+    let (home, _project) = remove_originating_scenario_fixture();
+    let output = cli(home.path())
+        .args(["remove", "zzz-nomatch-*"])
+        .output()
+        .expect("run unmatched-pattern remove");
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr_of(&output),
+        "Warning: skill pattern matched nothing: zzz-nomatch-*\n\
+Error: deployed skill matching positional pattern not found: zzz-nomatch-*\n"
+    );
+    assert!(
+        stdout_of(output).is_empty(),
+        "no plan is rendered for a NotFound pattern"
+    );
+}
+
+/// Bare `remove` (no operands) still means "every discovered source
+/// winner," and the plan is what makes that blast radius visible before
+/// anything is asked or applied — run from a cwd where project scope is not
+/// reachable, so `teach` resolves unambiguously alongside the rest.
+#[test]
+fn remove_bare_invocation_shows_the_full_blast_radius_before_applying() {
+    let (home, _project) = remove_originating_scenario_fixture();
+    let output = cli(home.path())
+        .args(["remove", "--yes"])
+        .output()
+        .expect("run bare remove --yes");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output),
+        "\
+Remove plan
+
+skill       files/deploy  claude  shared
+----------  ------------  ------  ------
+other-one   1             remove  remove
+other-two   1             remove  remove
+solo-skill  1             remove  none
+teach       1             remove  remove
+
+7 deployment removals across 2 targets: 7 remove; 4 skills, 7 files
+
+Removed other-one from claude (global)
+Removed other-one from shared (global)
+Removed other-two from claude (global)
+Removed other-two from shared (global)
+Removed solo-skill from claude (global)
+Removed teach from claude (global)
+Removed teach from shared (global)
+
+completed: 7 deployments removed (4 skills, 7 files)
+"
+    );
+}
+
+/// Plan order must equal apply order: reversing the requested names reverses
+/// both the rendered rows and the applied progress lines identically.
+#[test]
+fn remove_reviews_and_applies_skills_in_the_order_they_were_requested() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "zebra-skill", "# zebra");
+    create_skill(&source, "alpha-skill", "# alpha");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args(["--json", "load", "--claude", "--global"])
+        .assert()
+        .success();
+
+    let output = cli(home.path())
+        .args([
+            "remove",
+            "zebra-skill",
+            "alpha-skill",
+            "--claude",
+            "--global",
+            "--yes",
+        ])
+        .output()
+        .expect("run reversed-order remove");
+    assert!(output.status.success());
+    let stdout = stdout_of(output);
+    let rows = stdout
+        .lines()
+        .filter(|line| line.contains("1             remove"))
+        .map(|line| line.split_whitespace().next().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        ["zebra-skill", "alpha-skill"],
+        "reviewing in request order is not alphabetical order:\n{stdout}"
+    );
+    let applied = stdout
+        .lines()
+        .filter(|line| line.starts_with("Removed "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        applied,
+        [
+            "Removed zebra-skill from claude (global)",
+            "Removed alpha-skill from claude (global)",
+        ],
+        "apply must honour the order the plan promised:\n{stdout}"
+    );
+}
+
+/// A terminal user reviews the branch plan in the symbol vocabulary, in
+/// color, and a dry run still enumerates alternatives without a cancel row.
+#[test]
+fn remove_renders_the_interactive_symbol_and_color_branch_plan_for_a_terminal_user() {
+    let (home, project) = remove_ambiguous_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let stdout = stdout_of(
+        remove
+            .env_remove("NO_COLOR")
+            .env("SKILL_MANAGER_FORCE_INTERACTIVE", "1")
+            .args([
+                "remove",
+                "teach",
+                "--claude",
+                "--shared",
+                "--color",
+                "always",
+                "--dry-run",
+            ])
+            .output()
+            .expect("run interactive dry-run remove"),
+    );
+    assert_eq!(
+        stdout,
+        "\u{1b}[1;36mRemove plan\u{1b}[0m\n\
+\n\
+\u{1b}[1;36mAvailable deployments\u{1b}[0m\n\
+\n\
+skill  files/deploy  claude  shared\n\
+-----  ------------  ------  ------\n\
+teach  1             ↕ both  ↕ both\n\
+\n\
+\x20\x201  Remove project copies  \u{1b}[31m− 2 deployments, 2 files\u{1b}[0m\n\
+\x20\x202  Remove global copies   \u{1b}[31m− 2 deployments, 2 files\u{1b}[0m\n\
+\x20\x203  Remove both copies     \u{1b}[31m− 4 deployments, 4 files\u{1b}[0m\n\
+\n\
+Dry run — 3 alternatives shown; no option selected and no changes were made.\n"
+    );
+}
+
+/// The same terminal user reviewing an explicit, unambiguous scope sees the
+/// plain action table in the symbol vocabulary: a bare `−` (colored) with no
+/// location suffix, since the destination no longer varies across scopes.
+#[test]
+fn remove_renders_the_interactive_symbol_and_color_collapsed_plan_for_a_terminal_user() {
+    let (home, project) = remove_ambiguous_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let stdout = stdout_of(
+        remove
+            .env_remove("NO_COLOR")
+            .env("SKILL_MANAGER_FORCE_INTERACTIVE", "1")
+            .args([
+                "remove",
+                "teach",
+                "--claude",
+                "--shared",
+                "--global",
+                "--color",
+                "always",
+                "--dry-run",
+            ])
+            .output()
+            .expect("run interactive collapsed dry-run remove"),
+    );
+    assert_eq!(
+        stdout,
+        "\u{1b}[1;36mRemove plan\u{1b}[0m\n\
+\n\
+skill  files/deploy  claude  shared\n\
+-----  ------------  ------  ------\n\
+teach  1             \u{1b}[31m−\u{1b}[0m       \u{1b}[31m−\u{1b}[0m\n\
+\n\
+2 deployment removals across 2 selected targets: \u{1b}[31m− 2 remove\u{1b}[0m; 1 skill, 2 files\n\
+\n\
+Dry run — no changes were made.\n"
+    );
+}
+
+/// The NDJSON stream carries a single `plan` event at revision 0, ahead of
+/// every write, whose `decisions[0].options` carry each alternative's own
+/// typed consequence (`operation` and `totals`) — never gated columns, and
+/// never a bare count.
+#[test]
+fn remove_emits_a_structured_plan_event_with_per_option_consequences_before_applying() {
+    let (home, project) = remove_ambiguous_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let events = json_events(
+        remove
+            .args([
+                "--json",
+                "remove",
+                "teach",
+                "--claude",
+                "--shared",
+                "--dry-run",
+            ])
+            .output()
+            .expect("run machine ambiguous dry-run remove"),
+    );
+    let plans = events_of(&events, "plan");
+    assert_eq!(plans.len(), 1, "one revision was reviewed");
+    let data = plans[0]["data"].clone();
+    assert_eq!(data["plan_id"], "remove:teach");
+    assert_eq!(data["revision"], 0);
+    assert_eq!(data["command"], "remove");
+    assert_eq!(data["dry_run"], true);
+    assert_eq!(data["authorization"]["kind"], "selection");
+    assert_eq!(data["authorization"]["mode"], "dry-run");
+    assert_eq!(data["selection"]["targets"]["mode"], "explicit");
+    assert_eq!(
+        data["selection"]["targets"]["names"],
+        serde_json::json!(["claude", "shared"])
+    );
+    assert_eq!(
+        data["selection"]["scope"],
+        serde_json::json!({ "mode": "inferred" }),
+        "an unresolved branch reports scope as inferred, with no value yet chosen"
+    );
+    assert_eq!(data["entries"][0]["skill"], "teach");
+    assert_eq!(
+        data["entries"][0]["available"],
+        serde_json::json!([
+            "claude:global",
+            "claude:project",
+            "shared:global",
+            "shared:project"
+        ]),
+        "availability is evidence, never an action, while the branch is open"
+    );
+    assert_eq!(
+        data["entries"][0]["actions"],
+        serde_json::json!([]),
+        "no action is machine-recorded until a scope is actually chosen"
+    );
+    let decision = data["decisions"][0].clone();
+    assert_eq!(decision["id"], "removal_scope");
+    let options = decision["options"].as_array().expect("decision options");
+    assert_eq!(options.len(), 3);
+    assert_eq!(options[0]["id"], "project");
+    assert_eq!(options[0]["token"], "1");
+    assert_eq!(
+        options[0]["consequence"],
+        serde_json::json!({ "operation": "remove", "totals": { "deployments": 2, "files": 2 } })
+    );
+    assert_eq!(options[1]["id"], "global");
+    assert_eq!(options[1]["token"], "2");
+    assert_eq!(
+        options[1]["consequence"],
+        serde_json::json!({ "operation": "remove", "totals": { "deployments": 2, "files": 2 } })
+    );
+    assert_eq!(options[2]["id"], "both");
+    assert_eq!(options[2]["token"], "3");
+    assert_eq!(
+        options[2]["consequence"],
+        serde_json::json!({ "operation": "remove", "totals": { "deployments": 4, "files": 4 } }),
+        "every alternative's own blast radius travels with it in the machine stream"
+    );
+}
+
+/// `drifted` deployed to `claude`+`shared` at both scopes, with every one of
+/// its four deployments carrying a genuinely different file count (1, 2, 3,
+/// and 1 files respectively). This is the regression fixture for the
+/// blast-radius-understatement defect: a per-skill count borrowed from
+/// "whichever copy discovery found first" and then multiplied across cells
+/// would report the same number for every option regardless of which real
+/// deployments that option actually deletes. Divergence spans both scope
+/// (global vs. project) and target (claude vs. shared) so neither axis alone
+/// could hide a regression.
+fn remove_divergent_deployments_fixture() -> (TempDir, PathBuf) {
+    let home = sandbox();
+    let source = home.path().join("source");
+    let project = home.path().join("project");
+    fs::create_dir_all(&project).expect("create project directory");
+    create_skill(&source, "drifted", "# drifted");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args([
+            "--json", "load", "drifted", "--claude", "--shared", "--global",
+        ])
+        .assert()
+        .success();
+    // Global shared gains one extra file beyond the one every deployment
+    // starts with: 2 files.
+    fs::write(home.path().join(".agents/skills/drifted/extra.md"), "extra")
+        .expect("drift global shared deployment");
+    let mut project_load = cli(home.path());
+    project_load.current_dir(&project);
+    project_load
+        .args([
+            "--json",
+            "load",
+            "drifted",
+            "--claude",
+            "--shared",
+            "--project",
+        ])
+        .assert()
+        .success();
+    // Project claude gains two extra files beyond its starting one: 3 files.
+    // Project shared and global claude are left at their starting 1 file
+    // each, so every one of the four deployments ends up with its own
+    // distinct count: global claude 1, global shared 2, project claude 3,
+    // project shared 1.
+    fs::write(project.join(".claude/skills/drifted/a.md"), "a").expect("drift project claude");
+    fs::write(project.join(".claude/skills/drifted/b.md"), "b").expect("drift project claude");
+    (home, project)
+}
+
+/// Each branch option's advertised blast radius is derived from that exact
+/// option's real apply list, never from a representative per-skill count
+/// multiplied across cells — so it stays correct once deployments have
+/// genuinely drifted apart across both scope and target. Project totals
+/// (project claude 3 + project shared 1 = 4 files) and global totals (global
+/// claude 1 + global shared 2 = 3 files) differ from each other and from
+/// what a flawed "first discovered copy" count would have reported for
+/// either.
+#[test]
+fn remove_scope_alternatives_report_the_true_blast_radius_when_deployments_have_drifted_apart() {
+    let (home, project) = remove_divergent_deployments_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let output = remove
+        .args(["remove", "drifted", "--claude", "--shared", "--dry-run"])
+        .output()
+        .expect("run divergent dry-run remove");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output.clone()),
+        "Remove plan\n\
+\n\
+Available deployments\n\
+\n\
+skill    files/deploy  claude  shared\n\
+-------  ------------  ------  ------\n\
+drifted  1-3           both    both\n\
+\n\
+\x20\x201  Remove project copies  − 2 deployments, 4 files\n\
+\x20\x202  Remove global copies   − 2 deployments, 3 files\n\
+\x20\x203  Remove both copies     − 4 deployments, 7 files\n\
+\n\
+Dry run — 3 alternatives shown; no option selected and no changes were made.\n"
+    );
+    assert!(stderr_of(&output).is_empty(), "a dry run never prompts");
+}
+
+/// Selecting the project alternative deletes exactly the files that
+/// alternative's own blast radius promised — project claude's 3 files and
+/// project shared's 1 file, 4 total — and leaves both global deployments,
+/// with their own different counts, completely untouched. The post-apply
+/// result footer's file count matches the pre-apply option's promise exactly
+/// because both are derived from the same real apply list.
+#[test]
+fn remove_selecting_an_option_deletes_exactly_the_files_its_blast_radius_promised() {
+    let (home, project) = remove_divergent_deployments_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let output = remove
+        .args(["remove", "drifted", "--claude", "--shared"])
+        .write_stdin("1\n")
+        .output()
+        .expect("run divergent option-1 remove");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output.clone()),
+        "Remove plan\n\
+\n\
+Available deployments\n\
+\n\
+skill    files/deploy  claude  shared\n\
+-------  ------------  ------  ------\n\
+drifted  1-3           both    both\n\
+\n\
+\x20\x201  Remove project copies  − 2 deployments, 4 files\n\
+\x20\x202  Remove global copies   − 2 deployments, 3 files\n\
+\x20\x203  Remove both copies     − 4 deployments, 7 files\n\
+\x20\x20c  Cancel\n\
+\n\
+\n\
+Removed drifted from claude (project)\n\
+Removed drifted from shared (project)\n\
+\n\
+completed: 2 deployments removed (1 skill, 4 files)\n"
+    );
+    assert_eq!(
+        stderr_of(&output),
+        "Select removal scope [1-3, c to cancel]: "
+    );
+    assert!(
+        !project.join(".claude/skills/drifted").exists(),
+        "the chosen project claude deployment (3 files) must be gone"
+    );
+    assert!(
+        !project.join(".agents/skills/drifted").exists(),
+        "the chosen project shared deployment (1 file) must be gone"
+    );
+    let global_claude = home.path().join(".claude/skills/drifted");
+    let global_shared = home.path().join(".agents/skills/drifted");
+    assert!(
+        global_claude.join("SKILL.md").is_file() && !global_claude.join("a.md").exists(),
+        "global claude's own 1-file deployment must be untouched"
+    );
+    assert!(
+        global_shared.join("SKILL.md").is_file() && global_shared.join("extra.md").is_file(),
+        "global shared's own 2-file deployment must be untouched"
+    );
+}
+
+/// The `plan` event's per-option consequences carry the same true,
+/// per-option totals as the rendered table and the eventual apply — proving
+/// the machine stream cannot drift from the human rendering or from reality
+/// even when deployments have genuinely diverged across scope and target.
+#[test]
+fn remove_plan_event_reports_true_per_option_totals_when_deployments_have_drifted_apart() {
+    let (home, project) = remove_divergent_deployments_fixture();
+    let mut remove = cli(home.path());
+    remove.current_dir(&project);
+    let events = json_events(
+        remove
+            .args([
+                "--json",
+                "remove",
+                "drifted",
+                "--claude",
+                "--shared",
+                "--dry-run",
+            ])
+            .output()
+            .expect("run machine divergent dry-run remove"),
+    );
+    let plans = events_of(&events, "plan");
+    assert_eq!(plans.len(), 1);
+    let data = plans[0]["data"].clone();
+    let decision = data["decisions"][0].clone();
+    let options = decision["options"].as_array().expect("decision options");
+    assert_eq!(options[0]["id"], "project");
+    assert_eq!(
+        options[0]["consequence"],
+        serde_json::json!({ "operation": "remove", "totals": { "deployments": 2, "files": 4 } }),
+        "project claude (3 files) + project shared (1 file) = 4, not a borrowed representative count"
+    );
+    assert_eq!(options[1]["id"], "global");
+    assert_eq!(
+        options[1]["consequence"],
+        serde_json::json!({ "operation": "remove", "totals": { "deployments": 2, "files": 3 } }),
+        "global claude (1 file) + global shared (2 files) = 3, genuinely different from the project total"
+    );
+    assert_eq!(options[2]["id"], "both");
+    assert_eq!(
+        options[2]["consequence"],
+        serde_json::json!({ "operation": "remove", "totals": { "deployments": 4, "files": 7 } }),
+        "every deployment's own count summed: 1 + 2 + 3 + 1 = 7"
     );
 }

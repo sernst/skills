@@ -265,6 +265,7 @@ pub struct CopyArgs {
 }
 
 /// Arguments for `remove`.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Default, Args)]
 pub struct RemoveArgs {
     /// Skill names/patterns, skill directories, or collection directories.
@@ -282,6 +283,14 @@ pub struct RemoveArgs {
     /// Installation scope selection.
     #[command(flatten)]
     pub scope: ScopeSelection,
+    /// Remove both scopes wherever a skill exists in both.
+    ///
+    /// Mutually exclusive with `--global`/`--project`: this answers the
+    /// removal-scope branch itself (the noninteractive spelling of
+    /// interactive option 3), rather than restricting which scope is
+    /// inspected in the first place.
+    #[arg(long, conflicts_with_all = ["global", "project"])]
+    pub both: bool,
     /// Plan without changing persistent state.
     #[arg(long)]
     pub dry_run: bool,
@@ -601,6 +610,24 @@ mod tests {
         for command in ["load", "update", "remove", "status"] {
             assert!(
                 Cli::try_parse_from(["skill-manager", command, "--global", "--project"]).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn remove_both_flag_parses_and_conflicts_with_either_scope_flag() {
+        let cli = Cli::try_parse_from(["skill-manager", "remove", "teach", "--both"])
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let Some(Command::Remove(args)) = cli.command else {
+            unreachable!("expected remove command");
+        };
+        assert!(args.both);
+        assert!(!args.scope.is_explicit());
+
+        for flag in ["--global", "--project"] {
+            assert!(
+                Cli::try_parse_from(["skill-manager", "remove", "teach", "--both", flag]).is_err(),
+                "--both must conflict with {flag}"
             );
         }
     }

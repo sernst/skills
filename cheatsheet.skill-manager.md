@@ -195,14 +195,25 @@ skill-manager remove [SKILL_OR_PATTERN ...] [OPTIONS]
 ```
 
 Accepts the same `--filter`, source, target, scope, `--dry-run`, and `--refresh`
-options as deployment commands. `--yes`/`-y` skips the removal confirmation but
-never chooses a scope. With no skill operands, discovery selection determines
-the candidate set.
+options as deployment commands, plus the remove-only `--both` (mutually
+exclusive with `--global`/`--project`). With no skill operands, discovery
+selection determines the candidate set.
 
-Without an explicit scope, an unambiguous existing copy is removed. If a
-selected skill exists in both scopes, interactive mode asks for global, project,
-or both; non-interactive mode fails. For unattended removal from both, run one
-explicit global command and one explicit project command.
+It always renders a complete plan first, naming every matched skill, every
+destination it exists at, and every file count, before asking anything.
+Without an explicit scope, an unambiguous existing copy collapses the plan to
+a plain action table with a `[y/N]` confirmation (default No, since removal is
+destructive); `--yes` skips that confirmation but never chooses a scope.
+If a selected skill exists in both scopes and none was stated, the plan is a
+genuine branch instead: three mutually exclusive, numbered alternatives
+(project/global/both), each showing its own blast radius, resolved by a
+single-token selection (`c` cancels; invalid or empty input reprompts and
+never auto-selects, since every option is destructive). `--both` resolves
+that branch noninteractively in one command. `--no-input` requires an
+explicit `--global`, `--project`, or `--both` for an ambiguous skill and an
+explicit `--yes` to commit — `remove` never auto-authorizes under
+`--json`/`--no-input` the way `load`/`update`/`copy` do, because removal is
+irreversible.
 
 ### `status` (`ls`, `list`)
 

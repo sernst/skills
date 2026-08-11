@@ -28,7 +28,9 @@ Use this file to construct strict, single-invocation JSON objects for
   remain verbatim. Target `path` is always a root-relative template and is never
   rebased.
 - `global` and `project` are mutually exclusive. Non-interactive `load` requires
-  one. Ambiguous removal requires one. No `"both"` value exists.
+  one. Ambiguous removal requires `global`, `project`, or the remove-only
+  `both` boolean (mutually exclusive with `global`/`project`); no other
+  command accepts `both`.
 - `no_input` is a boolean accepted by every recipe. Recipe carriers are already
   non-interactive.
 
@@ -122,13 +124,21 @@ the apply step, so `yes` is accepted but not required to commit.
 {"command":"copy","source":"sernst-skills","destination":"./vendor/skills","filters":["managing-*"],"dry_run":true}
 ```
 
-<!-- recipe-command: remove fields: all,all_targets,antigravity,cd,cd_only,claude,command,dry_run,filter,filters,global,no_cd,no_input,project,refresh,shared,skill,skills,target,targets,yes -->
+<!-- recipe-command: remove fields: all,all_targets,antigravity,both,cd,cd_only,claude,command,dry_run,filter,filters,global,no_cd,no_input,project,refresh,shared,skill,skills,target,targets,yes -->
 ### `remove`
 
 Remove deployments. `skills`/`skill` is `string|string[]`. Also accepts filters,
-source, target, and scope selection; `dry_run`, `refresh`, `yes`, and
-`no_input`. `yes:true` skips only the destructive confirmation. It does not
-select a scope.
+source, target, and scope selection, plus the remove-only `both` boolean
+(mutually exclusive with `global`/`project`); `dry_run`, `refresh`, `yes`, and
+`no_input`. `remove` always renders its complete plan — every matched skill,
+every destination it exists at, every file count — before asking anything.
+When a skill exists in both scopes and the recipe did not select one, the
+plan is a genuine branch (`--project`/`--global`/`--both`), not a bare
+confirmation; a recipe call must set `global`, `project`, or `both` to
+resolve it, since `remove` never auto-picks a scope. Unlike `load`/`update`/
+`copy`, `remove` does not auto-authorize under `no_input` for a JSON stream:
+`yes:true` is required to commit regardless of output format, because
+removal is destructive and irreversible.
 
 ```json
 {"command":"remove","skills":["obsolete-skill"],"shared":true,"project":true,"dry_run":true}

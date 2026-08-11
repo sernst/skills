@@ -525,7 +525,7 @@ fn config_and_summary_payload_references_match_production_emit_sites() {
     );
 
     let summaries = event_json_payloads(app, "summary");
-    assert_eq!(summaries.len(), 8, "production summary emit-site count");
+    assert_eq!(summaries.len(), 7, "production summary emit-site count");
     let summary_fields = summaries
         .iter()
         .map(|payload| object_fields(payload))
@@ -535,7 +535,7 @@ fn config_and_summary_payload_references_match_production_emit_sites() {
         ("summary-load-update", 1),
         ("summary-import", 1),
         ("summary-copy", 1),
-        ("summary-remove", 2),
+        ("summary-remove", 1),
         ("summary-status", 1),
         ("summary-resolve", 1),
     ] {
@@ -578,8 +578,9 @@ fn config_and_summary_payload_references_match_production_emit_sites() {
         "self.report_sync_summary(\"load\", changed, skipped, run.args.dry_run)",
         "self.report_sync_summary(\"update\", changed, skipped, run.args.dry_run)",
         "\"action\": \"copy\", \"copied\": copied",
-        "\"action\": \"remove\", \"removed\": 0",
-        "\"action\": \"remove\", \"removed\": removed",
+        "self.report_remove_summary(0, args.dry_run)",
+        "self.report_remove_summary(0, true)",
+        "self.report_remove_summary(removed, args.dry_run)",
         "\"action\": \"status\", \"skills\": status_rows.len()",
         "\"action\": \"resolve\", \"resolved\": resolved_count",
     ] {

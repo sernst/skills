@@ -44,7 +44,12 @@ their whole plan and then auto-authorize the apply step in every non-interactive
 carrier (`--json`, `--json-input`, `--input`); `yes:true` is accepted but not
 required to commit either one. Both use enabled targets when none are
 selected, and `load` also infers project-vs-global scope silently when none is
-given. A committed `import`
+given. `copy` renders and auto-authorizes the same way. `remove` renders its
+whole plan identically but never auto-authorizes in any non-interactive mode:
+`yes:true` is always required to commit, because removal is destructive and
+irreversible, and an ambiguous scope (a skill deployed in both global and
+project) must be resolved with `global:true`, `project:true`, or the
+remove-only `both:true` — `yes:true` alone never picks one. A committed `import`
 requires `yes:true`, must name exactly one skill, and must narrow target and
 scope selection whenever more than one deployment differs from its source;
 a GitHub-backed source cannot be imported non-interactively at all. `all_targets:true` selects
@@ -85,10 +90,9 @@ remains blocking; never ignore an exit code by itself.
   `resolve` after preflight without a redundant confirmation.
 - Never guess an ambiguous source, collision winner, target, scope, target
   path, or backup. `yes` confirms; it never chooses a scope.
-- To remove from both scopes, issue two explicit recipes—one with
-  `global:true`, one with `project:true`—dry-run both, confirm once against the
-  combined plan, execute both, then verify with `status`. There is no recipe
-  value for `both`.
+- To remove from both scopes in one recipe, set `both:true` (mutually
+  exclusive with `global`/`project`); dry-run first, then set `yes:true` to
+  commit, and verify with `status` afterward.
 
 ## Use argv only for narrow exceptions
 

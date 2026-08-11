@@ -50,7 +50,7 @@ A directory below home remains a normal project.
 | `load` | Infers project-vs-global scope silently: project when an enabled selected target's leading directory exists in CWD (such as `.claude`, `.agents`, or `.gemini`); otherwise global. The inferred scope is shown in the plan and, if the plan is later cancelled, named in the cancel hint. |
 | `update` | Infers every existing skill/target deployment, including both scopes when both exist; `-g` or `-p` restricts the eligible deployments. |
 | `import` | Scans both scopes for changed deployments. When more than one differs from the source, it prompts for the copy to import; `-g` or `-p` restricts the scan. |
-| `remove` | Removes an unambiguous existing scope. When any selected skill exists in both scopes, it prompts once for project, global, or both; an explicit flag restricts it. |
+| `remove` | Removes an unambiguous existing scope. When any selected skill exists in both scopes, its plan presents mutually exclusive project/global/both options, each with its own blast radius, resolved by a single numbered selection (or noninteractively by `--global`/`--project`/`--both`). |
 | `status` | Inspects both scopes by default; `-g` or `-p` narrows the report. |
 
 `--json`, recipe input (`--json=…`, `--json-input`, or `--input`), and
@@ -64,23 +64,25 @@ three commands; plain `--no-input` (with no JSON carrier) still requires an
 explicit `--yes` to apply. `remove` and `import` never auto-authorize in any
 non-interactive mode—they always require an explicit `--yes`/`yes:true` to
 commit, because both are destructive. An ambiguous `remove` still needs an
-explicit scope flag in these modes and fails with an interaction-required
-error rather than guessing. At home, the only available scope is global.
-`--yes` bypasses `remove`'s destructive confirmation only—it never chooses a
-scope.
+explicit scope (`--global`, `--project`, or `--both`) in these modes and fails
+with an interaction-required error rather than guessing. At home, the only
+available scope is global. `--yes` bypasses `remove`'s destructive
+confirmation only—it never chooses a scope; `--both` is the only flag that
+resolves the scope branch itself, applying to both scopes at once without an
+interactive selection.
 
 All discovery commands accept repeatable `--filter PATTERN`, `--refresh`, and
 `--dry-run` where applicable. Configured sources are the default. `--cd` adds
 CWD for `status`; `--cd-only` uses only CWD; `--no-cd` retains the compatibility
 spelling for configured-source-only behavior.
 
-## Change plans for load, update, copy, and import
+## Change plans for load, update, copy, remove, and import
 
 Interactive `load` and `update` immediately use all enabled targets unless
-selectors narrow them; `load` also infers its scope (see above). Both, along
-with `copy`, always render a complete plan before asking anything—no command
-in this family ever asks a pre-emptive question before showing what it will
-do.
+selectors narrow them; `load` also infers its scope (see above). `load`,
+`update`, `copy`, and `remove` all always render a complete plan before
+asking anything—no command in this family ever asks a pre-emptive question
+before showing what it will do.
 
 `update`'s plan omits unchanged skills. `load`'s plan distinguishes new
 installs from overwrites: a deployment that does not yet exist is `load`, one
@@ -116,34 +118,60 @@ qualifier (`enabled` or `selected`) survives only while every target does;
 once gating drops one, the phrase degrades to a bare count so it never
 overstates what will be written.
 
-One confirmation follows, defaulting to yes for `load` and `copy` (both are
-constructive/regenerable) as well as for `update`. Declining cancels with exit
-`0`, emits `command.cancelled`, deploys nothing, and prints a hint naming only
-the decisions the CLI inferred—target and/or scope for `load`, targets and
-deployed scopes for `update`—so the next invocation is obvious. `copy` never
-infers anything (source, destination, and filters are always stated
-explicitly), so declining its plan has no hint to print. A no-op prints one
-precise result without a table or confirmation: for `update`, that the skill
-is up to date or not deployed to any target in the searched scope; for
-`load`, that every requested skill is already identical across the selected or
-enabled targets; for `copy`, that no skills matched the filter or were found
-in the source.
+`remove`'s plan is the same shape, but with a genuine branch point when any
+selected skill exists in both global and project scope and the user did not
+say which: the table's cells show pure availability (where a deployment
+*exists*, never an action token) and the plan presents three mutually
+exclusive, numbered alternatives—project, global, or both—each annotated with
+its own blast radius (`− N deployments, N files`). A single-token selection
+resolves it (`Select removal scope [1-3, c to cancel]:`); `c` cancels, and
+invalid or empty input reprompts and never auto-selects, because every option
+is destructive and there is no preselected default. `--both` (remove-only)
+resolves the branch noninteractively without an interactive selection. When
+scope is already unambiguous—stated explicitly with `--global`/`--project`,
+inferred to a single existing scope, or resolved by `--both`—there is no
+branch: the plan collapses to a plain action table and its footer reads `{N}
+deployment removals across {target label}: − {N} remove; {N} skill(s), {N}
+files`, exactly like `update`'s and `load`'s footers.
 
-`--yes`/`-y` (added to `load` and `copy` alongside `update`'s existing flag)
-renders the same plan and then applies it. `--dry-run` renders the plan and
-stops with a single `Dry run — no changes were made.` conclusion rather than
-echoing every item. Applying prints one progress line per deployment or
-copied skill—with the scope only when the plan has more than one, though
-`load`'s progress lines never carry a scope suffix, since `load` decides its
-scope once for the whole run—followed by a summary footer such as
-`completed: 4 deployments updated` or `completed: 6 deployments changed (6
-loaded)`, whose zero categories are omitted entirely. Under plain
-`--no-input` (no JSON carrier), inferred defaults still apply but `--yes` is
-required to authorize the write; `--json` and every recipe carrier
-auto-authorize instead, as described above. Machine mode keeps its existing
+One confirmation follows, defaulting to yes for `load` and `copy` (both are
+constructive/regenerable) as well as for `update`, but to **no** for a
+resolved `remove` plan (destructive, `[y/N]`); an unresolved `remove` branch
+is a numbered selection instead of a yes/no question, so it has no default at
+all. Declining cancels with exit `0`, emits `command.cancelled`, deploys
+nothing, and prints a hint naming only the decisions the CLI inferred—target
+and/or scope for `load`, targets and deployed scopes for `update` and
+`remove`—so the next invocation is obvious. Cancelling `remove`'s branch
+selection prints no hint: the user just made an explicit, real-time choice,
+so there is nothing left to teach. `copy` never infers anything (source,
+destination, and filters are always stated explicitly), so declining its plan
+has no hint to print. A no-op prints one precise result without a table or
+confirmation: for `update`, that the skill is up to date or not deployed to
+any target in the searched scope; for `load`, that every requested skill is
+already identical across the selected or enabled targets; for `copy`, that no
+skills matched the filter or were found in the source; for `remove`, that the
+named skill is not deployed to any selected target in either scope.
+
+`--yes`/`-y` (added to `load` and `copy` alongside `update`'s and `remove`'s
+existing flag) renders the same plan and then applies it. `--dry-run` renders
+the plan and stops with a single `Dry run — no changes were made.` conclusion
+rather than echoing every item—for `remove`'s unresolved branch, `--dry-run`
+enumerates all three alternatives and their blast radius but never offers to
+cancel, since there is nothing to apply or decline. Applying prints one
+progress line per deployment or copied skill—with the scope only when the
+plan has more than one, though `load`'s progress lines never carry a scope
+suffix, since `load` decides its scope once for the whole run—followed by a
+summary footer such as `completed: 4 deployments updated` or `completed: 6
+deployments changed (6 loaded)`, whose zero categories are omitted entirely.
+Under plain `--no-input` (no JSON carrier), inferred defaults still apply but
+`--yes` is required to authorize the write; `--json` and every recipe carrier
+auto-authorize `load`, `update`, and `copy` instead, as described above—
+`remove` never auto-authorizes in any non-interactive mode, and an ambiguous
+scope still requires an explicit `--global`, `--project`, or `--both` rather
+than accepting `--yes` alone to guess one. Machine mode keeps its existing
 event-only contract while additionally emitting the structured `plan` event,
 at revision `0`, described in [json.md](json.md), for all of `load`,
-`update`, and `copy`.
+`update`, `copy`, and `remove`.
 
 `import SKILL` reverses `load`. It resolves exactly one skill—patterns are
 rejected—through the same first-source-wins discovery, then scans the selected

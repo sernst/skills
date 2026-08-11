@@ -341,13 +341,24 @@ was selected but had no work is distinguishable from one that was never
 selected. `destinations` lists every destination some entry or decision
 alternative references.
 
-`authorization.kind` is `binary` for a yes/no confirmation and `progressive`
-when the plan carries decision dimensions. A progressive plan also reports
-`sequence` (dimension ids in prompt order), `resolved` (dimension id to chosen
-option id), `pending`, and, when a prompt follows this revision, `prompt` with
-the live `dimension`. Each entry lists `actions` it will perform and, when the
-plan exposes availability rather than decided writes, `available` destination
-ids.
+`authorization.kind` is `binary` for a yes/no confirmation, `selection` for a
+single mutually exclusive choice (`remove`'s ambiguous global/project/both
+scope is the only current example), or `progressive` when the plan resolves
+more than one decision across successive revisions (only `import` does this
+today). Any plan carrying one or more decisions — `selection` and
+`progressive` alike — also reports `sequence` (dimension ids in prompt
+order), `resolved` (dimension id to chosen option id), `pending`, and, when a
+prompt follows this revision, `prompt` with the live `dimension`. Each entry
+lists `actions` it will perform and, when the plan exposes availability
+rather than decided writes, `available` destination ids — `remove`'s
+unresolved scope branch is the only current source of `available`: while the
+branch is open an entry's `actions` is empty and `available` lists every
+deployment id the skill occupies; once resolved (explicit scope, `--both`, or
+a made selection) those become concrete `"operation": "remove"` actions.
+`load`, `update`, `copy`, and `remove` emit `plan`/`plan.updated` today;
+`import` adopts it as it migrates. `remove` always emits a single revision
+`0`: its one decision is resolved by one prompt, never a re-rendered
+sequence, so it never emits `plan.updated`.
 
 `decisions` is present whenever the plan carries dimensions and describes all of
 them, resolved and pending alike, so the payload matches the plan the user

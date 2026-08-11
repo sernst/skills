@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 
-use crate::authorize::Authorizer;
+use crate::authorize::{Authorization, Authorizer, SelectionOption};
 use crate::cache::{GitHubTransport, materialize_source};
 use crate::cli::{
     Command, ConfigsAction, ConfigsArgs, CopyArgs, ImportArgs, RemoveArgs, ResolveArgs,
@@ -33,14 +33,15 @@ use crate::plan::{
 };
 use crate::prompt::Prompt;
 use crate::review::{
-    ChangePlan, Destination, DestinationKind, PlanAuthorization, PlanRow, PlanSelection,
-    PlannedAction, RenderStyle, ResultEntry, ResultMarker, colored, destination_label, location_of,
-    location_text, plan_event_data, render_plan, result_footer,
+    ChangePlan, Decision, DecisionOption, Destination, DestinationKind, OptionConsequence,
+    PlanAuthorization, PlanRow, PlanSelection, PlannedAction, RenderStyle, ResultEntry,
+    ResultMarker, colored, destination_label, location_of, location_text, plan_event_data,
+    render_plan, result_footer,
 };
 use crate::skills::{
-    PatternExpansion, deployed_skills, detect_skill_dirs, directories_equal, discover_skills,
-    expand_skill_patterns, is_fnmatch_operand, is_path_or_github_shaped, matches_patterns,
-    skill_name, skill_state, split_sync_operands, validate_skill_name,
+    PatternExpansion, deployed_skills, detect_skill_dirs, directories_equal, directory_files,
+    discover_skills, expand_skill_patterns, is_fnmatch_operand, is_path_or_github_shaped,
+    matches_patterns, skill_name, skill_state, split_sync_operands, validate_skill_name,
 };
 use crate::status::{
     DeploymentDetail, SkillLocation, SkillRow, SourceRow, display_width, join_columns, padded,
@@ -74,6 +75,52 @@ struct ImportCandidate {
 struct ScopeContext {
     project_root: PathBuf,
     project_available: bool,
+}
+
+/// One target's inspected scopes for one `remove` skill: the resolved target
+/// root at each scope actually inspected, populated only when the skill is
+/// deployed there, alongside that exact deployment's own file count.
+///
+/// An explicit `--global`/`--project` inspects only its one scope; inference
+/// inspects global always and project only when it is available. A cell with
+/// both fields populated is the genuine branch point `remove` must surface
+/// before asking anything. Deployments genuinely drift apart (a stale global
+/// copy beside a refreshed project copy, say), so each scope's file count is
+/// captured independently here rather than assumed equal across the cell —
+/// nothing downstream may substitute one scope's count for the other's.
+struct RemoveCell {
+    target: Target,
+    global_root: Option<PathBuf>,
+    global_files: usize,
+    project_root: Option<PathBuf>,
+    project_files: usize,
+}
+
+/// Everywhere one skill is deployed, across every inspected target.
+struct RemoveSkillPlan {
+    identity: String,
+    cells: Vec<RemoveCell>,
+}
+
+/// Which alternative resolves an ambiguous `remove` cell.
+///
+/// An unambiguous cell (exactly one scope populated) is removed under every
+/// choice — the "N unambiguous deployments are removed in every option"
+/// invariant proven against the Stage 1 fixture — so this only changes the
+/// outcome where both scopes actually exist.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RemoveScopeChoice {
+    Project,
+    Global,
+    Both,
+}
+
+/// One resolved, apply-ready removal: exactly one skill at one target/scope.
+struct RemoveApplyItem {
+    skill: String,
+    target: Target,
+    scope: Scope,
+    root: PathBuf,
 }
 
 #[derive(Clone, Copy)]
@@ -2648,8 +2695,13 @@ where
         Ok(())
     }
 
-    // Resolution, confirmation, execution, and reporting form one ordered
-    // partial-commit operation and are therefore deliberately colocated.
+    /// Review, authorize, and apply the remove plan.
+    ///
+    /// Mirrors [`Self::run_update`] and [`Self::run_load`]: the complete plan
+    /// — every skill, every destination it exists at, every file count —
+    /// renders before anything is asked. Where a skill exists in both scopes
+    /// and the caller did not say which, the plan itself is the question: a
+    /// [`Decision`] with per-option blast radius, never a bare `[y/N]` count.
     #[allow(clippy::too_many_lines)]
     fn run_remove(&mut self, config: &Config, args: &RemoveArgs) -> Result<bool> {
         let target_templates = self.select_target_templates(config, &args.targets)?;
@@ -2666,6 +2718,7 @@ where
             }
         }
         let mut names = BTreeMap::<String, String>::new();
+        let mut requested = Vec::<String>::new();
         let mut positional_patterns = Vec::new();
         if args.skills.is_empty() {
             let sources = self.resolve_sources(
@@ -2689,7 +2742,8 @@ where
                 if path.join("SKILL.md").is_file() {
                     let name = skill_name(&path)?;
                     if matches_patterns(&name, &args.filters)? {
-                        names.insert(fold(&name), name);
+                        names.insert(fold(&name), name.clone());
+                        requested.push(name);
                     }
                 } else if path.is_dir() {
                     let entry = source_from_reference(raw, Some(SourceMode::Collection))?;
@@ -2706,17 +2760,24 @@ where
                     for skill in detect_skill_dirs(&resolved)? {
                         let name = skill_name(&skill)?;
                         if matches_patterns(&name, &args.filters)? {
-                            names.insert(fold(&name), name);
+                            names.insert(fold(&name), name.clone());
+                            requested.push(name);
                         }
                     }
                 } else {
                     validate_skill_name(raw)?;
                     if matches_patterns(raw, &args.filters)? {
                         names.insert(fold(raw), raw.clone());
+                        requested.push(raw.clone());
                     }
                 }
             }
         }
+        // Captured before pattern expansion, mirroring `run_sync`'s
+        // `positional_matched` formula: a literal name that already resolved
+        // must count as a positional match on its own, even when an unrelated
+        // pattern also given matches nothing.
+        let literal_given = !requested.is_empty();
         // `positional_patterns` holds only genuine fnmatch operands (see the
         // `is_fnmatch_operand` split above); literal skill names never land
         // here. With `expand_skill_patterns` matching nothing for an empty
@@ -2729,127 +2790,380 @@ where
             deployed_names.values().map(String::as_str),
         )?;
         self.emit_unmatched_patterns(&expansion.unmatched_patterns)?;
-        for name in expansion.matched {
-            if matches_patterns(&name, &args.filters)? {
-                names.insert(fold(&name), name);
+        for name in &expansion.matched {
+            if matches_patterns(name, &args.filters)? {
+                names.insert(fold(name), name.clone());
+                requested.push(name.clone());
             }
+        }
+        let positional_matched =
+            literal_given || positional_patterns.is_empty() || !expansion.matched.is_empty();
+        if !positional_matched {
+            return Err(SkillManagerError::NotFound {
+                kind: "deployed skill matching positional pattern",
+                reference: positional_patterns.join(", "),
+            });
         }
 
-        let mut plan = Vec::<(String, Target, Scope)>::new();
-        let mut dual = Vec::<(String, ScopedTarget)>::new();
+        let explicit = explicit_scope(&args.scope);
+        let mut skill_plans = Vec::new();
         for name in names.values() {
-            for template in &target_templates {
-                if let Some(scope) = explicit_scope(&args.scope) {
-                    let target = scoped_target(template, scope, &self.home, project_root);
-                    if target.target.path.join(name).is_dir() {
-                        plan.push((name.clone(), target.target, scope));
-                    }
-                    continue;
-                }
-                let global = scoped_target(template, Scope::Global, &self.home, project_root);
-                let project = scoped_target(template, Scope::Project, &self.home, project_root);
-                let global_exists = global.target.path.join(name).is_dir();
-                let project_exists =
-                    scope_context.project_available && project.target.path.join(name).is_dir();
-                match (global_exists, project_exists) {
-                    (true, false) => plan.push((name.clone(), global.target, Scope::Global)),
-                    (false, true) => plan.push((name.clone(), project.target, Scope::Project)),
-                    (true, true) => dual.push((name.clone(), template.clone())),
-                    (false, false) => {}
-                }
+            if let Some(skill_plan) = classify_remove_skill(
+                name,
+                &target_templates,
+                explicit,
+                scope_context.project_available,
+                &self.home,
+                project_root,
+            )? {
+                skill_plans.push(skill_plan);
             }
         }
-        if !dual.is_empty() {
-            if self.no_input {
+        let discovered = skill_plans
+            .iter()
+            .map(|skill_plan| skill_plan.identity.clone())
+            .collect::<Vec<_>>();
+        let order = remove_review_order(&discovered, &requested);
+        skill_plans.sort_by_key(|skill_plan| {
+            order
+                .iter()
+                .position(|key| *key == fold(&skill_plan.identity))
+                .unwrap_or(usize::MAX)
+        });
+
+        if skill_plans.is_empty() {
+            self.report_remove_no_match(args, &requested, &target_templates)?;
+            self.report_remove_summary(0, args.dry_run)?;
+            return Ok(true);
+        }
+
+        let (unambiguous_total, ambiguous_total) = remove_ambiguity_counts(&skill_plans);
+        let defers_to_branch = explicit.is_none() && !args.both && ambiguous_total > 0;
+        let default_choice = if args.both {
+            RemoveScopeChoice::Both
+        } else if explicit == Some(Scope::Global) {
+            RemoveScopeChoice::Global
+        } else if explicit == Some(Scope::Project) {
+            RemoveScopeChoice::Project
+        } else {
+            // Never exercised: reaching this branch means `ambiguous_total`
+            // is zero, so every cell resolves independently of the choice.
+            RemoveScopeChoice::Both
+        };
+        let target_names = target_templates
+            .iter()
+            .map(|template| template.target.name.clone())
+            .collect::<Vec<_>>();
+        let style = self.render_style();
+        let prompting = !args.dry_run && !args.yes && !self.no_input;
+
+        let (rows, mut resolved_items) =
+            remove_plan_rows(&skill_plans, defers_to_branch, default_choice)?;
+        let identities = skill_plans
+            .iter()
+            .map(|skill_plan| skill_plan.identity.clone())
+            .collect::<Vec<_>>();
+        let decisions =
+            remove_scope_decisions(&skill_plans, unambiguous_total, ambiguous_total, args.both)?;
+        let destinations = remove_destinations(&target_names);
+        let body_heading = defers_to_branch.then(|| "Available deployments".to_owned());
+        let plan = ChangePlan {
+            command: "remove".to_owned(),
+            plan_id: format!("remove:{}", identities.join(",")),
+            heading: "Remove plan".to_owned(),
+            metadata: Vec::new(),
+            destinations,
+            body_heading,
+            metric_header: Some("files/deploy".to_owned()),
+            detail_heading: "Destination-specific changes".to_owned(),
+            connector: Some("from".to_owned()),
+            rows,
+            blocks: Vec::new(),
+            decisions,
+            prompting,
+            distinguishes_overwrites: false,
+        };
+        let view = plan.view();
+        let targets_explicit = args.targets.is_explicit();
+        let label = destination_label(
+            view.columns().len(),
+            target_names.len(),
+            targets_explicit,
+            "target",
+        );
+        let selection = PlanSelection {
+            targets: target_names.clone(),
+            targets_explicit,
+            scope: view.uniform_scope(),
+            scope_explicit: args.scope.is_explicit(),
+        };
+        let authorization = self.remove_authorization(args, defers_to_branch, prompting);
+        let data = plan_event_data(&view, 0, args.dry_run, authorization, &selection);
+        self.reporter.event("plan", Level::Info, data)?;
+        for line in render_plan(&view, style) {
+            self.reporter.human(&line)?;
+        }
+
+        if defers_to_branch {
+            if args.dry_run {
+                let alternatives = plan
+                    .decisions
+                    .first()
+                    .map_or(0, |decision| decision.options.len());
+                self.reporter.human(&format!(
+                    "Dry run — {alternatives} alternatives shown; no option selected and no changes were made."
+                ))?;
+                self.report_remove_summary(0, true)?;
+                return Ok(true);
+            }
+            if args.yes || self.no_input {
                 return Err(SkillManagerError::InteractionRequired(
-                    "one or more skills are installed globally and in the project; pass --global or --project"
+                    "selected skills exist in both scopes; choose --project, --global, or --both before using --yes."
                         .into(),
                 ));
             }
-            let choices = vec!["project".to_owned(), "global".to_owned(), "both".to_owned()];
-            let selected = self.prompt.choose(
-                &format!(
-                    "{} selected deployment(s) exist in both scopes; choose which copies to remove",
-                    dual.len()
-                ),
-                &choices,
-            )?;
-            let scopes = match selected {
-                0 => vec![Scope::Project],
-                1 => vec![Scope::Global],
-                _ => vec![Scope::Global, Scope::Project],
+            let options = vec![
+                SelectionOption::numbered(0, "Remove project copies", true),
+                SelectionOption::numbered(1, "Remove global copies", true),
+                SelectionOption::numbered(2, "Remove both copies", true),
+            ];
+            let choice = match Authorizer::new(self.prompt)
+                .select("Select removal scope [1-3, c to cancel]", &options)?
+            {
+                Authorization::Cancelled => {
+                    self.report_cancelled("remove")?;
+                    return Ok(false);
+                }
+                Authorization::Approved(0) => RemoveScopeChoice::Project,
+                Authorization::Approved(1) => RemoveScopeChoice::Global,
+                Authorization::Approved(_) => RemoveScopeChoice::Both,
             };
-            for (name, template) in dual {
-                for scope in &scopes {
-                    let target = scoped_target(&template, *scope, &self.home, project_root);
-                    plan.push((name.clone(), target.target, *scope));
+            resolved_items = resolve_remove_apply_list(&skill_plans, choice);
+            self.reporter.human("")?;
+        } else {
+            let (skills_total, files_total) = remove_totals_from_items(&resolved_items)?;
+            self.reporter.human(&remove_plan_footer(
+                view.actions(),
+                &label,
+                skills_total,
+                files_total,
+                style,
+            ))?;
+            if args.dry_run {
+                self.reporter.human("")?;
+                self.reporter.human("Dry run — no changes were made.")?;
+            } else {
+                let question = if view.actions() == 1 {
+                    format!("Remove this deployment from {label}?")
+                } else {
+                    format!("Remove these {} deployments from {label}?", view.actions())
+                };
+                if self.authorize_remove(args, &question)? {
+                    self.reporter.human("")?;
+                } else {
+                    self.report_remove_cancelled(
+                        &target_names,
+                        targets_explicit,
+                        args.scope.is_explicit(),
+                    )?;
+                    return Ok(false);
                 }
             }
         }
-        if plan.is_empty() {
-            if !positional_patterns.is_empty() {
-                return Err(SkillManagerError::NotFound {
-                    kind: "deployed skill matching positional pattern",
-                    reference: positional_patterns.join(", "),
-                });
-            }
-            self.reporter.human("No deployed skills matched.")?;
-            self.reporter.event(
-                "summary",
-                Level::Info,
-                json!({ "action": "remove", "removed": 0, "dry_run": args.dry_run }),
-            )?;
-            return Ok(true);
+
+        // Captured before applying: the apply loop deletes the very
+        // directories this walks to count files, so recomputing afterward
+        // would silently read back zeros.
+        let (result_skills_total, result_files_total) = remove_totals_from_items(&resolved_items)?;
+        let removed = self.apply_remove_items(&resolved_items, args.dry_run)?;
+        if removed > 0 && !args.dry_run {
+            self.reporter.human("")?;
+            let footer = result_footer(
+                &[ResultEntry {
+                    marker: ResultMarker::Completed,
+                    count: removed,
+                    description: format!(
+                        "deployment{} removed ({}, {})",
+                        if removed == 1 { "" } else { "s" },
+                        counted_noun(result_skills_total, "skill"),
+                        counted_noun(result_files_total, "file"),
+                    ),
+                }],
+                style,
+            );
+            self.reporter.human(&footer)?;
         }
-        if !args.dry_run && !args.yes {
-            if self.no_input {
-                return Err(SkillManagerError::InteractionRequired(
-                    "remove requires confirmation; pass --yes in noninteractive mode".into(),
-                ));
-            }
-            if !self.prompt.confirm(
-                &format!("Remove {} skill deployment(s)?", plan.len()),
-                false,
-            )? {
-                self.report_cancelled("remove")?;
-                return Ok(false);
-            }
-        }
+        self.report_remove_summary(removed, args.dry_run)?;
+        Ok(true)
+    }
+
+    /// Emit the remove summary event from one shared, auditable site.
+    fn report_remove_summary(&mut self, removed: usize, dry_run: bool) -> Result<()> {
+        self.reporter.event(
+            "summary",
+            Level::Info,
+            json!({ "action": "remove", "removed": removed, "dry_run": dry_run }),
+        )
+    }
+
+    /// Apply every resolved removal, reporting progress the plan already
+    /// promised.
+    ///
+    /// The event fires unconditionally (dry run included) so the machine
+    /// stream stays complete; only the actual filesystem write and the human
+    /// progress line are gated by `dry_run`, mirroring
+    /// [`Self::apply_update_steps`].
+    fn apply_remove_items(&mut self, items: &[RemoveApplyItem], dry_run: bool) -> Result<usize> {
         let mut removed = 0_usize;
-        for (name, target, scope) in plan {
-            let destination = target.path.join(&name);
-            if !args.dry_run {
-                let _did_remove =
-                    remove_skill(&name, &target.path, self.repository.cache_root(), self.hook)?;
+        for item in items {
+            let destination = item.root.join(&item.skill);
+            if !dry_run {
+                remove_skill(
+                    &item.skill,
+                    &item.root,
+                    self.repository.cache_root(),
+                    self.hook,
+                )?;
+                self.reporter.human(&format!(
+                    "Removed {} from {} ({})",
+                    item.skill,
+                    item.target.name,
+                    item.scope.as_str()
+                ))?;
             }
             removed += 1;
-            self.reporter.human(&format!(
-                "Removed {} from {} ({}){}",
-                name,
-                target.name,
-                scope.as_str(),
-                if args.dry_run { " (dry-run)" } else { "" }
-            ))?;
             self.reporter.event(
                 "skill.removed",
                 Level::Info,
                 json!({
-                    "skill": name,
-                    "target": target.name,
-                    "scope": scope,
-                    "target_path": target.path,
+                    "skill": item.skill,
+                    "target": item.target.name,
+                    "scope": item.scope,
+                    "target_path": item.root,
                     "path": destination,
                     "action": "removed",
-                    "dry_run": args.dry_run
+                    "dry_run": dry_run,
                 }),
             )?;
         }
-        self.reporter.event(
-            "summary",
-            Level::Info,
-            json!({ "action": "remove", "removed": removed, "dry_run": args.dry_run }),
-        )?;
-        Ok(true)
+        Ok(removed)
+    }
+
+    /// Describe how this invocation authorizes its remove plan.
+    fn remove_authorization(
+        &self,
+        args: &RemoveArgs,
+        defers_to_branch: bool,
+        prompting: bool,
+    ) -> PlanAuthorization {
+        let mode = if args.dry_run {
+            "dry-run"
+        } else if args.yes {
+            "yes"
+        } else if self.no_input {
+            "noninteractive"
+        } else {
+            "prompt"
+        };
+        let kind = if defers_to_branch {
+            "selection"
+        } else {
+            "binary"
+        };
+        PlanAuthorization {
+            kind,
+            mode,
+            default: (kind == "binary")
+                .then_some(prompting.then_some(false))
+                .flatten(),
+        }
+    }
+
+    /// Obtain consent for a resolved remove plan's plain `[y/N]` prompt.
+    ///
+    /// Unlike `load`/`update`/`copy`, `remove` never auto-authorizes a JSON
+    /// stream under `--no-input`: removal is destructive and irreversible, so
+    /// `--yes` is required regardless of output format.
+    fn authorize_remove(&mut self, args: &RemoveArgs, question: &str) -> Result<bool> {
+        if args.yes {
+            return Ok(true);
+        }
+        if self.no_input {
+            return Err(SkillManagerError::InteractionRequired(
+                "applying this plan noninteractively requires --yes.".into(),
+            ));
+        }
+        Ok(Authorizer::new(self.prompt)
+            .confirm(question, true)?
+            .is_approved())
+    }
+
+    /// Explain a declined remove plan and how to narrow the next one.
+    ///
+    /// Unlike the deferred-branch cancel (which never hints, because the
+    /// numbered menu the user just answered already taught the scope
+    /// decision), the plain `[y/N]` cancel teaches whichever of targets and
+    /// scope were inferred rather than stated, mirroring
+    /// `report_update_cancelled`/`report_load_cancelled`.
+    fn report_remove_cancelled(
+        &mut self,
+        target_names: &[String],
+        targets_explicit: bool,
+        scope_explicit: bool,
+    ) -> Result<()> {
+        self.report_cancelled("remove")?;
+        let hint = match (!targets_explicit, !scope_explicit) {
+            (true, true) => Some(format!(
+                "Hint: targets and deployed scopes were inferred. Re-run with {}, and --global or --project, to narrow this plan.",
+                target_flag_hint(target_names)
+            )),
+            (true, false) => Some(format!(
+                "Hint: targets were inferred. Re-run with {} to narrow this plan.",
+                target_flag_hint(target_names)
+            )),
+            (false, true) => Some(
+                "Hint: deployed scopes were inferred. Re-run with --global or --project to narrow this plan."
+                    .to_owned(),
+            ),
+            (false, false) => None,
+        };
+        match hint {
+            Some(line) => self.reporter.human(&line),
+            None => Ok(()),
+        }
+    }
+
+    /// State precisely why a remove plan has nothing to do.
+    ///
+    /// A single literal skill name with no other filters names the specific
+    /// target and scope it was checked against, matching how narrowly the
+    /// invocation asked; anything broader falls back to the generic message.
+    fn report_remove_no_match(
+        &mut self,
+        args: &RemoveArgs,
+        requested: &[String],
+        target_templates: &[ScopedTarget],
+    ) -> Result<()> {
+        if args.filters.is_empty()
+            && let [name] = requested
+        {
+            let scope_desc = match explicit_scope(&args.scope) {
+                Some(scope) => format!("at {} scope", scope.as_str()),
+                None => format!("in {} scope", scope_phrase(&args.scope)),
+            };
+            let target_desc = if args.targets.is_explicit() {
+                match target_templates {
+                    [only] => only.target.name.clone(),
+                    _ => "any selected target".to_owned(),
+                }
+            } else {
+                "any enabled target".to_owned()
+            };
+            return self.reporter.human(&format!(
+                "{name} is not deployed to {target_desc} {scope_desc}."
+            ));
+        }
+        self.reporter.human("No deployed skills matched.")
     }
 
     #[allow(
@@ -4030,6 +4344,484 @@ fn copy_filter_clause(filters: &[String]) -> String {
 
 fn review_location(scope: Scope) -> Option<SkillLocation> {
     location_of(&BTreeSet::from([scope]))
+}
+
+/// Classify one skill's deployments into `remove`'s per-target cells.
+///
+/// An explicit scope inspects only its own field; inference always checks
+/// global and checks project only when it is available (mirroring
+/// [`update_scopes`]). A skill with no populated cell anywhere is not
+/// deployed and is silently omitted — the caller decides what "nothing
+/// matched" means.
+fn classify_remove_skill(
+    name: &str,
+    target_templates: &[ScopedTarget],
+    explicit: Option<Scope>,
+    project_available: bool,
+    home: &Path,
+    project_root: &Path,
+) -> Result<Option<RemoveSkillPlan>> {
+    let mut cells = Vec::with_capacity(target_templates.len());
+    for template in target_templates {
+        let mut global_root = None;
+        let mut project_root_path = None;
+        match explicit {
+            Some(Scope::Global) => {
+                let resolved = scoped_target(template, Scope::Global, home, project_root);
+                if resolved.target.path.join(name).is_dir() {
+                    global_root = Some(resolved.target.path);
+                }
+            }
+            Some(Scope::Project) => {
+                let resolved = scoped_target(template, Scope::Project, home, project_root);
+                if resolved.target.path.join(name).is_dir() {
+                    project_root_path = Some(resolved.target.path);
+                }
+            }
+            None => {
+                let global = scoped_target(template, Scope::Global, home, project_root);
+                if global.target.path.join(name).is_dir() {
+                    global_root = Some(global.target.path);
+                }
+                if project_available {
+                    let project = scoped_target(template, Scope::Project, home, project_root);
+                    if project.target.path.join(name).is_dir() {
+                        project_root_path = Some(project.target.path);
+                    }
+                }
+            }
+        }
+        if global_root.is_none() && project_root_path.is_none() {
+            continue;
+        }
+        // Each present scope's file count is measured from its own
+        // deployment, never borrowed from the other scope: they can and do
+        // drift apart, and a representative count here would silently
+        // understate or overstate whichever scope the user actually picks.
+        let global_files = match &global_root {
+            Some(root) => directory_files(&root.join(name))?.len(),
+            None => 0,
+        };
+        let project_files = match &project_root_path {
+            Some(root) => directory_files(&root.join(name))?.len(),
+            None => 0,
+        };
+        cells.push(RemoveCell {
+            target: template.target.clone(),
+            global_root,
+            global_files,
+            project_root: project_root_path,
+            project_files,
+        });
+    }
+    if cells.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(RemoveSkillPlan {
+        identity: name.to_owned(),
+        cells,
+    }))
+}
+
+/// The single skill order both plan review and apply follow for `remove`.
+///
+/// Mirrors [`review_sequence`]'s two-phase technique — requested names first
+/// in the order they were given, then everything else in discovery order —
+/// over `remove`'s own per-skill classification instead of a flat
+/// [`SyncStep`] list, since a removal row aggregates cells rather than one
+/// step per destination.
+fn remove_review_order(discovered: &[String], requested: &[String]) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut push = |key: String| {
+        if !order.contains(&key) {
+            order.push(key);
+        }
+    };
+    let present = discovered
+        .iter()
+        .map(|name| fold(name))
+        .collect::<BTreeSet<_>>();
+    for name in requested {
+        let key = fold(name);
+        if present.contains(&key) {
+            push(key);
+        }
+    }
+    for name in discovered {
+        push(fold(name));
+    }
+    order
+}
+
+/// Count how many cells are unambiguous (only one scope present) vs
+/// ambiguous (both scopes present) across every skill's cells.
+///
+/// Used only to decide whether a real branch exists and how many deployments
+/// the preamble reports as removed under every option regardless of choice.
+/// Each option's own deployment and file totals are computed separately by
+/// [`remove_choice_totals`], directly from [`resolve_remove_apply_list`], so
+/// they can never drift from what applying that option would actually do.
+fn remove_ambiguity_counts(skill_plans: &[RemoveSkillPlan]) -> (usize, usize) {
+    let mut unambiguous_total = 0_usize;
+    let mut ambiguous_total = 0_usize;
+    for skill_plan in skill_plans {
+        for cell in &skill_plan.cells {
+            match (cell.global_root.is_some(), cell.project_root.is_some()) {
+                (true, true) => ambiguous_total += 1,
+                (true, false) | (false, true) => unambiguous_total += 1,
+                (false, false) => {}
+            }
+        }
+    }
+    (unambiguous_total, ambiguous_total)
+}
+
+/// One row's file-count hint: the shared count when every present
+/// deployment agrees, or an explicit `min-max` range the moment they don't,
+/// so this informational column can never imply a false agreement between
+/// deployments that have actually drifted apart.
+fn remove_metric_display(counts: &[usize]) -> String {
+    let min = counts.iter().copied().min().unwrap_or(0);
+    let max = counts.iter().copied().max().unwrap_or(0);
+    if min == max {
+        min.to_string()
+    } else {
+        format!("{min}-{max}")
+    }
+}
+
+/// The scopes one cell resolves to under one [`RemoveScopeChoice`].
+///
+/// An unambiguous cell (only one scope populated) ignores the choice
+/// entirely and resolves to whichever scope exists — proven against the
+/// Stage 1 fixture's "N unambiguous deployments are removed in every option."
+fn resolved_cell_scopes(cell: &RemoveCell, choice: RemoveScopeChoice) -> Vec<Scope> {
+    if cell.global_root.is_some() && cell.project_root.is_some() {
+        return match choice {
+            RemoveScopeChoice::Project => vec![Scope::Project],
+            RemoveScopeChoice::Global => vec![Scope::Global],
+            RemoveScopeChoice::Both => vec![Scope::Global, Scope::Project],
+        };
+    }
+    let mut scopes = Vec::with_capacity(1);
+    if cell.global_root.is_some() {
+        scopes.push(Scope::Global);
+    }
+    if cell.project_root.is_some() {
+        scopes.push(Scope::Project);
+    }
+    scopes
+}
+
+/// Flatten every skill's cells into the final ordered, apply-ready list.
+///
+/// This is the single source of truth for both the resolved row actions
+/// (built at render time) and the apply loop (built once the branch, if any,
+/// is resolved): both call this with the same `choice`, so plan order and
+/// apply order cannot drift apart.
+fn resolve_remove_apply_list(
+    skill_plans: &[RemoveSkillPlan],
+    choice: RemoveScopeChoice,
+) -> Vec<RemoveApplyItem> {
+    let mut items = Vec::new();
+    for skill_plan in skill_plans {
+        for cell in &skill_plan.cells {
+            for scope in resolved_cell_scopes(cell, choice) {
+                let root = match scope {
+                    Scope::Global => cell.global_root.clone(),
+                    Scope::Project => cell.project_root.clone(),
+                }
+                .unwrap_or_default();
+                items.push(RemoveApplyItem {
+                    skill: skill_plan.identity.clone(),
+                    target: cell.target.clone(),
+                    scope,
+                    root,
+                });
+            }
+        }
+    }
+    items
+}
+
+/// Build the destination grid for `remove`: every enabled target contributes
+/// both scope destinations, exactly mirroring [`update_change_plan`] and
+/// [`load_change_plan`] — significance gating, not this builder, decides
+/// which survive rendering.
+fn remove_destinations(target_names: &[String]) -> Vec<Destination> {
+    let mut destinations = Vec::with_capacity(target_names.len() * 2);
+    for name in target_names {
+        for scope in [Scope::Global, Scope::Project] {
+            destinations.push(Destination {
+                id: destination_id(name, scope),
+                column: name.clone(),
+                label: format!("{name} · {}", scope.as_str()),
+                kind: DestinationKind::Deployment {
+                    target: name.clone(),
+                    scope,
+                },
+                path: None,
+            });
+        }
+    }
+    destinations
+}
+
+/// Build `remove`'s rows: pure availability while the scope branch is still
+/// open, or concrete [`PlannedAction::Remove`] actions once it is resolved
+/// (whether by explicit scope, `--both`, or an inference that never actually
+/// branched). Also returns the flat apply list for the resolved case; the
+/// deferred case builds its apply list only after interactive selection.
+///
+/// The single-row, single-action, no-availability case is `remove`'s
+/// degenerate sentence (shared [`render_body`](crate::review) mechanism): the
+/// table's bare file count reads oddly as prose, so this mutates that one row
+/// to say `"N files"` instead, matching the `ux-guidelines.md` example
+/// (`− managing-skills from claude: 3 files`).
+fn remove_plan_rows(
+    skill_plans: &[RemoveSkillPlan],
+    defers_to_branch: bool,
+    choice: RemoveScopeChoice,
+) -> Result<(Vec<PlanRow>, Vec<RemoveApplyItem>)> {
+    if defers_to_branch {
+        let mut rows = Vec::with_capacity(skill_plans.len());
+        for skill_plan in skill_plans {
+            let mut availability = Vec::new();
+            let mut counts = Vec::new();
+            for cell in &skill_plan.cells {
+                if cell.global_root.is_some() {
+                    availability.push(destination_id(&cell.target.name, Scope::Global));
+                    counts.push(cell.global_files);
+                }
+                if cell.project_root.is_some() {
+                    availability.push(destination_id(&cell.target.name, Scope::Project));
+                    counts.push(cell.project_files);
+                }
+            }
+            rows.push(PlanRow {
+                identity: skill_plan.identity.clone(),
+                metric: Some(remove_metric_display(&counts)),
+                availability,
+                ..PlanRow::default()
+            });
+        }
+        return Ok((rows, Vec::new()));
+    }
+
+    let mut rows = Vec::with_capacity(skill_plans.len());
+    let mut items = Vec::new();
+    for skill_plan in skill_plans {
+        let mut actions = Vec::new();
+        let mut counts = Vec::new();
+        for cell in &skill_plan.cells {
+            for scope in resolved_cell_scopes(cell, choice) {
+                let root = match scope {
+                    Scope::Global => cell.global_root.clone(),
+                    Scope::Project => cell.project_root.clone(),
+                }
+                .unwrap_or_default();
+                let stat = diff_directories(&root.join(&skill_plan.identity), Path::new(""))?;
+                counts.push(stat.files_changed());
+                actions.push(PlannedAction {
+                    destination: destination_id(&cell.target.name, scope),
+                    action: PlanAction::Remove,
+                    existed: true,
+                    description: String::new(),
+                    stat,
+                });
+                items.push(RemoveApplyItem {
+                    skill: skill_plan.identity.clone(),
+                    target: cell.target.clone(),
+                    scope,
+                    root,
+                });
+            }
+        }
+        rows.push(PlanRow {
+            identity: skill_plan.identity.clone(),
+            metric: Some(remove_metric_display(&counts)),
+            actions,
+            ..PlanRow::default()
+        });
+    }
+    if let [row] = rows.as_mut_slice()
+        && let [action] = row.actions.as_mut_slice()
+        && row.availability.is_empty()
+        && let Some(metric) = row.metric.take()
+    {
+        let count = metric.parse::<usize>().unwrap_or(0);
+        action.description = counted_noun(count, "file");
+    }
+    Ok((rows, items))
+}
+
+/// Sum the skill and file counts of a resolved, apply-ready removal list.
+///
+/// Recomputes each item's diff rather than reusing a row's cached
+/// [`PlannedAction::stat`] because the deferred (branch) case has no row
+/// actions yet at the point this is needed — the interactive selection
+/// resolves the apply list directly without a second render.
+fn remove_totals_from_items(items: &[RemoveApplyItem]) -> Result<(usize, usize)> {
+    let skills = items
+        .iter()
+        .map(|item| fold(&item.skill))
+        .collect::<BTreeSet<_>>()
+        .len();
+    let mut files = 0_usize;
+    for item in items {
+        let stat = diff_directories(&item.root.join(&item.skill), Path::new(""))?;
+        files += stat.files_changed();
+    }
+    Ok((skills, files))
+}
+
+/// Total deployments and files one scope choice would actually remove.
+///
+/// Resolves the exact apply list [`resolve_remove_apply_list`] would hand to
+/// [`App::apply_remove_items`] for this choice and diffs each item for real,
+/// rather than combining a per-skill representative count across cells. This
+/// is what keeps a branch option's advertised blast radius from drifting
+/// away from what selecting it actually deletes when deployments across
+/// scopes have genuinely diverged.
+fn remove_choice_totals(
+    skill_plans: &[RemoveSkillPlan],
+    choice: RemoveScopeChoice,
+) -> Result<(usize, usize)> {
+    let items = resolve_remove_apply_list(skill_plans, choice);
+    let deployments = items.len();
+    let mut files = 0_usize;
+    for item in &items {
+        let stat = diff_directories(&item.root.join(&item.skill), Path::new(""))?;
+        files += stat.files_changed();
+    }
+    Ok((deployments, files))
+}
+
+/// Build one removal alternative whose blast radius is too wide to enumerate
+/// per destination, so it travels as typed aggregate totals.
+fn remove_scope_option(
+    id: &str,
+    token: &str,
+    label: String,
+    deployments: usize,
+    files: usize,
+) -> DecisionOption {
+    let mut totals = vec![("deployments".to_owned(), deployments as u64)];
+    let effect = if files > 0 {
+        totals.push(("files".to_owned(), files as u64));
+        format!("− {deployments} deployments, {files} files")
+    } else {
+        format!("− {deployments} deployments")
+    };
+    DecisionOption {
+        id: id.to_owned(),
+        token: token.to_owned(),
+        label,
+        effect: Some(effect),
+        effect_color: PlanAction::Remove.color_code(),
+        consequence: OptionConsequence {
+            operation: Some(PlanAction::Remove),
+            totals,
+            ..OptionConsequence::default()
+        },
+        ..DecisionOption::default()
+    }
+}
+
+/// Build `remove`'s `removal_scope` decision when a real branch exists.
+///
+/// Unambiguous deployments are removed by every option, so the preamble and
+/// each label's "where both exist" suffix appear only when there are any —
+/// confirmed against the Stage 1 fixtures, which show both forms. `--both`
+/// pre-resolves the dimension to `"both"`, which still carries every
+/// option's typed consequence in the structured event but is filtered out of
+/// every render by [`PlanView::decisions`](crate::review::PlanView::decisions).
+///
+/// Each option's deployment and file totals come from
+/// [`remove_choice_totals`], which resolves and diffs that exact choice's
+/// real apply list — never from multiplying a shared per-skill count across
+/// cells, which silently misreports blast radius the moment a skill's
+/// deployments have drifted apart across scopes.
+fn remove_scope_decisions(
+    skill_plans: &[RemoveSkillPlan],
+    unambiguous_total: usize,
+    ambiguous_total: usize,
+    both: bool,
+) -> Result<Vec<Decision>> {
+    if ambiguous_total == 0 {
+        return Ok(Vec::new());
+    }
+    let preamble = (unambiguous_total > 0).then(|| {
+        format!(
+            "{} are removed in every option.",
+            counted_noun(unambiguous_total, "unambiguous deployment")
+        )
+    });
+    let suffix = if unambiguous_total > 0 {
+        " where both exist"
+    } else {
+        ""
+    };
+    let (project_deployments, project_files) =
+        remove_choice_totals(skill_plans, RemoveScopeChoice::Project)?;
+    let (global_deployments, global_files) =
+        remove_choice_totals(skill_plans, RemoveScopeChoice::Global)?;
+    let (both_deployments, both_files) =
+        remove_choice_totals(skill_plans, RemoveScopeChoice::Both)?;
+    let options = vec![
+        remove_scope_option(
+            "project",
+            "1",
+            format!("Remove project copies{suffix}"),
+            project_deployments,
+            project_files,
+        ),
+        remove_scope_option(
+            "global",
+            "2",
+            format!("Remove global copies{suffix}"),
+            global_deployments,
+            global_files,
+        ),
+        remove_scope_option(
+            "both",
+            "3",
+            format!("Remove both copies{suffix}"),
+            both_deployments,
+            both_files,
+        ),
+    ];
+    Ok(vec![Decision {
+        id: "removal_scope".to_owned(),
+        preamble,
+        prompt: "Select removal scope".to_owned(),
+        options,
+        resolved: both.then(|| "both".to_owned()),
+        ..Decision::default()
+    }])
+}
+
+/// The resolved remove plan footer: total removals, then the skill and file
+/// counts they cover.
+fn remove_plan_footer(
+    actions: usize,
+    label: &str,
+    skills: usize,
+    files: usize,
+    style: RenderStyle,
+) -> String {
+    let clause_text = if style.symbols {
+        format!("− {actions} remove")
+    } else {
+        format!("{actions} remove")
+    };
+    let clause = colored(&clause_text, PlanAction::Remove.color_code(), style.color);
+    format!(
+        "{} across {label}: {clause}; {}, {}",
+        counted_noun(actions, "deployment removal"),
+        counted_noun(skills, "skill"),
+        counted_noun(files, "file"),
+    )
 }
 
 /// Describe the scope a plan searched, for a plan that found nothing.

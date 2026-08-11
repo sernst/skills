@@ -226,7 +226,7 @@ Remove plan
 
 − managing-skills from claude: 3 files
 
-1 deployment removal from 1 selected target: − 1 remove; 1 skill, 3 files
+1 deployment removal across 1 selected target: − 1 remove; 1 skill, 3 files
 ```
 
 ```text
@@ -407,7 +407,13 @@ forbidden as a cancellation hint.
 - A plan footer is one grammatical line: total actionable work, significant
   destination/blast-radius context, then only nonzero action categories.
   Example shape: `{N} changes across {target label}: + {N} new[, ↑ {N}
-  overwrite][, ✓ {N} already identical]`.
+  overwrite][, ✓ {N} already identical]`. Per command: `load`: `{N} changes
+  across {target label}: + {N} new[, ↑ {N} overwrite][, ✓ {N} already
+  identical]`; `update`: `{N} updates across {target label}`; `remove`, one
+  resolved plan: `{N} deployment removals across {target label}: − {N}
+  remove; {N} skill(s), {N} files`; `remove`, unresolved branch: one nonzero
+  base clause plus one effect line per alternative; `copy`: `{N} changes to 1
+  destination: + {N} new[, ↑ {N} overwrite]`.
 - A result footer after apply uses the same nonzero-only, comma-separated
   grammar: `✓: {N} {result description}[, —: {N} unchanged]`. The complete
   entry is green in a TTY.
@@ -553,13 +559,13 @@ output, regardless of terminal width.
 > document; if every command below reaches "migrated," delete this section
 > entirely rather than leaving a stale all-done note.
 
-Snapshot date: 2026-08-25.
+Snapshot date: 2026-08-11.
 
 - **Migrated** (uses `ChangePlan`/`Authorizer` in
-  `src/review.rs`/`src/authorize.rs`): `update`, `load`, `copy`.
+  `src/review.rs`/`src/authorize.rs`): `update`, `load`, `copy`, `remove`.
 - **Not yet migrated** (still uses older, command-specific prompting such as
   direct `self.prompt.confirm`/`self.prompt.choose` calls that predate the
-  plan-first invariant): `remove`, `import`.
+  plan-first invariant): `import`.
 
 This gap is tracked, expected follow-up work, not a rule exception. When
 touching any not-yet-migrated command, migrate its authorization onto the

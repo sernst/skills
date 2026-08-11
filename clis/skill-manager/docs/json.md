@@ -74,7 +74,10 @@ and paths but never include backup bytes. Layout migration emits
 A mutating command that renders a plan for review also emits one event per
 rendered revision, always before anything is written: `plan` for revision `0`
 and `plan.updated` for every narrowed re-render that follows. `update`, `load`,
-and `copy` emit it today; `remove` and `import` adopt it as they migrate.
+`copy`, and `remove` emit it today; `import` adopts it as it migrates. `remove`
+always emits a single revision `0` — an ambiguous scope is one decision
+resolved by one prompt, not a re-rendered sequence, so it never emits
+`plan.updated`.
 
 ```json
 {
@@ -125,12 +128,17 @@ and `copy` emit it today; `remove` and `import` adopt it as they migrate.
 `plan_id` is stable across the revisions of one invocation and `revision` counts
 from `0`, so a progressively narrowed multi-prompt plan is reconstructable.
 
-`authorization.kind` is `binary` or `progressive`; `authorization.mode` is
+`authorization.kind` is `binary`, `selection`, or `progressive`; `authorization.mode` is
 `prompt`, `yes`, `dry-run`, or `noninteractive`, and `default` is present only
-for a prompt that has one. A `progressive` plan additionally reports `sequence`
+for a `binary` prompt that has one — a `selection` is never preselected, because
+every option is destructive. Any plan that carries one or more `decisions`
+(`selection` and `progressive` alike) additionally reports `sequence`
 (dimension ids in prompt order), `resolved` (dimension id to the chosen option
 id), `pending`, and, when a prompt follows this revision, `prompt` naming the
-live `dimension`:
+live `dimension`. `selection` carries exactly one dimension resolved by one
+mutually exclusive choice — `remove`'s ambiguous global/project/both scope is
+the only current example; `progressive` carries more than one, resolved across
+successive revisions:
 
 ```json
 "authorization": {
@@ -196,27 +204,33 @@ entry or decision alternative references is listed.
 An entry lists the `actions` it will perform and, for a plan that exposes where
 an item exists without yet deciding what to do about it, an `available` array of
 destination ids. Availability is evidence, not an operation, and never counts as
-an action.
+an action — `remove`'s unresolved global/project branch is the only current
+source of it: while the scope is undecided, an entry's `actions` array is
+empty and its `available` array lists every deployment id the skill occupies;
+once the branch resolves (explicit scope, `--both`, or a made selection),
+those same destinations become concrete `"operation": "remove"` actions.
 
 A `deployment` destination carries `path` when the command decides target
 roots itself rather than accepting an arbitrary one — `load` populates it;
-`update` does not, to keep its established payload unchanged. An entry carries
-`source` naming the resolved source label an item came from whenever the
-command tracks that provenance (`load` does; `update` does not, for the same
-reason). Fields that a command has never emitted are simply absent rather than
-`null`, so consumers can treat presence itself as meaningful.
+`update` and `remove` do not, to keep their established payloads unchanged. An
+entry carries `source` naming the resolved source label an item came from
+whenever the command tracks that provenance (`load` does; `update` and
+`remove` do not, for the same reason). Fields that a command has never emitted
+are simply absent rather than `null`, so consumers can treat presence itself
+as meaningful.
 
 Significance gating never hides a semantic action from `entries`, even when
 rendering hides the same row from the human table because every action on it
 is a no-op: a fully identical `load` row still appears as a complete entry
 whose actions are all `"operation": "skip"`. `summary` reflects the same
 completeness. Its per-operation counts use the vocabulary each command's plan
-distinguishes: `update`'s `summary` buckets by the literal action word
-(`"update"`); `load` and `copy` instead bucket by whether a deployment already
-`existed` (`"new"` for one that did not, `"overwrite"` for one that did), with
-`"skip"` always counted separately for identical, no-op actions regardless of
-that distinction. Automation should key off these command-specific categories
-rather than assuming one fixed set across every command.
+distinguishes: `update`'s and `remove`'s `summary` bucket by the literal
+action word (`"update"`, `"remove"`); `load` and `copy` instead bucket by
+whether a deployment already `existed` (`"new"` for one that did not,
+`"overwrite"` for one that did), with `"skip"` always counted separately for
+identical, no-op actions regardless of that distinction. Automation should key
+off these command-specific categories rather than assuming one fixed set
+across every command.
 
 Significance gating is a property of human rendering and never reaches this
 stream. The payload omits only what is genuinely absent: a zero metric, an empty
