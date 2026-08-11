@@ -385,6 +385,35 @@ pub fn is_fnmatch_operand(operand: &str) -> bool {
     operand.contains(['*', '?', '['])
 }
 
+/// Return whether a literal operand is shaped like a filesystem path or a
+/// GitHub `owner/repo` reference.
+///
+/// This mirrors the boundary `source_from_reference` already treats as a
+/// path/reference: an absolute path, a `~` expansion, an explicit `./`/`../`
+/// (or the Windows `.\`/`..\` equivalents) relative marker, or any operand
+/// containing a path separator. `owner/repo` GitHub shorthand is covered by
+/// the separator check since it always contains `/`. A bare word with none of
+/// these shapes is deliberately left unclassified here so the caller can
+/// still resolve it against a configured source, a discovered skill name, or
+/// a plain current-directory entry.
+#[must_use]
+pub fn is_path_or_github_shaped(operand: &str) -> bool {
+    if operand.starts_with('~') {
+        return true;
+    }
+    if operand.starts_with("./")
+        || operand.starts_with("../")
+        || operand.starts_with(".\\")
+        || operand.starts_with("..\\")
+    {
+        return true;
+    }
+    if operand.contains('/') || operand.contains('\\') {
+        return true;
+    }
+    Path::new(operand).is_absolute()
+}
+
 /// Split `load`/`update` positional operands by their command-boundary role.
 ///
 /// Literal values retain the historical source-reference meaning. Values with
@@ -633,8 +662,8 @@ mod tests {
     #[cfg(unix)]
     use super::detect_skill_dirs;
     use super::{
-        directories_equal, expand_skill_patterns, is_fnmatch_operand, matches_patterns,
-        split_sync_operands, validate_skill_name,
+        directories_equal, expand_skill_patterns, is_fnmatch_operand, is_path_or_github_shaped,
+        matches_patterns, split_sync_operands, validate_skill_name,
     };
     #[cfg(unix)]
     use crate::config::source_from_reference;
@@ -702,6 +731,27 @@ mod tests {
         assert_eq!(selection.skill_patterns, ["grill-*", "[ab]eta", "one?"]);
         assert!(!is_fnmatch_operand("owner/repo"));
         assert!(is_fnmatch_operand("[literal"));
+    }
+
+    #[test]
+    fn path_and_github_shaped_operands_are_recognized() {
+        for shaped in [
+            "owner/repo",
+            "./local",
+            "../local",
+            r".\local",
+            r"..\local",
+            "~/skills",
+            "a/b",
+            r"a\b",
+        ] {
+            assert!(is_path_or_github_shaped(shaped), "{shaped}");
+        }
+        for bare in ["knowing-camber-me", "primary", "UPPER-CASE"] {
+            assert!(!is_path_or_github_shaped(bare), "{bare}");
+        }
+        #[cfg(windows)]
+        assert!(is_path_or_github_shaped(r"C:\skills"));
     }
 
     #[test]

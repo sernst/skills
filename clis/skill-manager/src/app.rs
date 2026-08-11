@@ -21,8 +21,8 @@ use crate::config::{
     set_source_location, source_from_reference, source_location, source_reference,
 };
 use crate::domain::{
-    ResolvedSource, Scope, ScopedTarget, SkillCandidate, SourceEntry, SourceLocation, SourceMode,
-    SourceType, Target, TargetEntry,
+    ResolvedSource, Scope, ScopedTarget, SkillCandidate, SkillDiscovery, SourceEntry,
+    SourceLocation, SourceMode, SourceType, Target, TargetEntry,
 };
 use crate::error::{Result, SkillManagerError};
 use crate::event::{Level, Reporter};
@@ -32,9 +32,9 @@ use crate::plan::{
 };
 use crate::prompt::Prompt;
 use crate::skills::{
-    deployed_skills, detect_skill_dirs, directories_equal, discover_skills, expand_skill_patterns,
-    is_fnmatch_operand, matches_patterns, skill_name, skill_state, split_sync_operands,
-    validate_skill_name,
+    PatternExpansion, deployed_skills, detect_skill_dirs, directories_equal, discover_skills,
+    expand_skill_patterns, is_fnmatch_operand, is_path_or_github_shaped, matches_patterns,
+    skill_name, skill_state, split_sync_operands, validate_skill_name,
 };
 use crate::status::{
     DeploymentDetail, SkillLocation, SkillRow, SourceRow, display_width, join_columns, padded,
@@ -588,9 +588,7 @@ where
             )?;
         }
         for warning in &migration.warnings {
-            self.reporter.diagnostic(&format!("Warning: {warning}"))?;
-            self.reporter
-                .event("diagnostic", Level::Warning, json!({ "message": warning }))?;
+            self.emit_message_diagnostic(warning)?;
         }
         Ok(())
     }
@@ -1120,15 +1118,88 @@ where
         confirmed: bool,
     ) -> Result<bool> {
         let operands = split_sync_operands(&args.sources);
-        let sources = self.resolve_sources(
+        let glob_patterns = operands.skill_patterns;
+
+        // Pre-discovery pass: a literal operand is a definite source when it
+        // already names a configured source or is shaped like a path/GitHub
+        // reference. Everything else is deferred until skill discovery runs,
+        // because only discovery can tell a bare skill name from a bare
+        // directory name.
+        let mut definite_sources = Vec::new();
+        let mut deferred = Vec::new();
+        for operand in &operands.sources {
+            if configured_source_index(config, operand)?.is_some()
+                || is_path_or_github_shaped(operand)
+            {
+                definite_sources.push(operand.clone());
+            } else {
+                deferred.push(operand.clone());
+            }
+        }
+
+        let mut sources = self.resolve_sources(
             config,
-            &operands.sources,
+            &definite_sources,
             &args.source_selection,
             args.refresh,
             args.dry_run,
         )?;
-        let discovery = discover_skills(&sources, &[], &config.exclude)?;
+        // Collisions are not emitted from this preliminary discovery: it may
+        // be discarded and replaced below once deferred bare words are
+        // resolved, and emitting collisions from a discovery pass that gets
+        // thrown away would report irrelevant warnings (or, when the final
+        // discovery repeats the same collision, duplicate it).
+        let mut discovery = discover_skills(&sources, &[], &config.exclude)?;
+        let cwd = std::env::current_dir().map_err(|error| SkillManagerError::io(".", error))?;
+
+        // Post-discovery pass: resolve every deferred bare word against the
+        // skills just discovered. A discovered skill name wins over a
+        // same-named CWD directory (with a warning); an unmatched bare word
+        // that still names a CWD directory is queued for promotion; anything
+        // else is provisionally unresolved until we know whether a directory
+        // promotion (and its one permitted extra discovery pass) is coming.
+        let (mut literal_skill_names, promoted_sources, provisional) =
+            self.resolve_deferred_sync_operands(&deferred, &cwd, &discovery)?;
+        if !promoted_sources.is_empty() {
+            if definite_sources.is_empty() && literal_skill_names.is_empty() {
+                sources = self.resolve_sources(
+                    config,
+                    &promoted_sources,
+                    &args.source_selection,
+                    args.refresh,
+                    args.dry_run,
+                )?;
+            } else {
+                for word in &promoted_sources {
+                    let entry = configured_source_or_reference(config, word, None)?;
+                    sources.push(materialize_source(
+                        self.repository,
+                        self.github,
+                        &entry,
+                        args.refresh,
+                        args.dry_run,
+                    )?);
+                }
+            }
+            discovery = discover_skills(&sources, &[], &config.exclude)?;
+            // Words that were neither a discovered skill nor a CWD directory
+            // before promotion may only now resolve, since the directory
+            // just promoted to a source can contain them (e.g. `load
+            // plain-dir widget` where `plain-dir/widget/SKILL.md` exists).
+            // This is the only place they get a second chance; anything
+            // still unresolved after this single extra discovery pass is a
+            // hard error.
+            if !provisional.is_empty() {
+                literal_skill_names.extend(self.resolve_provisional_sync_operands(
+                    &provisional,
+                    &cwd,
+                    &discovery,
+                )?);
+            }
+        }
+        // Emit collisions exactly once, from the final discovery result.
         self.emit_collisions(&discovery.collisions)?;
+
         let target_templates =
             self.select_target_templates(config, &args.targets, !update_only, args.dry_run)?;
         let scope_context = scope_context(&self.home)?;
@@ -1144,15 +1215,41 @@ where
             .values()
             .map(|candidate| candidate.name.as_str())
             .collect::<Vec<_>>();
-        let expansion = expand_skill_patterns(&operands.skill_patterns, candidate_names)?;
+        // Only call the expander when glob patterns were actually supplied.
+        // `expand_skill_patterns` returns every candidate for an empty
+        // pattern list by design (the plain "no operands: deploy
+        // everything" contract), so calling it unconditionally here would
+        // silently select all candidates even when only literal skill names
+        // narrowed the selection.
+        let expansion = if glob_patterns.is_empty() {
+            PatternExpansion::default()
+        } else {
+            expand_skill_patterns(&glob_patterns, candidate_names)?
+        };
         self.emit_unmatched_patterns(&expansion.unmatched_patterns)?;
-        let positional_matched =
-            operands.skill_patterns.is_empty() || !expansion.matched.is_empty();
-        let selected = expansion
-            .matched
-            .iter()
-            .map(|name| fold(name))
-            .collect::<BTreeSet<_>>();
+        // A literal skill name that resolved successfully must count as a
+        // positional match on its own, even when an unrelated unmatched glob
+        // pattern was also supplied: an unmatched glob only warns (it never
+        // fails the whole invocation by itself), so it must not force a
+        // non-zero exit after a valid literal already deployed something.
+        let positional_matched = !literal_skill_names.is_empty()
+            || glob_patterns.is_empty()
+            || !expansion.matched.is_empty();
+        let selected = if glob_patterns.is_empty() && literal_skill_names.is_empty() {
+            // No positional selector narrowed skills at all: keep the
+            // long-standing "select every discovered candidate" behavior
+            // rather than accidentally tripping it when literal skill names
+            // were supplied but happened not to widen `glob_patterns`.
+            discovery.winners.keys().cloned().collect::<BTreeSet<_>>()
+        } else {
+            let mut set = expansion
+                .matched
+                .iter()
+                .map(|name| fold(name))
+                .collect::<BTreeSet<_>>();
+            set.extend(literal_skill_names.iter().map(|name| fold(name)));
+            set
+        };
 
         let mut steps = Vec::new();
         for candidate in discovery.winners.values() {
@@ -1293,7 +1390,7 @@ where
         if !positional_matched {
             return Err(SkillManagerError::NotFound {
                 kind: "skill matching positional pattern",
-                reference: operands.skill_patterns.join(", "),
+                reference: glob_patterns.join(", "),
             });
         }
         self.reporter.event(
@@ -2526,14 +2623,151 @@ where
     fn emit_unmatched_patterns(&mut self, patterns: &[String]) -> Result<()> {
         for pattern in patterns {
             let message = format!("skill pattern matched nothing: {pattern}");
-            self.reporter.diagnostic(&format!("Warning: {message}"))?;
-            self.reporter.event(
-                "diagnostic",
-                Level::Warning,
-                json!({ "message": message, "pattern": pattern }),
-            )?;
+            self.emit_pattern_diagnostic(&message, pattern)?;
         }
         Ok(())
+    }
+
+    /// Emit the shared message-only `diagnostic` warning shape, on both the
+    /// human and NDJSON channels.
+    fn emit_message_diagnostic(&mut self, message: &str) -> Result<()> {
+        self.reporter.diagnostic(&format!("Warning: {message}"))?;
+        self.reporter
+            .event("diagnostic", Level::Warning, json!({ "message": message }))
+    }
+
+    /// Emit the shared `diagnostic` warning shape carrying a `message` and a
+    /// `pattern`/operand field, on both the human and NDJSON channels.
+    fn emit_pattern_diagnostic(&mut self, message: &str, pattern: &str) -> Result<()> {
+        self.reporter.diagnostic(&format!("Warning: {message}"))?;
+        self.reporter.event(
+            "diagnostic",
+            Level::Warning,
+            json!({ "message": message, "pattern": pattern }),
+        )
+    }
+
+    /// Check `word` against the skills just discovered. If it names a
+    /// discovered skill (case-insensitively), that skill wins; when a
+    /// same-named directory also exists under `cwd`, a warning names the
+    /// ambiguity and points at `./word` to force the directory
+    /// interpretation instead. Shared by both the preliminary
+    /// (`resolve_deferred_sync_operands`) and post-promotion
+    /// (`resolve_provisional_sync_operands`) resolution passes so the
+    /// ambiguity rule cannot drift between them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the ambiguity diagnostic cannot be emitted.
+    fn resolve_skill_word_with_ambiguity_warning(
+        &mut self,
+        word: &str,
+        cwd: &Path,
+        discovery: &SkillDiscovery,
+    ) -> Result<Option<String>> {
+        let Some(candidate) = discovery.winners.get(&fold(word)) else {
+            return Ok(None);
+        };
+        let name = candidate.name.clone();
+        if cwd.join(word).is_dir() {
+            let message = format!(
+                "\"{word}\" matches both a discovered skill and a directory in the current working directory; the skill was selected. Use \"./{word}\" to select the directory as a source instead."
+            );
+            self.emit_message_diagnostic(&message)?;
+        }
+        Ok(Some(name))
+    }
+
+    /// Resolve `load`/`update` bare words left unclassified before discovery.
+    ///
+    /// Each deferred word is checked, in order, against the skills just
+    /// discovered and then against the current working directory:
+    ///
+    /// 1. A discovered skill name (case-insensitively) selects that skill,
+    ///    applying the ambiguity warning via
+    ///    [`Self::resolve_skill_word_with_ambiguity_warning`] when a
+    ///    same-named CWD directory also exists.
+    /// 2. Otherwise, an existing CWD directory is returned so the caller can
+    ///    promote it to a source and re-resolve once, preserving the
+    ///    historical bare-relative-directory behavior.
+    /// 3. Otherwise, the word is provisionally unresolved: it may still
+    ///    resolve once a promoted directory's skills are discovered (see
+    ///    [`Self::resolve_provisional_sync_operands`]). When no word in the
+    ///    batch triggered a directory promotion, there is no further chance
+    ///    for these words to resolve, so they hard-error immediately here,
+    ///    exactly as before this refinement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a diagnostic cannot be emitted, or (when no
+    /// directory was promoted) a deferred word matches no source,
+    /// directory, or skill.
+    fn resolve_deferred_sync_operands(
+        &mut self,
+        deferred: &[String],
+        cwd: &Path,
+        discovery: &SkillDiscovery,
+    ) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
+        let mut literal_skill_names = Vec::new();
+        let mut promoted_sources = Vec::new();
+        let mut provisional = Vec::new();
+        if deferred.is_empty() {
+            return Ok((literal_skill_names, promoted_sources, provisional));
+        }
+        for word in deferred {
+            if let Some(name) =
+                self.resolve_skill_word_with_ambiguity_warning(word, cwd, discovery)?
+            {
+                literal_skill_names.push(name);
+            } else if cwd.join(word).is_dir() {
+                promoted_sources.push(word.clone());
+            } else {
+                provisional.push(word.clone());
+            }
+        }
+        // No directory is being promoted, so there is no second discovery
+        // pass coming: any word that is still unresolved must hard-error now.
+        if promoted_sources.is_empty()
+            && let Some(word) = provisional.first()
+        {
+            return Err(SkillManagerError::NoSourceDirectoryOrSkill {
+                reference: word.clone(),
+            });
+        }
+        Ok((literal_skill_names, promoted_sources, provisional))
+    }
+
+    /// Resolve deferred words left provisionally unresolved by
+    /// [`Self::resolve_deferred_sync_operands`] against the final discovery
+    /// that followed a directory promotion, applying the same
+    /// discovered-skill-vs-CWD-directory ambiguity check (via
+    /// [`Self::resolve_skill_word_with_ambiguity_warning`]) as the
+    /// preliminary pass. A word still unmatched is a hard error, identical
+    /// in shape to the immediate-error path above.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a diagnostic cannot be emitted, or a
+    /// provisional word still matches no discovered skill after the final
+    /// discovery pass.
+    fn resolve_provisional_sync_operands(
+        &mut self,
+        provisional: &[String],
+        cwd: &Path,
+        discovery: &SkillDiscovery,
+    ) -> Result<Vec<String>> {
+        let mut literal_skill_names = Vec::new();
+        for word in provisional {
+            match self.resolve_skill_word_with_ambiguity_warning(word, cwd, discovery)? {
+                Some(name) => literal_skill_names.push(name),
+                None => {
+                    return Err(SkillManagerError::NoSourceDirectoryOrSkill {
+                        reference: word.clone(),
+                    });
+                }
+            }
+        }
+        Ok(literal_skill_names)
     }
 
     fn emit_collisions(
@@ -3316,7 +3550,7 @@ mod tests {
         TargetArgs, TargetNameArgs, TargetPathArgs, UpdateArgs,
     };
     use crate::config::{Config, FileConfigRepository, resolved_targets, source_from_reference};
-    use crate::domain::{ResolvedSource, Scope, SkillCandidate, TargetEntry};
+    use crate::domain::{ResolvedSource, Scope, SkillCandidate, SkillDiscovery, TargetEntry};
     use crate::error::{Result, SkillManagerError};
     use crate::event::{Level, Reporter};
     use crate::prompt::Prompt;
@@ -3708,6 +3942,133 @@ mod tests {
                 }),
             }))
             .is_err()
+        );
+    }
+
+    /// `resolve_provisional_sync_operands` resolves bare words against the
+    /// FINAL discovery that follows a directory promotion (see
+    /// `run_sync`'s two-phase sequencing). This directly exercises that the
+    /// same discovered-skill-vs-CWD-directory ambiguity check applied by the
+    /// preliminary resolver (`resolve_deferred_sync_operands`) is also
+    /// applied here, via the shared `resolve_skill_word_with_ambiguity_warning`
+    /// helper. A synthetic `cwd` and hand-built `SkillDiscovery` are used
+    /// (rather than driving this through the full CLI, which cannot express
+    /// this exact combination: a bare word that only resolves to a skill
+    /// after a *different* directory operand is promoted, while a
+    /// same-named directory unrelated to that promotion also exists
+    /// directly under the CWD) so the ambiguity condition is deterministic
+    /// and isolated from global process state. Before the fix, this
+    /// resolver selected the skill without ever rechecking `cwd`, so no
+    /// diagnostic would have been recorded here.
+    #[test]
+    fn provisional_resolution_still_warns_when_a_same_named_cwd_directory_exists() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+        let network = NoNetwork;
+        let hook = NoopTransactionHook;
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let mut app = Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            false,
+            home.path().to_path_buf(),
+        );
+
+        // A directory named exactly like the provisionally-resolved skill
+        // exists directly under the synthetic CWD, distinct from wherever
+        // the skill itself actually lives.
+        let cwd = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        std::fs::create_dir_all(cwd.path().join("widget"))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+
+        let entry = source_from_reference("owner/repository", None)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let mut discovery = SkillDiscovery::default();
+        discovery.winners.insert(
+            "widget".into(),
+            SkillCandidate {
+                name: "widget".into(),
+                path: home.path().join("plain-dir").join("widget"),
+                source: ResolvedSource {
+                    entry,
+                    path: home.path().join("plain-dir"),
+                    from_cache: false,
+                    temporary: None,
+                },
+            },
+        );
+
+        let resolved = app
+            .resolve_provisional_sync_operands(&["widget".into()], cwd.path(), &discovery)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(resolved, vec!["widget".to_string()]);
+        assert!(
+            app.reporter.events.contains(&"diagnostic".to_string()),
+            "the ambiguity must emit a diagnostic event: {:?}",
+            app.reporter.events
+        );
+        assert!(
+            app.reporter.diagnostics.iter().any(|line| line
+                .contains("matches both a discovered skill and a directory")
+                && line.contains("./widget")),
+            "the diagnostic must name the ambiguity and point at ./widget: {:?}",
+            app.reporter.diagnostics
+        );
+    }
+
+    /// Regression companion to the ambiguity test above: a provisionally
+    /// resolved word that has NO same-named CWD directory must select the
+    /// skill without emitting any ambiguity diagnostic.
+    #[test]
+    fn provisional_resolution_does_not_warn_without_a_same_named_cwd_directory() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+        let network = NoNetwork;
+        let hook = NoopTransactionHook;
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let mut app = Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            false,
+            home.path().to_path_buf(),
+        );
+
+        // No "widget" directory exists directly under this synthetic CWD.
+        let cwd = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+
+        let entry = source_from_reference("owner/repository", None)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let mut discovery = SkillDiscovery::default();
+        discovery.winners.insert(
+            "widget".into(),
+            SkillCandidate {
+                name: "widget".into(),
+                path: home.path().join("plain-dir").join("widget"),
+                source: ResolvedSource {
+                    entry,
+                    path: home.path().join("plain-dir"),
+                    from_cache: false,
+                    temporary: None,
+                },
+            },
+        );
+
+        let resolved = app
+            .resolve_provisional_sync_operands(&["widget".into()], cwd.path(), &discovery)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(resolved, vec!["widget".to_string()]);
+        assert!(
+            app.reporter.diagnostics.is_empty(),
+            "no ambiguity exists, so no diagnostic should be emitted: {:?}",
+            app.reporter.diagnostics
         );
     }
 

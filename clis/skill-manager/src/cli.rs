@@ -164,8 +164,16 @@ impl TargetSelection {
 /// Arguments shared by `load` and `update`.
 #[derive(Clone, Debug, Default, Args)]
 pub struct SyncArgs {
-    /// Source paths/references/names/IDs, or skill-name patterns.
-    #[arg(value_name = "SOURCE_OR_PATTERN")]
+    /// Source paths/references/names/IDs, skill names, or skill-name patterns.
+    ///
+    /// A literal operand resolves in order: a configured source (ID, name,
+    /// active location, or unique label); a path-shaped or GitHub-ref-shaped
+    /// value (absolute, `~`, `./`/`../`, or containing a path separator); a
+    /// discovered skill name (case-insensitive); an existing directory below
+    /// the current working directory. A discovered skill name wins over a
+    /// same-named directory, with a warning suggesting `./name` to force the
+    /// directory. An operand matching none of these is a hard error.
+    #[arg(value_name = "SOURCE_OR_SKILL_OR_PATTERN")]
     pub sources: Vec<String>,
     /// Include pattern; repeatable and combined with logical OR.
     #[arg(long = "filter", value_name = "PATTERN")]

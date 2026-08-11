@@ -3938,3 +3938,804 @@ fn configs_human_output_is_layered_and_raw_output_remains_exact() {
     assert!(raw.status.success());
     assert_eq!(raw.stdout, expected);
 }
+
+/// A bare literal `load`/`update` operand now resolves against discovered
+/// skill names, case-insensitively, from any CWD. This is the reported bug:
+/// before the fix, a bare skill name was always treated as a CWD-relative
+/// source path and failed with "source directory not found".
+#[test]
+fn load_bare_skill_name_resolves_from_an_unrelated_cwd() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "knowing-camber-me", "# Camber");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "sernst-skills",
+        ])
+        .assert()
+        .success();
+
+    let elsewhere = home.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("create unrelated cwd");
+    let mut load = cli(home.path());
+    load.current_dir(&elsewhere);
+    load.args(["load", "knowing-camber-me", "--claude", "--global"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Loaded knowing-camber-me"));
+    assert!(
+        home.path()
+            .join(".claude/skills/knowing-camber-me/SKILL.md")
+            .is_file()
+    );
+}
+
+/// `install` (the `load` alias) resolves a bare skill name case-insensitively.
+#[test]
+fn install_uppercase_skill_name_folds_case() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "sample-skill", "# Sample");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+        ])
+        .assert()
+        .success();
+
+    cli(home.path())
+        .args(["install", "SAMPLE-SKILL", "--claude", "--global"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Loaded sample-skill"));
+    assert!(
+        home.path()
+            .join(".claude/skills/sample-skill/SKILL.md")
+            .is_file()
+    );
+}
+
+/// A bare literal that names no configured source, CWD directory, or
+/// discovered skill is a hard error with an actionable message, unlike an
+/// unmatched glob pattern, which only warns.
+#[test]
+fn load_unknown_literal_is_a_hard_error() {
+    let home = sandbox();
+    cli(home.path())
+        .args([
+            "load",
+            "totally-unknown-thing",
+            "--claude",
+            "--global",
+            "--no-input",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no configured source, directory, or skill named \"totally-unknown-thing\"",
+        ))
+        .stderr(predicate::str::contains("skill-manager ls"));
+
+    cli(home.path())
+        .args([
+            "--json",
+            "load",
+            "totally-unknown-thing",
+            "--claude",
+            "--global",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "no configured source, directory, or skill named \\\"totally-unknown-thing\\\"",
+        ))
+        .stdout(predicate::str::contains("\"event\":\"command.failed\""));
+}
+
+/// When a bare word is both a discovered skill name and a same-named CWD
+/// directory, the skill wins and the command warns about the ambiguity,
+/// pointing at `./name` to force the directory interpretation. Both the
+/// human warning and the NDJSON `diagnostic`/`Warning` event are asserted.
+#[test]
+fn ambiguous_bare_word_prefers_the_skill_and_warns() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "dup-name", "# Dup");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    fs::create_dir_all(home.path().join("dup-name")).expect("create ambiguous cwd directory");
+
+    cli(home.path())
+        .args(["load", "dup-name", "--claude", "--global", "--no-input"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "\"dup-name\" matches both a discovered skill and a directory",
+        ))
+        .stderr(predicate::str::contains("./dup-name"));
+    assert!(
+        home.path()
+            .join(".claude/skills/dup-name/SKILL.md")
+            .is_file()
+    );
+
+    let events = json_events(
+        cli(home.path())
+            .args(["--json", "load", "dup-name", "--shared", "--global"])
+            .output()
+            .expect("json ambiguous load"),
+    );
+    let warnings = events_of(&events, "diagnostic");
+    assert!(
+        warnings.iter().any(|event| {
+            event["level"] == "warning"
+                && event["data"]["message"].as_str().is_some_and(|message| {
+                    message.contains("matches both a discovered skill and a directory")
+                        && message.contains("./dup-name")
+                })
+                && event["data"].get("pattern").is_none()
+        }),
+        "expected an NDJSON diagnostic warning naming the ambiguity with a message-only payload: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "skill.loaded" && event["data"]["skill"] == "dup-name")
+    );
+}
+
+/// Regression: a bare relative directory name that is not a discovered skill
+/// still resolves as a source path, exactly as before this fix.
+#[test]
+fn bare_directory_name_that_is_not_a_skill_still_resolves_as_a_source() {
+    let home = sandbox();
+    let plain_dir = home.path().join("plain-dir");
+    create_skill(&plain_dir, "widget", "# Widget");
+
+    cli(home.path())
+        .args(["load", "plain-dir", "--claude", "--global", "--no-input"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Loaded widget"));
+    assert!(home.path().join(".claude/skills/widget/SKILL.md").is_file());
+}
+
+/// Regression: a bare configured-source name and a bare source label still
+/// resolve as source references, exactly as before this fix.
+#[test]
+fn bare_configured_source_name_and_label_still_resolve_as_sources() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "gizmo", "# Gizmo");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+            "--label",
+            "Primary Label",
+        ])
+        .assert()
+        .success();
+
+    cli(home.path())
+        .args(["load", "primary", "--claude", "--global", "--no-input"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Loaded gizmo"));
+    assert!(home.path().join(".claude/skills/gizmo/SKILL.md").is_file());
+
+    cli(home.path())
+        .args([
+            "load",
+            "Primary Label",
+            "--shared",
+            "--global",
+            "--no-input",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Loaded gizmo"));
+    assert!(home.path().join(".agents/skills/gizmo/SKILL.md").is_file());
+}
+
+/// Regression (A6): when a mixed operand list contains both a literal skill
+/// name and a bare directory name that must be promoted to a source (a
+/// second discovery pass), any collision from the configured sources must be
+/// reported exactly once, not once per discovery pass.
+#[test]
+fn collision_diagnostic_is_emitted_exactly_once_across_a_second_discovery_pass() {
+    let home = sandbox();
+    let first = home.path().join("first");
+    let second = home.path().join("second");
+    create_skill(&first, "common", "# First");
+    create_skill(&second, "common", "# Second");
+    for (path, name) in [(&first, "first"), (&second, "second")] {
+        cli(home.path())
+            .args([
+                "--json",
+                "source",
+                "add",
+                path.to_str().expect("utf8 path"),
+                name,
+            ])
+            .assert()
+            .success();
+    }
+    let plain_dir = home.path().join("plain-dir");
+    create_skill(&plain_dir, "extra", "# Extra");
+
+    let events = json_events(
+        cli(home.path())
+            .args([
+                "--json",
+                "load",
+                "common",
+                "plain-dir",
+                "--claude",
+                "--global",
+            ])
+            .output()
+            .expect("mixed skill and promoted-directory load"),
+    );
+    let collisions = events_of(&events, "collision.detected");
+    assert_eq!(
+        collisions.len(),
+        1,
+        "collision.detected must be emitted exactly once across both discovery passes: {events:?}"
+    );
+    // The bare literal skill name narrows selection to itself, same as the
+    // mixed source+skill case above; the promoted directory only widens the
+    // discovery *candidate pool* (which is what surfaces the collision from
+    // "first"/"second"), not the final selection.
+    let loaded = events_of(&events, "skill.loaded");
+    let names = loaded
+        .iter()
+        .filter_map(|event| event["data"]["skill"].as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(names, BTreeSet::from(["common"]));
+}
+
+/// `load <bare-dir> <exact-skill-inside-that-dir>` must succeed: the skill
+/// name only becomes resolvable after `plain-dir` is promoted to a source
+/// and the second discovery pass runs, so it must not be hard-errored
+/// against the preliminary (pre-promotion) discovery. This is the reported
+/// sequencing bug: an equivalent glob (`load plain-dir "widg*"`) already
+/// worked, but the exact literal name did not.
+#[test]
+fn bare_dir_operand_and_a_skill_name_discovered_only_inside_it_both_resolve() {
+    let home = sandbox();
+    let plain_dir = home.path().join("plain-dir");
+    create_skill(&plain_dir, "widget", "# Widget");
+
+    // The glob-based equivalent already worked before this fix; assert it
+    // still does, alongside the newly-fixed exact-name case.
+    cli(home.path())
+        .args([
+            "load",
+            "plain-dir",
+            "widg*",
+            "--claude",
+            "--global",
+            "--no-input",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Loaded widget"));
+
+    let events = json_events(
+        cli(home.path())
+            .args([
+                "--json",
+                "load",
+                "plain-dir",
+                "widget",
+                "--shared",
+                "--global",
+            ])
+            .output()
+            .expect("bare directory plus exact skill name inside it"),
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event"] == "command.failed"),
+        "a skill discovered only after directory promotion must resolve: {events:?}"
+    );
+    let loaded = events_of(&events, "skill.loaded");
+    assert_eq!(loaded.len(), 1, "exactly one skill must deploy: {events:?}");
+    assert_eq!(loaded[0]["data"]["skill"], "widget");
+    assert!(home.path().join(".agents/skills/widget/SKILL.md").is_file());
+}
+
+/// `load <bare-dir> <exact-skill-inside-it> <name-that-exists-nowhere>` must
+/// still be a hard error naming the truly unresolvable word, even after the
+/// directory is promoted, `widget` resolves against the final discovery, and
+/// only `nowhere-to-be-found` remains unresolved. This is rollback-sensitive:
+/// on the pre-fix implementation, `resolve_deferred_sync_operands` hard-errors
+/// immediately against the PRELIMINARY discovery, before `plain-dir` is ever
+/// promoted -- so it would report `widget` (the first deferred word it fails
+/// to resolve) rather than `nowhere-to-be-found`, and it would do so even
+/// though `widget` is in fact resolvable once promotion runs.
+#[test]
+fn bare_dir_operand_with_an_unresolvable_sibling_name_is_still_a_hard_error() {
+    let home = sandbox();
+    let plain_dir = home.path().join("plain-dir");
+    create_skill(&plain_dir, "widget", "# Widget");
+
+    cli(home.path())
+        .args([
+            "load",
+            "plain-dir",
+            "widget",
+            "nowhere-to-be-found",
+            "--claude",
+            "--global",
+            "--no-input",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no configured source, directory, or skill named \"nowhere-to-be-found\"",
+        ))
+        .stderr(predicate::str::contains("skill-manager ls"))
+        .stderr(predicate::str::contains("\"widget\"").not());
+    assert!(!home.path().join(".claude/skills/widget").exists());
+}
+
+// A word that becomes resolvable only after directory promotion (the
+// provisional path) still applies the discovered-skill-vs-CWD-directory
+// ambiguity rule identically to the preliminary resolver: see the
+// `provisional_resolution_still_warns_when_a_same_named_cwd_directory_exists`
+// and `provisional_resolution_does_not_warn_without_a_same_named_cwd_directory`
+// unit tests in `src/app.rs`. Those exercise `resolve_provisional_sync_operands`
+// directly against a synthetic CWD and a hand-built discovery result, because
+// the combination cannot be expressed as a single CLI invocation: any bare
+// word that is itself a real top-level CWD directory is always classified as
+// a directory to promote (step 5) during the *preliminary* pass -- before
+// discovery can know whether that same word would also resolve as a skill --
+// so it can never simultaneously reach the provisional bucket. A directory
+// literally named after the provisionally-resolved skill can therefore never
+// coexist with that skill being "provisional" at the CLI level; the ambiguity
+// check inside `resolve_provisional_sync_operands` is still required (so the
+// helper cannot silently drift from the preliminary resolver as the code
+// evolves), which is exactly what the unit tests isolate and prove.
+
+/// The single extra discovery pass triggered by a bare-directory promotion,
+/// combined with a provisionally-unresolved sibling word that only resolves
+/// against that final discovery, must not run discovery (or emit its
+/// collision diagnostics) more than once. Reuses the same
+/// exactly-once-across-passes counting approach as
+/// `collision_diagnostic_is_emitted_exactly_once_across_a_second_discovery_pass`.
+/// A literal skill name resolved in the preliminary pass keeps the
+/// configured sources (rather than replacing them with just the promoted
+/// directory), so the pre-existing collision stays observable in the final
+/// discovery and its diagnostic count proves discovery ran exactly once
+/// beyond the preliminary pass, not once per resolved word.
+#[test]
+fn provisional_word_resolution_does_not_trigger_a_third_discovery_pass() {
+    let home = sandbox();
+    let first = home.path().join("first");
+    let second = home.path().join("second");
+    create_skill(&first, "shared-name", "# First");
+    create_skill(&second, "shared-name", "# Second");
+    for (path, name) in [(&first, "first"), (&second, "second")] {
+        cli(home.path())
+            .args([
+                "--json",
+                "source",
+                "add",
+                path.to_str().expect("utf8 path"),
+                name,
+            ])
+            .assert()
+            .success();
+    }
+    let plain_dir = home.path().join("plain-dir");
+    create_skill(&plain_dir, "widget", "# Widget");
+
+    let events = json_events(
+        cli(home.path())
+            .args([
+                "--json",
+                "load",
+                "shared-name",
+                "plain-dir",
+                "widget",
+                "--claude",
+                "--global",
+            ])
+            .output()
+            .expect("literal skill, bare directory promotion, and a provisionally-resolved word"),
+    );
+    let collisions = events_of(&events, "collision.detected");
+    assert_eq!(
+        collisions.len(),
+        1,
+        "collision.detected must be emitted exactly once, proving discovery ran at most once beyond the preliminary pass: {events:?}"
+    );
+    let loaded = events_of(&events, "skill.loaded");
+    let names = loaded
+        .iter()
+        .filter_map(|event| event["data"]["skill"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names.len(),
+        2,
+        "each selected skill must load exactly once, not be duplicated by the extra pass: {events:?}"
+    );
+    assert_eq!(
+        names.iter().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from(["shared-name", "widget"])
+    );
+    assert!(home.path().join(".claude/skills/widget/SKILL.md").is_file());
+    assert!(
+        home.path()
+            .join(".claude/skills/shared-name/SKILL.md")
+            .is_file()
+    );
+}
+
+/// `update <skill name>` selects only that skill, resolving it through the
+/// new literal-skill-name path rather than a configured source or label.
+#[test]
+fn update_bare_skill_name_selects_only_that_skill() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    let keep = create_skill(&source, "keep-me", "# Keep v1");
+    let drop = create_skill(&source, "drop-me", "# Drop v1");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args(["--json", "load", "--claude", "--global"])
+        .assert()
+        .success();
+
+    fs::write(keep.join("SKILL.md"), "# Keep v2").expect("update keep-me source");
+    fs::write(drop.join("SKILL.md"), "# Drop v2").expect("update drop-me source");
+
+    cli(home.path())
+        .args(["update", "keep-me", "--claude", "--global", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Updated keep-me"))
+        .stdout(predicate::str::contains("Updated drop-me").not());
+    assert_eq!(
+        fs::read_to_string(home.path().join(".claude/skills/keep-me/SKILL.md"))
+            .expect("read updated keep-me deployment"),
+        "# Keep v2"
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join(".claude/skills/drop-me/SKILL.md"))
+            .expect("read unchanged drop-me deployment"),
+        "# Drop v1"
+    );
+}
+
+/// Mixed operands narrow to both the named source and the named skill: a
+/// second, unrelated source and its skills are excluded entirely.
+#[test]
+fn mixed_source_and_skill_operands_narrow_to_both() {
+    let home = sandbox();
+    let source_a = home.path().join("source-a");
+    let source_b = home.path().join("source-b");
+    create_skill(&source_a, "widget-a", "# Widget A");
+    create_skill(&source_a, "gadget-a", "# Gadget A");
+    create_skill(&source_b, "widget-b", "# Widget B");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source_a.to_str().expect("utf8 source a"),
+            "alpha-source",
+            "--label",
+            "Alpha Source",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source_b.to_str().expect("utf8 source b"),
+            "beta-source",
+        ])
+        .assert()
+        .success();
+
+    let events = json_events(
+        cli(home.path())
+            .args([
+                "--json",
+                "load",
+                "Alpha Source",
+                "widget-a",
+                "--claude",
+                "--global",
+            ])
+            .output()
+            .expect("mixed operand load"),
+    );
+    let loaded = events_of(&events, "skill.loaded");
+    assert_eq!(loaded.len(), 1, "only widget-a should deploy: {events:?}");
+    assert_eq!(loaded[0]["data"]["skill"], "widget-a");
+    assert!(home.path().join(".claude/skills/widget-a").is_dir());
+    assert!(!home.path().join(".claude/skills/gadget-a").exists());
+    assert!(!home.path().join(".claude/skills/widget-b").exists());
+}
+
+/// Glob behavior is unchanged: a wildcard still selects matching skills, and
+/// an unmatched glob still warns rather than hard-erroring like an
+/// unresolvable literal does.
+#[test]
+fn glob_patterns_are_unaffected_by_literal_skill_name_resolution() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "knowing-camber-me", "# Camber");
+    create_skill(&source, "knowing-other-thing", "# Other");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+        ])
+        .assert()
+        .success();
+
+    cli(home.path())
+        .args(["load", "knowing-*", "--claude", "--global", "--no-input"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Loaded knowing-camber-me"))
+        .stdout(predicate::str::contains("Loaded knowing-other-thing"));
+
+    cli(home.path())
+        .args(["--json", "load", "missing-glob-*", "--claude", "--global"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "skill pattern matched nothing: missing-glob-*",
+        ));
+}
+
+/// A valid literal skill name paired with an unmatched glob must still
+/// succeed: the unmatched glob only warns, and the literal skill deploys.
+/// This is the reported "mutation followed by hard failure" bug: before the
+/// fix, `load known-skill missing-*` deployed `known-skill` and then still
+/// exited non-zero because `positional_matched` only tracked glob matches.
+#[test]
+fn literal_skill_name_with_an_unmatched_glob_still_succeeds_and_only_deploys_the_literal() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "known-skill", "# Known");
+    create_skill(&source, "other-skill", "# Other");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+        ])
+        .assert()
+        .success();
+
+    let events = json_events(
+        cli(home.path())
+            .args([
+                "--json",
+                "load",
+                "known-skill",
+                "missing-*",
+                "--claude",
+                "--global",
+            ])
+            .output()
+            .expect("literal plus unmatched glob load"),
+    );
+    let warnings = events_of(&events, "diagnostic");
+    assert!(
+        warnings.iter().any(|event| {
+            event["data"]["message"] == "skill pattern matched nothing: missing-*"
+        }),
+        "expected the unmatched-glob warning: {events:?}"
+    );
+    let loaded = events_of(&events, "skill.loaded");
+    assert_eq!(
+        loaded.len(),
+        1,
+        "only the literal skill should deploy: {events:?}"
+    );
+    assert_eq!(loaded[0]["data"]["skill"], "known-skill");
+    assert!(
+        events.iter().any(|event| event["event"] == "summary"),
+        "the invocation must succeed and emit a summary, not command.failed: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event"] == "command.failed"),
+        "an unmatched glob must not fail the invocation when a literal matched: {events:?}"
+    );
+    assert!(
+        home.path()
+            .join(".claude/skills/known-skill/SKILL.md")
+            .is_file()
+    );
+    assert!(!home.path().join(".claude/skills/other-skill").exists());
+
+    // Plain (non-JSON) exit code must be zero too.
+    cli(home.path())
+        .args([
+            "load",
+            "known-skill",
+            "missing-*",
+            "--shared",
+            "--global",
+            "--no-input",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "skill pattern matched nothing: missing-*",
+        ));
+}
+
+/// The inverse of the above: an unresolvable literal must still be a hard
+/// error even when another glob operand DOES match something. A matching
+/// glob must not mask an unresolvable literal.
+#[test]
+fn unresolvable_literal_with_a_matching_glob_is_still_a_hard_error() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "knowing-camber-me", "# Camber");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+        ])
+        .assert()
+        .success();
+
+    cli(home.path())
+        .args([
+            "load",
+            "totally-unknown-thing",
+            "knowing-*",
+            "--claude",
+            "--global",
+            "--no-input",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no configured source, directory, or skill named \"totally-unknown-thing\"",
+        ))
+        .stderr(predicate::str::contains("skill-manager ls"));
+    assert!(
+        !home
+            .path()
+            .join(".claude/skills/knowing-camber-me")
+            .exists()
+    );
+}
+
+/// JSON recipe input (`--json-input`) overlays into the same `SyncArgs` as
+/// the CLI, so a bare literal skill name supplied through a recipe's
+/// `"source"` field must resolve identically: narrowing to that one skill,
+/// not falling back to "deploy everything".
+#[test]
+fn recipe_literal_skill_name_resolution_matches_the_cli() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "recipe-target", "# Recipe target");
+    create_skill(&source, "recipe-other", "# Recipe other");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+        ])
+        .assert()
+        .success();
+
+    let recipe = serde_json::json!({
+        "command": "load",
+        "source": "recipe-target",
+        "claude": true,
+        "global": true
+    });
+    let events = json_events(
+        cli(home.path())
+            .arg("--json-input")
+            .write_stdin(recipe.to_string())
+            .output()
+            .expect("run literal-skill-name recipe"),
+    );
+    let loaded = events_of(&events, "skill.loaded");
+    assert_eq!(
+        loaded.len(),
+        1,
+        "recipe literal skill name must narrow like the CLI does: {events:?}"
+    );
+    assert_eq!(loaded[0]["data"]["skill"], "recipe-target");
+    assert!(
+        home.path()
+            .join(".claude/skills/recipe-target/SKILL.md")
+            .is_file()
+    );
+    assert!(!home.path().join(".claude/skills/recipe-other").exists());
+}
+
+/// With no positional operands at all, `load` still deploys every discovered
+/// skill; this must remain true even though literal skill names now
+/// participate in selection.
+#[test]
+fn load_with_no_positional_operands_still_deploys_everything() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "alpha", "# Alpha");
+    create_skill(&source, "beta", "# Beta");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+        ])
+        .assert()
+        .success();
+
+    let events = json_events(
+        cli(home.path())
+            .args(["--json", "load", "--claude", "--global"])
+            .output()
+            .expect("load everything"),
+    );
+    let loaded = events_of(&events, "skill.loaded");
+    let names = loaded
+        .iter()
+        .filter_map(|event| event["data"]["skill"].as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        names,
+        BTreeSet::from(["alpha", "beta"]),
+        "no-operand load must deploy every discovered skill"
+    );
+}

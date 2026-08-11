@@ -22,6 +22,14 @@ pub enum SkillManagerError {
         /// The user-supplied label.
         label: String,
     },
+    /// A bare `load`/`update` literal matched no source, directory, or skill.
+    #[error(
+        "no configured source, directory, or skill named \"{reference}\"; run `skill-manager ls` to see configured sources and discovered skills"
+    )]
+    NoSourceDirectoryOrSkill {
+        /// The user-supplied literal operand.
+        reference: String,
+    },
     /// A filesystem operation failed.
     #[error("filesystem operation failed for {path}: {source}")]
     FileSystem {

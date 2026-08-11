@@ -135,8 +135,12 @@ sources -> discovered skills -> targets
 
 - A **source** is a local directory or GitHub repository path containing one
   skill or a collection of skill directories.
-- A **skill** is a directory whose root contains `SKILL.md`. Patterns and
-  filters select which discovered skills an operation uses.
+- A **skill** is a directory whose root contains `SKILL.md`. Patterns, filters,
+  and exact skill names (case-insensitive) all select which discovered skills
+  an operation uses; a bare name that matches both a discovered skill and a
+  same-named directory in the current directory selects the skill and warns
+  (use `./name` to force the directory), and a name matching none of those is
+  a hard error.
 - A **target** is a root-relative deployment template. Built-ins are `claude`
   (`.claude/skills`), `shared` (`.agents/skills`), and `antigravity`
   (`.gemini/antigravity/skills`).

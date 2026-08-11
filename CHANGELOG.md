@@ -2,6 +2,12 @@
 
 All notable changes to the downloadable CLIs are documented here.
 
+## 0.1.3 - 2026-08-10
+
+- Fixes `load`/`install` and `update`/`up` treating a bare skill name as a current-directory path; a literal operand now resolves case-insensitively against discovered skill names when it does not name a configured source, path, or GitHub reference.
+- Adds a hard error, `no configured source, directory, or skill named "NAME"`, for a bare operand that resolves to nothing, with a hint to run `skill-manager ls`.
+- Warns and prefers the skill when a bare operand matches both a discovered skill name and a same-named directory in the current directory, pointing at `./NAME` to force the directory interpretation.
+
 ## 0.1.2 - 2026-08-08
 
 - Treats the manager home as global-only across every scoped command, preventing duplicate project deployments and rejecting explicit `--project` use there with clear guidance.

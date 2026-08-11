@@ -9,8 +9,8 @@ and honors `NO_COLOR`; `always` colors even redirected output; `never` is plain.
 
 | Command | Purpose |
 | --- | --- |
-| `load [SOURCE_OR_PATTERN...]` | Discover and deploy skills, replacing existing copies; alias: `install`. |
-| `update [SOURCE_OR_PATTERN...]` | Update skills already deployed in the selected or inferred scope, after one plan confirmation; alias: `up`. |
+| `load [SOURCE_OR_SKILL_OR_PATTERN...]` | Discover and deploy skills, replacing existing copies; alias: `install`. |
+| `update [SOURCE_OR_SKILL_OR_PATTERN...]` | Update skills already deployed in the selected or inferred scope, after one plan confirmation; alias: `up`. |
 | `import SKILL` | Adopt one deployed, possibly agent-modified copy as the new source content. |
 | `copy SOURCE DEST` | Copy discovered skills to an arbitrary destination. |
 | `remove [SKILL_OR_PATTERN...]` | Remove selected or auto-detected deployments. |
@@ -146,10 +146,29 @@ legacy overrides until updated or removed.
 
 Python `fnmatch` patterns are case-folded consistently. Positional operands
 containing `*`, `?`, or `[` are skill-name patterns for `load`, `update`,
-`remove`, and `resolve`; literal operands preserve their command-specific
-source, skill-directory, or collection-directory behavior. `copy` continues to
-use only `--filter`. `status` positionals still match a skill name, source name,
-or unique source label.
+`remove`, and `resolve`. `copy` continues to use only `--filter`. `status`
+positionals still match a skill name, source name, or unique source label.
+
+For `load`/`install` and `update`/`up` (which share the same operand
+handling), each non-pattern positional operand is resolved in order:
+
+1. A configured source (by id, name, active location, or unique label).
+2. A path-shaped or GitHub-ref-shaped reference — absolute, `~`-prefixed,
+   `./`/`../` (or `.\`/`..\`) prefixed, or containing a path separator (so
+   `owner/repo` GitHub references resolve here).
+3. Case-insensitively, a discovered skill name — the fix for the reported
+   bug where a bare skill name run from any working directory used to be
+   misread as a directory path.
+4. An existing directory under the current working directory, preserving
+   the historical bare-relative-directory behavior.
+
+If a bare word matches **both** a discovered skill name and a same-named
+directory under the current working directory, the skill wins and the
+command emits a warning naming the ambiguity and pointing at `./name` to
+force the directory interpretation instead. A bare word that matches none of
+the above is a hard error: `no configured source, directory, or skill named
+"NAME"`, with a hint to run `skill-manager ls`; this is deliberately
+stricter than an unmatched glob pattern, which only warns.
 
 Positional patterns are ORed together and then ANDed with the OR-combined
 repeatable `--filter` patterns. Their candidate universes are discovered winners

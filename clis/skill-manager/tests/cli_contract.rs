@@ -33,7 +33,7 @@ fn version_is_available_without_configuration() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.1.2"));
+        .stdout(predicate::str::contains("0.1.3"));
 }
 
 /// Parser misuse follows Clap's conventional usage exit code and stderr stream.
