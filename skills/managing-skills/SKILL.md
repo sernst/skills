@@ -51,8 +51,16 @@ irreversible, and an ambiguous scope (a skill deployed in both global and
 project) must be resolved with `global:true`, `project:true`, or the
 remove-only `both:true` — `yes:true` alone never picks one. A committed `import`
 requires `yes:true`, must name exactly one skill, and must narrow target and
-scope selection whenever more than one deployment differs from its source;
-a GitHub-backed source cannot be imported non-interactively at all. `all_targets:true` selects
+scope selection whenever more than one deployment still differs from the
+source after that; set `update:true` (import + update, recommended) or
+`no_update:true`/`update:false` to resolve the propagation dimension when it
+is genuinely ambiguous — neither is implied by `yes:true`. Propagation
+resolves silently with no flag needed whenever the resolved source copy
+would leave nothing else out of date (nothing to synchronize either way), so
+a single-deployment import commits with only `yes:true`. A GitHub-backed source
+needs a configured local alternate location — without one, import fails
+outright, interactively or not; with one, it imports into that alternate like
+any other destination. `all_targets:true` selects
 enabled configured targets only; select a disabled target explicitly by name
 when the user intends that override. A machine `source.add` must include a
 nonblank `name`. Supply an explicit scope whenever required. Never answer

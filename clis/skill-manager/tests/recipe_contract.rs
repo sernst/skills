@@ -162,6 +162,62 @@ fn recipe_overlay_covers_sync_aliases_and_import_command() {
     );
 }
 
+/// clap's `conflicts_with` between `--update`/`--no-update` only guards the
+/// CLI argv path; the JSON overlay applies both fields independently, so
+/// `recipe.rs` re-checks the exclusivity itself. Also covers item E:
+/// `update` is a tri-state in JSON even though it is two flags on the CLI,
+/// so `update:false` must resolve propagation to import-only, equivalent to
+/// `no_update:true`, rather than silently leaving both flags unset.
+#[test]
+fn import_update_and_no_update_recipe_fields_are_mutually_exclusive() {
+    assert!(
+        recipe_error(&serde_json::json!({
+            "command": "import",
+            "skill": "a",
+            "update": true,
+            "no_update": true
+        }))
+        .contains("mutually exclusive")
+    );
+
+    let import_update = recipe(&serde_json::json!({
+        "command": "import",
+        "skill": "a",
+        "update": true
+    }));
+    let Some(Command::Import(args)) = import_update.command else {
+        unreachable!("import command")
+    };
+    assert!(args.update && !args.no_update);
+
+    let import_only = recipe(&serde_json::json!({
+        "command": "import",
+        "skill": "a",
+        "update": false
+    }));
+    let Some(Command::Import(args)) = import_only.command else {
+        unreachable!("import command")
+    };
+    assert!(
+        !args.update && args.no_update,
+        "update:false must mean import-only (equivalent to no_update:true)"
+    );
+
+    let consistent = recipe(&serde_json::json!({
+        "command": "import",
+        "skill": "a",
+        "update": false,
+        "no_update": true
+    }));
+    let Some(Command::Import(args)) = consistent.command else {
+        unreachable!("import command")
+    };
+    assert!(
+        !args.update && args.no_update,
+        "update:false alongside a consistent explicit no_update:true is not a conflict"
+    );
+}
+
 #[test]
 fn recipe_overlay_covers_query_command_shapes_and_explicit_false() {
     let explicit_false = recipe(&serde_json::json!({

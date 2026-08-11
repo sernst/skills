@@ -58,12 +58,10 @@ The comments in this section are machine-checked against production emit sites.
   already resolved.
 <!-- event: skill.copied -->
 - `skill.copied`: copy plan or committed copy.
-<!-- event: skill.import-planned -->
-- `skill.import-planned`: selected deployment and its source-overwrite plan.
 <!-- event: skill.import-skipped -->
 - `skill.import-skipped`: no selected deployment differs from the source.
 <!-- event: skill.imported -->
-- `skill.imported`: import plan or committed source overwrite.
+- `skill.imported`: committed source overwrite.
 <!-- event: skill.loaded -->
 - `skill.loaded`: load plan or committed deployment.
 <!-- event: skill.removed -->
@@ -187,8 +185,9 @@ the destination skill directory. `copy` has no `scope`; load/update/skip do.
 
 <!-- payload: skill-import fields: action,alternate,deletions,deployment,destination,dry_run,files_changed,insertions,mode,path,scope,skill,source,source_id,source_label,source_name,source_type,target,target_path -->
 <!-- payload: skill-import-skipped fields: action,alternate,dry_run,mode,path,skill,source,source_id,source_label,source_name,source_type -->
-`skill.import-planned` and `skill.imported` reverse the action direction and
-contain the flattened source fields plus:
+`skill.imported` is emitted only on a committed apply (never during a
+`plan`/`plan.updated` dry run or narrowing prompt) and contains the flattened
+source fields plus:
 
 ```json
 {
@@ -202,7 +201,7 @@ contain the flattened source fields plus:
   "files_changed": 3,
   "insertions": 12,
   "deletions": 9,
-  "action": "planned|imported",
+  "action": "imported",
   "dry_run": false
 }
 ```
@@ -355,10 +354,12 @@ unresolved scope branch is the only current source of `available`: while the
 branch is open an entry's `actions` is empty and `available` lists every
 deployment id the skill occupies; once resolved (explicit scope, `--both`, or
 a made selection) those become concrete `"operation": "remove"` actions.
-`load`, `update`, `copy`, and `remove` emit `plan`/`plan.updated` today;
-`import` adopts it as it migrates. `remove` always emits a single revision
-`0`: its one decision is resolved by one prompt, never a re-rendered
-sequence, so it never emits `plan.updated`.
+`load`, `update`, `copy`, `remove`, and `import` all emit `plan`/`plan.updated`.
+`remove` always emits a single revision `0`: its one decision is resolved by
+one prompt, never a re-rendered sequence, so it never emits `plan.updated`.
+`import` is the only command whose plan can resolve more than one decision
+across successive revisions (`authorization.kind: "progressive"`), so it is
+the only command that can emit `plan.updated`.
 
 `decisions` is present whenever the plan carries dimensions and describes all of
 them, resolved and pending alike, so the payload matches the plan the user

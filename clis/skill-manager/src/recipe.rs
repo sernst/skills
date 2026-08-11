@@ -189,6 +189,8 @@ fn overlay_import(args: &mut ImportArgs, object: &Map<String, Value>) -> Result<
             "dry_run",
             "global",
             "project",
+            "update",
+            "no_update",
             "yes",
         ],
     )?;
@@ -198,7 +200,25 @@ fn overlay_import(args: &mut ImportArgs, object: &Map<String, Value>) -> Result<
     overlay_target_selection(&mut args.targets, object)?;
     overlay_scope_selection(&mut args.scope, object)?;
     overlay_bool(&mut args.dry_run, object.get("dry_run"))?;
-    overlay_bool(&mut args.yes, object.get("yes"))
+    // `update` is a tri-state in JSON even though it is two flags on the
+    // CLI: `update:true` means import + update, `update:false` means
+    // import-only (equivalent to `no_update:true`), and an absent key
+    // leaves the choice open. Without this, `update:false` overlaid onto
+    // `args.update` (which starts `false`) is a silent no-op that leaves
+    // both flags unset and the propagation choice unresolved.
+    match object.get("update").map(strict_bool).transpose()? {
+        Some(true) => overlay_bool(&mut args.update, Some(&Value::Bool(true)))?,
+        Some(false) => overlay_bool(&mut args.no_update, Some(&Value::Bool(true)))?,
+        None => {}
+    }
+    overlay_bool(&mut args.no_update, object.get("no_update"))?;
+    overlay_bool(&mut args.yes, object.get("yes"))?;
+    if args.update && args.no_update {
+        return Err(SkillManagerError::InvalidInput(
+            "update is mutually exclusive with no_update".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn overlay_sync_fields(args: &mut SyncArgs, object: &Map<String, Value>) -> Result<()> {

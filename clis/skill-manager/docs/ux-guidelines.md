@@ -413,7 +413,28 @@ forbidden as a cancellation hint.
   resolved plan: `{N} deployment removals across {target label}: − {N}
   remove; {N} skill(s), {N} files`; `remove`, unresolved branch: one nonzero
   base clause plus one effect line per alternative; `copy`: `{N} changes to 1
-  destination: + {N} new[, ↑ {N} overwrite]`.
+  destination: + {N} new[, ↑ {N} overwrite]`; `import`, resolved import-only:
+  `1 source replacement from {TARGET} · {SCOPE}[; {N} deployment(s) left out
+  of date]` (the staleness clause is omitted when propagation would leave
+  nothing out of date); `import`, resolved import + update: `1 source
+  replacement; {N} deployments synchronized (1 source copy, {N} updated[, {N}
+  already identical])` (the "already identical" clause covers any deployment
+  that already matched the resolved copy without being the copy itself). An
+  explicit `--update`/`update:true` on a degenerate plan (nothing left to
+  synchronize) still records `import-update` in the machine stream honestly,
+  but the human footer falls back to the import-only form regardless — the
+  import+update form has no way to omit its `{N} updated` clause, so it is
+  never used when that count is zero.
+- `import`'s pre-apply preview reframes to match whichever propagation mode
+  is actually resolved: only when import + update is genuinely pending or
+  chosen does the resolved copy's nested preview read as `Propagation
+  preview` with `↑ {N} file(s) changed` (a pending write). Once import-only
+  is resolved and something would genuinely be left behind, the same
+  destinations render instead as `Left out of date` with `{N} file(s)
+  behind, +{ins}/-{del}` — never the update marker — since nothing will
+  actually be written. A destination that is already synchronized (or is
+  the resolved copy's own identity) carries nothing under the staleness
+  framing and is dropped, the same recursive none-value rule as elsewhere.
 - A result footer after apply uses the same nonzero-only, comma-separated
   grammar: `✓: {N} {result description}[, —: {N} unchanged]`. The complete
   entry is green in a TTY.
@@ -543,33 +564,4 @@ quietly into an unrelated command change.
 
 Skill names are never ellipsized or truncated, in either TTY or redirected
 output, regardless of terminal width.
-
-## Migration status snapshot (point-in-time — see maintenance note)
-
-> **This section is a snapshot, not a rule.** Everything above it describes
-> the timeless target behavior every command MUST converge on; nothing above
-> it depends on which commands have migrated yet. This section exists only so
-> a reader can tell which commands already match the target behavior and
-> which still don't, as of the date below.
->
-> **Maintenance instruction:** when you migrate a command onto the shared
-> `ChangePlan`/`Authorizer` plan-first machinery, update *only the list
-> below* — move the command from "not yet migrated" to "migrated" and adjust
-> the date. Do not add migration-status commentary anywhere else in this
-> document; if every command below reaches "migrated," delete this section
-> entirely rather than leaving a stale all-done note.
-
-Snapshot date: 2026-08-11.
-
-- **Migrated** (uses `ChangePlan`/`Authorizer` in
-  `src/review.rs`/`src/authorize.rs`): `update`, `load`, `copy`, `remove`.
-- **Not yet migrated** (still uses older, command-specific prompting such as
-  direct `self.prompt.confirm`/`self.prompt.choose` calls that predate the
-  plan-first invariant): `import`.
-
-This gap is tracked, expected follow-up work, not a rule exception. When
-touching any not-yet-migrated command, migrate its authorization onto the
-shared abstraction rather than extending its legacy prompt-then-plan (or
-prompt-only) behavior, and do not treat its current behavior as precedent for
-a new command.
 

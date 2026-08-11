@@ -681,7 +681,6 @@ fn every_production_event_has_a_source_derived_payload_family() {
         ("plan", "plan"),
         ("plan.updated", "plan"),
         ("skill.copied", "skill-action"),
-        ("skill.import-planned", "skill-import"),
         ("skill.import-skipped", "skill-import-skipped"),
         ("skill.imported", "skill-import"),
         ("skill.loaded", "skill-action"),

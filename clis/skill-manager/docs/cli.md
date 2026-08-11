@@ -49,7 +49,7 @@ A directory below home remains a normal project.
 | --- | --- |
 | `load` | Infers project-vs-global scope silently: project when an enabled selected target's leading directory exists in CWD (such as `.claude`, `.agents`, or `.gemini`); otherwise global. The inferred scope is shown in the plan and, if the plan is later cancelled, named in the cancel hint. |
 | `update` | Infers every existing skill/target deployment, including both scopes when both exist; `-g` or `-p` restricts the eligible deployments. |
-| `import` | Scans both scopes for changed deployments. When more than one differs from the source, it prompts for the copy to import; `-g` or `-p` restricts the scan. |
+| `import` | Scans both scopes for changed deployments. With more than one candidate, source copy is a genuine prompt dimension; `-g` or `-p` narrows the scan and can reduce it to one. |
 | `remove` | Removes an unambiguous existing scope. When any selected skill exists in both scopes, its plan presents mutually exclusive project/global/both options, each with its own blast radius, resolved by a single numbered selection (or noninteractively by `--global`/`--project`/`--both`). |
 | `status` | Inspects both scopes by default; `-g` or `-p` narrows the report. |
 
@@ -171,40 +171,65 @@ scope still requires an explicit `--global`, `--project`, or `--both` rather
 than accepting `--yes` alone to guess one. Machine mode keeps its existing
 event-only contract while additionally emitting the structured `plan` event,
 at revision `0`, described in [json.md](json.md), for all of `load`,
-`update`, `copy`, and `remove`.
+`update`, `copy`, `remove`, and `import`.
 
 `import SKILL` reverses `load`. It resolves exactly one skill—patterns are
 rejected—through the same first-source-wins discovery, then scans the selected
 or enabled targets in both scopes for deployed copies whose content differs from
 the source. Identical copies are never candidates, and finding none succeeds
-with `skill.import-skipped`. A single candidate is preselected; several require
-an interactive choice or narrower target and scope flags.
+with `skill.import-skipped`.
 
-The import plan names the `from` deployment and the `to` source directory, then
-lists each added, modified, or deleted file with `+N/-N` line counts and a byte
-delta for binary content, plus a totals line. Its confirmation defaults to no
-because the write is destructive to the source. Applying it makes the source
-directory byte-identical to the chosen deployed copy, including deleting source
-files the deployment no longer has, using the same staged, journaled, locked
-transaction as a deployment. `--dry-run` renders the plan and writes nothing.
+Import has two decision dimensions, and the complete plan for both always
+renders before any prompt. The first dimension is which deployed copy to
+adopt: with more than one candidate, the plan numbers each one with its path,
+its diff against the current source, and a nested per-copy preview of what
+propagating that copy would do to every other deployment, under a deferred
+`Propagation modes (chosen after the source copy)` heading that is visible
+but not yet asked; a non-prompting render of the same list (`--dry-run`, an
+ambiguous `--yes`) carries the equivalent deferred heading `Source copies
+(chosen first)` instead of vanishing unlabeled. `Select source copy [1-N, c
+to cancel]:` resolves it with one token; `c` cancels, and invalid or empty
+input reprompts without ever auto-selecting. With exactly one candidate, or
+when every candidate is byte-identical to the others, the dimension resolves
+silently in configured order — adopting any of them would produce the same
+source and the same propagation, so there is no genuine choice to force.
+Answering a nonfinal prompt re-renders the plan narrowed by that answer: the
+resolved dimension, every non-selected copy, and their diffs and previews
+disappear, and the chosen copy demotes to ordinary `From`/`Path` metadata.
 
-After a real interactive import, if another enabled, installed deployment is
-now outdated—including another scope of the same target—the CLI defaults to
-offering a review. Accepting shows the standard changed-only update plan and a
-second default-yes confirmation before synchronizing. The invitation is absent
-when nothing remains and is skipped for JSON, `--no-input`, and `--dry-run`.
-Declining that optional second confirmation leaves the successful source import
-in place and explicitly reports that the other deployments were not updated.
-Import `--yes` approves only the source replacement and never silently fans out.
-Normal output uses source and `target · scope` names; `--verbose` adds full paths.
+The second dimension is propagation mode: `1 Import + update (recommended)`
+imports the chosen copy and then updates every other deployment to match it;
+`2 Import only` imports without touching the rest. `--update`/`--no-update`
+resolve it noninteractively; neither is implied by `--yes`, because import is
+destructive and propagation is a second, independent commitment. Propagation
+is genuine only when the resolved source copy would actually leave at least
+one other deployment out of date; when it would not — a single deployment,
+or every deployment already matching that copy — the dimension resolves
+silently with no prompt, no flag, and no rendered decision, so a plan that
+never had a real second question to ask never asks one. This is always the
+last prompt when it is genuinely asked, so its answer applies immediately
+with no trailing `[y/N]`. Applying makes the source directory byte-identical
+to the chosen deployed copy, including deleting source files the deployment
+no longer has, using the same staged, journaled, locked transaction as a
+deployment, then performs the resolved propagation. `--dry-run` renders the
+complete plan for both dimensions and stops with a single conclusion; no
+per-item echoes.
+
+`--yes` renders the plan and then applies it, but only once every dimension is
+resolved by flags—`import`, like `remove`, never auto-authorizes in any
+non-interactive mode, so `--json`, every recipe carrier, and plain
+`--no-input` all require an explicit `--yes`/`yes:true`, and a genuine
+multi-copy ambiguity that flags do not resolve fails with an
+interaction-required error rather than guessing. Normal output uses source and
+`target · scope` names; `--verbose` adds full paths.
 
 Import writes to local source checkouts only. When the resolved source is
-GitHub-backed, it requires a configured local alternate location and an
-interactive confirmation, and it imports into that alternate.
-Without a resolvable local destination—including in non-interactive mode—it
-fails with an actionable error instead of guessing. That destination is resolved
-only after a candidate is found, so a source that is already up to date never
-prompts for, or fails over, a destination it would not write.
+GitHub-backed, it requires a configured local alternate location; without one
+it fails with an actionable error naming the missing configuration instead of
+guessing or prompting, and that check only runs once a changed candidate is
+found, so a source that is already up to date never fails over a destination
+it would not write. Once an alternate is configured, import proceeds exactly
+like any other source, with the alternate as the ordinary `Into` destination.
 
 ## Source and target lifecycle
 

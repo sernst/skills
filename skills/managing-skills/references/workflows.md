@@ -75,21 +75,29 @@ Never turn an update request into a load of a new deployment.
 Use `import` when the user edited a deployed skill in place and wants that copy
 to become the canonical source content. It overwrites the source in full, so
 dry-run first, show the reported file and line deltas, and obtain an explicit
-second confirmation before the committed call:
+second confirmation before the committed call. `import` has two decisions:
+which deployed copy to adopt (only ambiguous when more than one still differs
+from the source after target/scope selection) and whether to propagate the
+imported content to every other deployment afterward — set `update:true`
+(import + update, recommended) or `no_update:true`/`update:false`; neither is
+implied by `yes:true`. Propagation resolves silently, with no flag needed,
+whenever the copy adopted would leave nothing else out of date:
 
 ```json
 {"command":"status","filters":["example"]}
 {"command":"import","skill":"example","claude":true,"global":true,"dry_run":true}
-{"command":"import","skill":"example","claude":true,"global":true,"yes":true}
+{"command":"import","skill":"example","claude":true,"global":true,"update":true,"yes":true}
 ```
 
 Read `files_changed`, `insertions`, `deletions`, `deployment`, and `destination`
-from `skill.import-planned` when reporting the plan. `skill.import-skipped`
-means every selected deployment already matches the source, which is a clean
+from the `plan` event's per-option `consequence` when reporting the plan, and
+from `skill.imported` after a committed apply. `skill.import-skipped` means
+every selected deployment already matches the source, which is a clean
 success. An `InteractionRequired` failure means either several deployments
-differ—narrow with target and scope fields—or the source is GitHub-backed, which
-only a human-interactive terminal run can import into a local alternate
-location.
+still differ and target/scope fields did not narrow them to one, or the
+source is GitHub-backed with no configured local alternate location — add one
+with `source.alternate` first; once configured, import proceeds
+non-interactively like any other source.
 
 ## Remove skills
 

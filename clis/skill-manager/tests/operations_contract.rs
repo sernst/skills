@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
-use serde_json::Value;
+use serde_json::{Value, json};
 use skill_manager::config::{acquire_lock, canonical_config_bytes};
 use tempfile::TempDir;
 
@@ -2524,19 +2524,16 @@ fn seed_github_cache(home: &Path, skill: &str, body: &str) {
     .expect("write cache metadata");
 }
 
-/// A single changed deployment is adopted as the new source content in full.
-#[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "One end-to-end import contract keeps the idle, dry-run, and committed phases auditable together."
-)]
-fn import_mirrors_one_changed_deployment_and_dry_runs_change_nothing() {
+/// `claude` loaded at both scopes; the project copy and the global copy are
+/// each edited to different content, so both differ from the source and both
+/// become genuine `source_copy` alternatives. `Available source copies`
+/// orders project before global (scope-major, project first).
+fn import_ambiguous_fixture() -> (TempDir, PathBuf) {
     let home = sandbox();
+    let project = home.path().join("project");
+    fs::create_dir_all(&project).expect("create project directory");
     let source = home.path().join("source");
-    let skill = create_skill(&source, "alpha", "# Alpha\nline two\n");
-    fs::create_dir_all(skill.join("reference")).expect("create source reference directory");
-    fs::write(skill.join("reference/stale.md"), "stale\n").expect("write stale reference");
-
+    create_skill(&source, "docwriter", "# Doc\n");
     cli(home.path())
         .args([
             "--json",
@@ -2548,343 +2545,937 @@ fn import_mirrors_one_changed_deployment_and_dry_runs_change_nothing() {
         .assert()
         .success();
     cli(home.path())
-        .args(["--json", "load", "--claude", "--global", "--no-input"])
+        .args(["--json", "load", "docwriter", "--claude", "--global"])
         .assert()
         .success();
-
-    let idle = json_events(
-        cli(home.path())
-            .args([
-                "--json",
-                "import",
-                "alpha",
-                "--claude",
-                "--global",
-                "--yes",
-                "--no-input",
-            ])
-            .output()
-            .expect("run idle import"),
-    );
-    assert_eq!(events_of(&idle, "skill.import-skipped").len(), 1);
-    assert!(events_of(&idle, "skill.imported").is_empty());
-    let summary = events_of(&idle, "summary")[0]["data"].clone();
-    assert_eq!(summary["action"], "import");
-    assert_eq!(summary["imported"], 0);
-    assert_eq!(summary["skipped"], 1);
-
-    let deployed = home.path().join(".claude/skills/alpha");
-    fs::write(
-        deployed.join("SKILL.md"),
-        "# Alpha\nline two edited\nline three\n",
-    )
-    .expect("agent edits the deployed skill");
-    fs::remove_file(deployed.join("reference/stale.md")).expect("agent deletes a reference");
-    fs::write(deployed.join("reference/new.md"), "fresh\n").expect("agent adds a reference");
-
-    let config_before = fs::read(home.path().join(".skill-manager/config.json"))
-        .expect("read configuration before dry run");
-    let planned = json_events(
-        cli(home.path())
-            .args([
-                "--json",
-                "import",
-                "alpha",
-                "--claude",
-                "--global",
-                "--yes",
-                "--no-input",
-                "--dry-run",
-            ])
-            .output()
-            .expect("run dry-run import"),
-    );
-    let plan = events_of(&planned, "skill.import-planned");
-    assert_eq!(plan.len(), 1);
-    assert_eq!(plan[0]["data"]["dry_run"], true);
-    assert_eq!(plan[0]["data"]["files_changed"], 3);
-    assert_eq!(plan[0]["data"]["target"], "claude");
-    assert_eq!(plan[0]["data"]["scope"], "global");
-    assert_eq!(
-        events_of(&planned, "skill.imported")[0]["data"]["dry_run"],
-        true
-    );
-    assert_eq!(
-        fs::read_to_string(skill.join("SKILL.md")).expect("source is untouched by a dry run"),
-        "# Alpha\nline two\n"
-    );
-    assert!(skill.join("reference/stale.md").is_file());
-    assert!(!skill.join("reference/new.md").exists());
-    assert_eq!(
-        fs::read(home.path().join(".skill-manager/config.json"))
-            .expect("read configuration after dry run"),
-        config_before
-    );
-
-    let committed = json_events(
-        cli(home.path())
-            .args([
-                "--json",
-                "import",
-                "alpha",
-                "--claude",
-                "--global",
-                "--yes",
-                "--no-input",
-            ])
-            .output()
-            .expect("run committed import"),
-    );
-    let imported = events_of(&committed, "skill.imported");
-    assert_eq!(imported.len(), 1);
-    assert_eq!(imported[0]["data"]["action"], "imported");
-    assert_eq!(imported[0]["data"]["dry_run"], false);
-    assert_eq!(
-        fs::read_to_string(skill.join("SKILL.md")).expect("imported source content"),
-        "# Alpha\nline two edited\nline three\n"
-    );
-    assert_eq!(
-        fs::read_to_string(skill.join("reference/new.md")).expect("imported new reference"),
-        "fresh\n"
-    );
-    assert!(
-        !skill.join("reference/stale.md").exists(),
-        "import must mirror deletions into the source"
-    );
-    assert!(!source.join(".skill-manager-journals").exists());
-    assert!(!source.join(".skill-manager-staging").exists());
-
-    cli(home.path())
-        .args([
-            "--json",
-            "import",
-            "alpha",
-            "--claude",
-            "--global",
-            "--yes",
-            "--no-input",
-        ])
+    let mut project_load = cli(home.path());
+    project_load
+        .current_dir(&project)
+        .args(["--json", "load", "docwriter", "--claude", "--project"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "\"event\":\"skill.import-skipped\"",
-        ));
+        .success();
+    fs::write(
+        home.path().join(".claude/skills/docwriter/SKILL.md"),
+        "# Doc\nglobal edit\n",
+    )
+    .expect("edit global deployment");
+    fs::write(
+        project.join(".claude/skills/docwriter/SKILL.md"),
+        "# Doc\nproject edit\n",
+    )
+    .expect("edit project deployment");
+    (home, project)
 }
 
-/// Import renders a reviewable plain-text plan and accepts recipe invocation.
-#[test]
-fn import_renders_a_plain_plan_and_runs_from_a_recipe() {
-    let home = sandbox();
-    let source = home.path().join("source");
-    let skill = create_skill(&source, "alpha", "# Alpha\n");
-    cli(home.path())
-        .args([
-            "--json",
-            "source",
-            "add",
-            source.to_str().expect("utf8 path"),
-            "primary",
-        ])
-        .assert()
-        .success();
-    cli(home.path())
-        .args(["--json", "load", "--claude", "--global", "--no-input"])
-        .assert()
-        .success();
-    let deployed = home.path().join(".claude/skills/alpha");
-    fs::write(deployed.join("SKILL.md"), "# Alpha\nsecond line\n").expect("agent edit");
-    fs::write(deployed.join("logo.bin"), [0_u8, 1, 2, 3]).expect("agent adds binary content");
+/// Same layout as [`import_ambiguous_fixture`], but the project deployment is
+/// resynchronized to the source's own content, leaving only one genuine
+/// `source_copy` candidate (`claude · global`). Only the propagation
+/// dimension is pending, so exactly one prompt is asked.
+fn import_single_copy_fixture() -> (TempDir, PathBuf) {
+    let (home, project) = import_ambiguous_fixture();
+    fs::write(project.join(".claude/skills/docwriter/SKILL.md"), "# Doc\n")
+        .expect("resync project deployment to the source");
+    (home, project)
+}
 
-    let output = cli(home.path())
+/// Two genuine candidates once more (any difference from the *current*
+/// source -- including merely gaining an extra file -- qualifies a
+/// deployment for `source_copy`, so `claude · project` becomes a second
+/// alternative here purely by carrying `notes.md`), but the test resolves
+/// `claude · global` (source copy 2, whose own diff from source is a single
+/// `SKILL.md` line). Propagating *that* choice to `claude · project` must
+/// both rewrite `SKILL.md` and remove the extra file the new source lacks,
+/// so its advertised total (`2 files changed`) only matches what apply
+/// actually writes if both files are enumerated from the same source of
+/// truth used to apply. This is the E8 regression fixture: Stage 3's remove
+/// defect computed a representative count instead of the resolved apply
+/// list, promising fewer files than it deleted.
+fn import_drifted_fixture() -> (TempDir, PathBuf) {
+    let (home, project) = import_single_copy_fixture();
+    fs::write(
+        project.join(".claude/skills/docwriter/notes.md"),
+        "extra notes\n",
+    )
+    .expect("give the project deployment a file the candidate lacks");
+    (home, project)
+}
+
+/// The interactive rendering of the multi-copy plan: `Available source
+/// copies`, both alternatives with their own diff and nested propagation
+/// preview, the `c Cancel` option, and the deferred `Propagation modes`
+/// heading -- everything but the pending-decision footer, which callers
+/// append themselves since it differs between an unresolved render and a
+/// `--yes` failure that never prints it.
+const IMPORT_TWO_COPY_INTERACTIVE_BODY: &str = "\
+Import plan
+
+Into  Primary (source)
+
+Available source copies
+
+  1  claude \u{b7} project
+     Path    PROJECT_DEPLOYMENT
+     Source  \u{2190} 1 file changed, +1/-0
+       ~  SKILL.md  +1/-0
+     Propagation with import + update  2 deployments
+       claude \u{b7} global   \u{2191} 1 file changed, +1/-1
+       claude \u{b7} project  \u{2713} source copy; synchronized, no file changes
+
+  2  claude \u{b7} global
+     Path    GLOBAL_DEPLOYMENT
+     Source  \u{2190} 1 file changed, +1/-0
+       ~  SKILL.md  +1/-0
+     Propagation with import + update  2 deployments
+       claude \u{b7} global   \u{2713} source copy; synchronized, no file changes
+       claude \u{b7} project  \u{2191} 1 file changed, +1/-1
+
+  c  Cancel
+
+Propagation modes (chosen after the source copy)
+
+  1  Import + update  (recommended)
+     Replace the source, then synchronize every deployment shown for that copy.
+
+  2  Import only
+     Replace the source; write no deployments and leave the other 1 out of date.
+
+";
+
+/// The same plan with no prompt pending: `--dry-run` (and a `--yes` run that
+/// still finds both dimensions ambiguous) never offers a numbered `Cancel`,
+/// so the `c Cancel` line disappears -- `render_decision` only appends
+/// `Cancel` while genuinely prompting. The heading itself does not disappear;
+/// it switches to the deferred wording (`Source copies (chosen first)`) so a
+/// reader of a non-prompting render can still tell the two numbered lists
+/// apart (see item G).
+const IMPORT_TWO_COPY_DRY_BODY: &str = "\
+Import plan
+
+Into  Primary (source)
+
+Source copies (chosen first)
+
+  1  claude \u{b7} project
+     Path    PROJECT_DEPLOYMENT
+     Source  \u{2190} 1 file changed, +1/-0
+       ~  SKILL.md  +1/-0
+     Propagation with import + update  2 deployments
+       claude \u{b7} global   \u{2191} 1 file changed, +1/-1
+       claude \u{b7} project  \u{2713} source copy; synchronized, no file changes
+
+  2  claude \u{b7} global
+     Path    GLOBAL_DEPLOYMENT
+     Source  \u{2190} 1 file changed, +1/-0
+       ~  SKILL.md  +1/-0
+     Propagation with import + update  2 deployments
+       claude \u{b7} global   \u{2713} source copy; synchronized, no file changes
+       claude \u{b7} project  \u{2191} 1 file changed, +1/-1
+
+Propagation modes (chosen after the source copy)
+
+  1  Import + update  (recommended)
+     Replace the source, then synchronize every deployment shown for that copy.
+
+  2  Import only
+     Replace the source; write no deployments and leave the other 1 out of date.
+
+";
+
+/// The footer for the unresolved two-copy plan: neither dimension is
+/// resolved yet, so it names both remaining questions and their order.
+const IMPORT_TWO_COPY_UNRESOLVED_FOOTER: &str =
+    "2 source copies; propagation decision follows source selection\n";
+
+/// The narrowed re-render after answering `2` (choose `claude \u{b7} global`):
+/// the whole `Available source copies` section is gone, option `1`
+/// (`claude \u{b7} project`) and its own diff and nested preview are gone, and
+/// the chosen copy demotes to ordinary `From`/`Path` metadata. Only the
+/// still-pending propagation dimension remains, now active (`c Cancel` is
+/// offered and the heading is the un-deferred `Propagation preview` block).
+const IMPORT_NARROWED_TO_GLOBAL_BODY: &str = "\n\
+Import plan \u{2014} source copy 2 selected
+
+From  claude \u{b7} global
+Path  GLOBAL_DEPLOYMENT
+Into  Primary (source)
+
+Source replacement
+  \u{2190} 1 file changed, +1/-0
+  ~  SKILL.md  +1/-0
+
+Propagation preview
+  claude \u{b7} global   \u{2713} source copy; synchronized, no file changes
+  claude \u{b7} project  \u{2191} 1 file changed, +1/-1
+
+  1  Import + update  (recommended)
+     Replace the source and synchronize 2 deployments (1 source copy, 1 updated).
+
+  2  Import only
+     Replace the source; write no deployments and leave 1 out of date.
+
+  c  Cancel
+
+1 source copy selected; 2 propagation modes
+";
+
+fn import_two_copy_interactive_body(home: &Path, project: &Path) -> String {
+    let project_deployment =
+        portable_canonicalize(project.join(".claude/skills/docwriter")).expect("project path");
+    let global_deployment =
+        portable_canonicalize(home.join(".claude/skills/docwriter")).expect("global path");
+    IMPORT_TWO_COPY_INTERACTIVE_BODY
+        .replace(
+            "PROJECT_DEPLOYMENT",
+            &project_deployment.display().to_string(),
+        )
+        .replace(
+            "GLOBAL_DEPLOYMENT",
+            &global_deployment.display().to_string(),
+        )
+}
+
+fn import_two_copy_dry_body(home: &Path, project: &Path) -> String {
+    let project_deployment =
+        portable_canonicalize(project.join(".claude/skills/docwriter")).expect("project path");
+    let global_deployment =
+        portable_canonicalize(home.join(".claude/skills/docwriter")).expect("global path");
+    IMPORT_TWO_COPY_DRY_BODY
+        .replace(
+            "PROJECT_DEPLOYMENT",
+            &project_deployment.display().to_string(),
+        )
+        .replace(
+            "GLOBAL_DEPLOYMENT",
+            &global_deployment.display().to_string(),
+        )
+}
+
+fn import_narrowed_to_global_body(home: &Path) -> String {
+    let global_deployment =
+        portable_canonicalize(home.join(".claude/skills/docwriter")).expect("global path");
+    IMPORT_NARROWED_TO_GLOBAL_BODY.replace(
+        "GLOBAL_DEPLOYMENT",
+        &global_deployment.display().to_string(),
+    )
+}
+
+/// E1: the complete multi-copy plan -- every source-copy alternative's own
+/// diff, its nested per-copy propagation preview, the deferred propagation
+/// heading, and both propagation modes -- renders in full before any prompt
+/// is asked. E9: cancelling exits 0 with no writes and no extra hint.
+#[test]
+fn import_renders_the_complete_multi_copy_plan_before_the_first_prompt() {
+    let (home, project) = import_ambiguous_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude"])
+        .write_stdin("c\n")
+        .output()
+        .expect("run ambiguous import then cancel");
+    assert!(output.status.success(), "cancelling is not a failure");
+    let body = import_two_copy_interactive_body(home.path(), &project);
+    assert_eq!(
+        stdout_of(output.clone()),
+        format!("{body}{IMPORT_TWO_COPY_UNRESOLVED_FOOTER}Cancelled.\n")
+    );
+    assert_eq!(
+        stderr_of(&output),
+        "Select source copy [1-2, c to cancel]: "
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join("source/docwriter/SKILL.md"))
+            .expect("source untouched"),
+        "# Doc\n"
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join(".claude/skills/docwriter/SKILL.md"))
+            .expect("global deployment untouched"),
+        "# Doc\nglobal edit\n"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join(".claude/skills/docwriter/SKILL.md"))
+            .expect("project deployment untouched"),
+        "# Doc\nproject edit\n"
+    );
+}
+
+/// E2/E9: an empty answer and an invalid token both reprompt with the same
+/// instruction; the selection never auto-picks an option, and the plan is
+/// printed exactly once regardless of how many reprompts follow.
+#[test]
+fn import_source_selection_reprompts_on_invalid_and_empty_input_without_auto_selecting() {
+    let (home, project) = import_ambiguous_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude"])
+        .write_stdin("\nbogus\nc\n")
+        .output()
+        .expect("run reprompted source selection");
+    assert!(output.status.success());
+    assert_eq!(
+        stderr_of(&output),
+        "Select source copy [1-2, c to cancel]: Enter 1, 2, or c.\n\
+Select source copy [1-2, c to cancel]: Enter 1, 2, or c.\n\
+Select source copy [1-2, c to cancel]: "
+    );
+    let body = import_two_copy_interactive_body(home.path(), &project);
+    assert_eq!(
+        stdout_of(output),
+        format!("{body}{IMPORT_TWO_COPY_UNRESOLVED_FOOTER}Cancelled.\n")
+    );
+}
+
+/// E3: after answering `2`, the plan re-renders narrowed to that one
+/// candidate. Option `1` (`claude \u{b7} project`), its own diff, and its own
+/// nested preview -- along with the whole `Available source copies` heading
+/// -- vanish; the chosen copy demotes to ordinary `From`/`Path` metadata;
+/// only the unresolved propagation dimension remains, now active.
+#[test]
+fn import_narrowed_re_render_gates_out_the_resolved_source_dimension() {
+    let (home, project) = import_ambiguous_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude"])
+        .write_stdin("2\nc\n")
+        .output()
+        .expect("run narrowed re-render then cancel");
+    assert!(output.status.success());
+    let body = import_two_copy_interactive_body(home.path(), &project);
+    let narrowed = import_narrowed_to_global_body(home.path());
+    assert_eq!(
+        stdout_of(output.clone()),
+        format!("{body}{IMPORT_TWO_COPY_UNRESOLVED_FOOTER}{narrowed}Cancelled.\n")
+    );
+    assert_eq!(
+        stderr_of(&output),
+        "Select source copy [1-2, c to cancel]: Select propagation [1-2, c to cancel]: "
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join("source/docwriter/SKILL.md")).expect("untouched"),
+        "# Doc\n"
+    );
+}
+
+/// E9: cancelling the second (propagation) prompt after the source copy was
+/// already chosen still exits 0 and writes nothing at all -- not even the
+/// source replacement -- because the final decision was never authorized.
+#[test]
+fn import_cancel_at_the_propagation_prompt_writes_nothing() {
+    let (home, project) = import_ambiguous_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude"])
+        .write_stdin("2\nc\n")
+        .output()
+        .expect("run cancelled propagation selection");
+    assert!(output.status.success(), "cancelling is not a failure");
+    assert_eq!(
+        fs::read_to_string(home.path().join("source/docwriter/SKILL.md"))
+            .expect("source untouched"),
+        "# Doc\n"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join(".claude/skills/docwriter/SKILL.md"))
+            .expect("project deployment untouched"),
+        "# Doc\nproject edit\n"
+    );
+}
+
+/// E2/E9: the same reprompt discipline applies at the second prompt.
+#[test]
+fn import_propagation_reprompts_on_invalid_and_empty_input_without_auto_selecting() {
+    let (home, project) = import_ambiguous_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude"])
+        .write_stdin("2\n\nbogus\nc\n")
+        .output()
+        .expect("run reprompted propagation selection");
+    assert!(output.status.success());
+    assert_eq!(
+        stderr_of(&output),
+        "Select source copy [1-2, c to cancel]: Select propagation [1-2, c to cancel]: Enter 1, 2, or c.\n\
+Select propagation [1-2, c to cancel]: Enter 1, 2, or c.\n\
+Select propagation [1-2, c to cancel]: "
+    );
+    let body = import_two_copy_interactive_body(home.path(), &project);
+    let narrowed = import_narrowed_to_global_body(home.path());
+    assert_eq!(
+        stdout_of(output),
+        format!("{body}{IMPORT_TWO_COPY_UNRESOLVED_FOOTER}{narrowed}Cancelled.\n")
+    );
+}
+
+/// E4: the final propagation answer applies immediately -- no trailing
+/// `[y/N]` -- replacing the source and synchronizing the other deployment,
+/// including a `Synchronized ... (source copy)` line for the resolved
+/// candidate's own now-redundant deployment.
+#[test]
+fn import_final_propagation_answer_applies_immediately() {
+    let (home, project) = import_ambiguous_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude"])
+        .write_stdin("2\n1\n")
+        .output()
+        .expect("run full accepted import");
+    assert!(output.status.success());
+    let body = import_two_copy_interactive_body(home.path(), &project);
+    let narrowed = import_narrowed_to_global_body(home.path());
+    assert_eq!(
+        stdout_of(output.clone()),
+        format!(
+            "{body}{IMPORT_TWO_COPY_UNRESOLVED_FOOTER}{narrowed}\n\
+Imported docwriter from claude \u{b7} global into Primary (source).\n\
+Synchronized docwriter -> claude (global) (source copy)\n\
+Updated docwriter -> claude (project)\n\
+\n\
+completed: 1 source replaced (1 file, +1/-0), 2 deployments synchronized (1 source copy, 1 updated)\n"
+        )
+    );
+    assert_eq!(
+        stderr_of(&output),
+        "Select source copy [1-2, c to cancel]: Select propagation [1-2, c to cancel]: "
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join("source/docwriter/SKILL.md")).expect("imported"),
+        "# Doc\nglobal edit\n"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join(".claude/skills/docwriter/SKILL.md")).expect("synced"),
+        "# Doc\nglobal edit\n"
+    );
+}
+
+/// Both propagation outcomes are real code paths: "Import only" replaces the
+/// source but leaves the other deployment untouched (and out of date).
+#[test]
+fn import_only_propagation_leaves_the_other_deployment_out_of_date() {
+    let (home, project) = import_ambiguous_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude"])
+        .write_stdin("2\n2\n")
+        .output()
+        .expect("run import-only propagation");
+    assert!(output.status.success());
+    let body = import_two_copy_interactive_body(home.path(), &project);
+    let narrowed = import_narrowed_to_global_body(home.path());
+    assert_eq!(
+        stdout_of(output),
+        format!(
+            "{body}{IMPORT_TWO_COPY_UNRESOLVED_FOOTER}{narrowed}\n\
+Imported docwriter from claude \u{b7} global into Primary (source).\n\
+\n\
+completed: 1 source replaced (1 file, +1/-0)\n"
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join("source/docwriter/SKILL.md")).expect("imported"),
+        "# Doc\nglobal edit\n"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join(".claude/skills/docwriter/SKILL.md"))
+            .expect("left untouched and out of date"),
+        "# Doc\nproject edit\n"
+    );
+}
+
+/// E5: when only one deployment genuinely differs from the source, only the
+/// propagation dimension is real, so the whole session is exactly one
+/// prompt: `From`/`Path` metadata from the very first render, no `Available
+/// source copies` section, no source-copy prompt at all.
+#[test]
+fn import_single_copy_case_uses_exactly_one_prompt() {
+    let (home, project) = import_single_copy_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude"])
+        .write_stdin("1\n")
+        .output()
+        .expect("run single-copy import");
+    assert!(output.status.success());
+    let global_deployment =
+        portable_canonicalize(home.path().join(".claude/skills/docwriter")).expect("global path");
+    assert_eq!(
+        stdout_of(output.clone()),
+        format!(
+            "Import plan\n\
+\n\
+From  claude \u{b7} global\n\
+Path  {global}\n\
+Into  Primary (source)\n\
+\n\
+Source replacement\n\
+\u{20}\u{20}\u{2190} 1 file changed, +1/-0\n\
+\u{20}\u{20}~  SKILL.md  +1/-0\n\
+\n\
+Propagation preview\n\
+\u{20}\u{20}claude \u{b7} global   \u{2713} source copy; synchronized, no file changes\n\
+\u{20}\u{20}claude \u{b7} project  \u{2191} 1 file changed, +1/-0\n\
+\n\
+\u{20}\u{20}1  Import + update  (recommended)\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}Replace the source and synchronize 2 deployments (1 source copy, 1 updated).\n\
+\n\
+\u{20}\u{20}2  Import only\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}Replace the source; write no deployments and leave 1 out of date.\n\
+\n\
+\u{20}\u{20}c  Cancel\n\
+\n\
+1 source copy; 2 propagation modes\n\
+\n\
+Imported docwriter from claude \u{b7} global into Primary (source).\n\
+Synchronized docwriter -> claude (global) (source copy)\n\
+Updated docwriter -> claude (project)\n\
+\n\
+completed: 1 source replaced (1 file, +1/-0), 2 deployments synchronized (1 source copy, 1 updated)\n",
+            global = global_deployment.display()
+        )
+    );
+    assert_eq!(
+        stderr_of(&output),
+        "Select propagation [1-2, c to cancel]: "
+    );
+    assert_eq!(
+        fs::read_to_string(project.join(".claude/skills/docwriter/SKILL.md")).expect("synced"),
+        "# Doc\nglobal edit\n"
+    );
+}
+
+/// `--update` resolves the propagation dimension without a prompt, but the
+/// plan still applies through the ordinary `[y/N]` confirmation -- an
+/// explicit flag is not `--yes`.
+#[test]
+fn import_update_flag_resolves_propagation_without_a_prompt() {
+    let (home, project) = import_single_copy_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude", "--update"])
+        .write_stdin("y\n")
+        .output()
+        .expect("run --update import");
+    assert!(output.status.success());
+    let stdout = stdout_of(output.clone());
+    assert!(
+        stdout.contains("Mode  import + update (recommended, explicitly selected)"),
+        "unexpected stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "1 source replacement; 2 deployments synchronized (1 source copy, 1 updated)"
+        )
+    );
+    assert_eq!(
+        stderr_of(&output),
+        "Apply this import plan from claude \u{b7} global? [y/N] "
+    );
+    assert_eq!(
+        fs::read_to_string(project.join(".claude/skills/docwriter/SKILL.md")).expect("synced"),
+        "# Doc\nglobal edit\n"
+    );
+}
+
+/// `--no-update` resolves propagation to "Import only" without a prompt;
+/// declining the `[y/N]` confirmation writes nothing.
+#[test]
+fn import_no_update_flag_resolves_propagation_without_a_prompt_and_can_be_declined() {
+    let (home, project) = import_single_copy_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude", "--no-update"])
+        .write_stdin("n\n")
+        .output()
+        .expect("run --no-update import decline");
+    assert!(output.status.success(), "declining is not a failure");
+    let stdout = stdout_of(output.clone());
+    assert!(stdout.contains("Mode  import only (explicitly selected)"));
+    assert!(
+        stdout.contains(
+            "1 source replacement from claude \u{b7} global; 1 deployment left out of date"
+        )
+    );
+    assert!(stdout.ends_with("Cancelled.\n"));
+    assert_eq!(
+        fs::read_to_string(home.path().join("source/docwriter/SKILL.md")).expect("untouched"),
+        "# Doc\n"
+    );
+}
+
+/// M: when propagation is explicitly resolved to import-only and a genuine
+/// bystander would be left out of date, the render must not promise a write
+/// that will not happen. `Propagation preview` (with `\u{2191}` marking a
+/// pending write) is reframed as `Left out of date` staleness, and the
+/// resolved copy's own now-none-value "synchronized" entry is dropped
+/// entirely rather than reused under a framing it does not fit.
+#[test]
+fn import_no_update_dry_run_reframes_the_unchosen_propagation_as_staleness() {
+    let (home, project) = import_single_copy_fixture();
+    let global_deployment =
+        portable_canonicalize(home.path().join(".claude/skills/docwriter")).expect("global path");
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
         .args([
             "import",
-            "alpha",
+            "docwriter",
             "--claude",
-            "--global",
-            "--no-input",
+            "--no-update",
             "--dry-run",
         ])
         .output()
-        .expect("run human dry-run import");
+        .expect("run --no-update --dry-run import");
     assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).expect("utf8 plan");
-    assert!(stdout.contains("Import alpha"));
-    assert!(stdout.contains("From   claude · global"));
-    assert!(stdout.contains("Into   Primary (source)"));
-    assert!(stdout.contains("Changes"));
-    assert!(stdout.contains("modified  SKILL.md"));
-    assert!(stdout.contains("added     logo.bin"));
-    assert!(stdout.contains("bin +4 bytes"));
-    assert!(stdout.contains("2 files changed, +1/-0, 1 binary"));
-    assert!(!stdout.contains('\u{1b}'), "plain output must be ANSI-free");
-    assert!(!stdout.contains('\u{2190}'), "plain output uses words");
-    assert!(
-        !stdout.contains(&source.display().to_string()),
-        "default import output must hide the source collection path: {stdout}"
-    );
-    assert!(
-        !stdout.contains(&skill.display().to_string()),
-        "default import output must hide the source path: {stdout}"
-    );
-    assert!(
-        !stdout.contains(&deployed.display().to_string()),
-        "default import output must hide the deployment path: {stdout}"
-    );
-
-    let recipe = serde_json::json!({
-        "command": "import",
-        "skill": "alpha",
-        "claude": true,
-        "global": true,
-        "yes": true
-    });
-    cli(home.path())
-        .args(["--json-input"])
-        .write_stdin(recipe.to_string())
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"event\":\"skill.imported\""))
-        .stdout(predicate::str::contains("\"action\":\"import\""));
     assert_eq!(
-        fs::read_to_string(skill.join("SKILL.md")).expect("recipe import applied"),
-        "# Alpha\nsecond line\n"
+        stdout_of(output),
+        format!(
+            "Import plan\n\
+\n\
+From  claude \u{b7} global\n\
+Path  {global}\n\
+Into  Primary (source)\n\
+Mode  import only (explicitly selected)\n\
+\n\
+Source replacement\n\
+\u{20}\u{20}\u{2190} 1 file changed, +1/-0\n\
+\u{20}\u{20}~  SKILL.md  +1/-0\n\
+\n\
+Left out of date\n\
+\u{20}\u{20}claude \u{b7} project  1 file behind, +1/-0\n\
+\n\
+1 source replacement from claude \u{b7} global; 1 deployment left out of date\n\
+\n\
+Dry run \u{2014} no changes were made.\n",
+            global = global_deployment.display()
+        )
     );
-    assert!(skill.join("logo.bin").is_file());
 }
 
-/// Several changed deployments require selection, which recipes cannot supply.
+/// E6: `--yes` never implies a propagation mode. On an otherwise-unambiguous
+/// single copy, `--yes` alone still leaves propagation pending and refuses.
 #[test]
-fn import_requires_narrowing_when_several_deployments_changed() {
-    let home = sandbox();
-    let source = home.path().join("source");
-    let skill = create_skill(&source, "alpha", "# Alpha\n");
-    cli(home.path())
+fn import_yes_alone_does_not_resolve_propagation_and_is_refused() {
+    let (home, project) = import_single_copy_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude", "--yes"])
+        .output()
+        .expect("run --yes alone on a single copy");
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr_of(&output),
+        "Error: propagation choice is required before --yes; pass --update or --no-update.\n"
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join("source/docwriter/SKILL.md")).expect("untouched"),
+        "# Doc\n"
+    );
+}
+
+/// E6/E9: on a genuinely ambiguous (multi-copy) import, `--yes` refuses
+/// until both the source copy and the propagation mode are resolved; the
+/// full plan still renders (without the interactive `Cancel` framing) so
+/// the failure is self-explanatory.
+#[test]
+fn import_yes_refuses_when_both_dimensions_are_ambiguous() {
+    let (home, project) = import_ambiguous_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude", "--yes"])
+        .output()
+        .expect("run --yes on an ambiguous import");
+    assert!(!output.status.success());
+    let body = import_two_copy_dry_body(home.path(), &project);
+    assert_eq!(stdout_of(output.clone()), body);
+    assert_eq!(
+        stderr_of(&output),
+        "Error: import requires a source copy and propagation mode before --yes; \
+choose exactly one target and scope, then pass --update or --no-update.\n"
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join("source/docwriter/SKILL.md")).expect("untouched"),
+        "# Doc\n"
+    );
+}
+
+/// E6: with both dimensions resolved explicitly (`--claude --global` narrows
+/// the copy, `--update` resolves propagation), `--yes` renders the plan --
+/// including the `Mode` metadata line recording that propagation was
+/// explicitly selected -- and applies immediately with no prompt at all.
+#[test]
+fn import_yes_applies_immediately_with_explicit_dimensions() {
+    let (home, project) = import_ambiguous_fixture();
+    fs::write(project.join(".claude/skills/docwriter/SKILL.md"), "# Doc\n")
+        .expect("resync project deployment");
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
         .args([
-            "--json",
-            "source",
-            "add",
-            source.to_str().expect("utf8 path"),
-            "primary",
-        ])
-        .assert()
-        .success();
-    cli(home.path())
-        .args([
-            "--json",
-            "load",
+            "import",
+            "docwriter",
             "--claude",
-            "--shared",
             "--global",
-            "--no-input",
+            "--update",
+            "--yes",
         ])
-        .assert()
-        .success();
-    fs::write(
-        home.path().join(".claude/skills/alpha/SKILL.md"),
-        "# Alpha claude\n",
-    )
-    .expect("edit claude copy");
-    fs::write(
-        home.path().join(".agents/skills/alpha/SKILL.md"),
-        "# Alpha shared\n",
-    )
-    .expect("edit shared copy");
-
-    cli(home.path())
-        .args([
-            "--json", "import", "alpha", "--claude", "--shared", "--global", "--yes",
-        ])
-        .assert()
-        .failure()
-        .stdout(predicate::str::contains(
-            "2 changed deployments of alpha are importable",
-        ));
-    cli(home.path())
-        .args(["--json", "import", "alph*", "--claude", "--global", "--yes"])
-        .assert()
-        .failure()
-        .stdout(predicate::str::contains("does not accept patterns"));
-    cli(home.path())
-        .args([
-            "--json", "import", "missing", "--claude", "--global", "--yes",
-        ])
-        .assert()
-        .failure()
-        .stdout(predicate::str::contains("source skill"));
-    assert_eq!(
-        fs::read_to_string(skill.join("SKILL.md")).expect("source is untouched"),
-        "# Alpha\n"
+        .output()
+        .expect("run --yes with both dimensions explicit");
+    assert!(output.status.success());
+    let stdout = stdout_of(output.clone());
+    assert!(stdout.contains("Mode  import + update (recommended, explicitly selected)"));
+    assert!(
+        stdout.contains(
+            "1 source replacement; 2 deployments synchronized (1 source copy, 1 updated)"
+        )
     );
-
-    cli(home.path())
-        .args(["import", "alpha", "--claude", "--shared", "--global"])
-        .write_stdin("2\ny\n")
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("Choose the alpha copy to import"))
-        .stderr(predicate::str::contains("shared · global"));
+    assert!(stdout.contains("Imported docwriter from claude \u{b7} global into Primary (source)."));
+    assert!(stdout.contains("Synchronized docwriter -> claude (global) (source copy)"));
+    assert!(stdout.contains("Updated docwriter -> claude (project)"));
+    assert!(stdout
+        .contains("completed: 1 source replaced (1 file, +1/-0), 2 deployments synchronized (1 source copy, 1 updated)"));
+    assert_eq!(stderr_of(&output), "", "no prompt at all under --yes");
     assert_eq!(
-        fs::read_to_string(skill.join("SKILL.md")).expect("selected copy is imported"),
-        "# Alpha shared\n"
-    );
-
-    fs::write(
-        home.path().join(".claude/skills/alpha/SKILL.md"),
-        "# Alpha declined\n",
-    )
-    .expect("create another import candidate");
-    cli(home.path())
-        .args(["import", "alpha", "--claude", "--global"])
-        .write_stdin("n\n")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Cancelled."));
-    assert_eq!(
-        fs::read_to_string(skill.join("SKILL.md")).expect("declined import changes nothing"),
-        "# Alpha shared\n"
+        fs::read_to_string(project.join(".claude/skills/docwriter/SKILL.md")).expect("synced"),
+        "# Doc\nglobal edit\n"
     );
 }
 
-/// GitHub-backed sources import only into a confirmed local alternate location.
+/// Applying noninteractively without `--yes` refuses even when both
+/// dimensions are already resolved by flags -- flags answer the questions,
+/// they do not authorize the write.
 #[test]
-fn import_into_a_github_source_requires_a_confirmed_local_alternate() {
+fn import_no_input_without_yes_refuses_to_apply() {
+    let (home, project) = import_single_copy_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude", "--update", "--no-input"])
+        .output()
+        .expect("run --no-input without --yes");
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr_of(&output),
+        "Error: applying this plan noninteractively requires --yes.\n"
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join("source/docwriter/SKILL.md")).expect("untouched"),
+        "# Doc\n"
+    );
+}
+
+/// `--dry-run` on the single-copy case renders the whole plan (still with
+/// its own `c Cancel` option and pending-decision footer, since a dry run is
+/// simply the same plan minus the offer to answer it -- no, dry run drops
+/// `Cancel` specifically) and exits 0 with a single conclusion, no per-item
+/// echoes, and no writes.
+#[test]
+fn import_dry_run_renders_the_single_copy_plan_and_exits_zero() {
+    let (home, project) = import_single_copy_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude", "--dry-run"])
+        .output()
+        .expect("run single-copy dry run");
+    assert!(output.status.success());
+    let global_deployment =
+        portable_canonicalize(home.path().join(".claude/skills/docwriter")).expect("global path");
+    assert_eq!(
+        stdout_of(output.clone()),
+        format!(
+            "Import plan\n\
+\n\
+From  claude \u{b7} global\n\
+Path  {global}\n\
+Into  Primary (source)\n\
+\n\
+Source replacement\n\
+\u{20}\u{20}\u{2190} 1 file changed, +1/-0\n\
+\u{20}\u{20}~  SKILL.md  +1/-0\n\
+\n\
+Propagation preview\n\
+\u{20}\u{20}claude \u{b7} global   \u{2713} source copy; synchronized, no file changes\n\
+\u{20}\u{20}claude \u{b7} project  \u{2191} 1 file changed, +1/-0\n\
+\n\
+Propagation modes (chosen after the source copy)\n\
+\n\
+\u{20}\u{20}1  Import + update  (recommended)\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}Replace the source and synchronize 2 deployments (1 source copy, 1 updated).\n\
+\n\
+\u{20}\u{20}2  Import only\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}Replace the source; write no deployments and leave 1 out of date.\n\
+\n\
+1 source copy; 2 propagation modes\n\
+\n\
+Dry run \u{2014} 2 alternatives shown; no option selected and no changes were made.\n",
+            global = global_deployment.display()
+        )
+    );
+    assert!(stderr_of(&output).is_empty(), "a dry run never prompts");
+    assert_eq!(
+        fs::read_to_string(home.path().join("source/docwriter/SKILL.md")).expect("untouched"),
+        "# Doc\n"
+    );
+}
+
+/// `--dry-run` on the multi-copy case renders the same plan `--yes` would
+/// (no `Available source copies` heading, no `c Cancel`) plus the two-copy
+/// pending footer, and exits 0 with a single conclusion.
+#[test]
+fn import_dry_run_renders_the_multi_copy_plan_and_exits_zero() {
+    let (home, project) = import_ambiguous_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude", "--dry-run"])
+        .output()
+        .expect("run multi-copy dry run");
+    assert!(output.status.success());
+    let body = import_two_copy_dry_body(home.path(), &project);
+    assert_eq!(
+        stdout_of(output.clone()),
+        format!(
+            "{body}{IMPORT_TWO_COPY_UNRESOLVED_FOOTER}\n\
+Dry run \u{2014} 2 alternatives shown; no option selected and no changes were made.\n"
+        )
+    );
+    assert!(stderr_of(&output).is_empty(), "a dry run never prompts");
+}
+
+/// A syntactically valid skill name that is not deployed anywhere fails
+/// with `NotFound`, never exiting 0.
+#[test]
+fn import_reports_missing_skill() {
+    let home = sandbox();
+    cli(home.path())
+        .args(["import", "missing", "--claude"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Error: source skill not found: missing",
+        ));
+}
+
+/// `import` selects exactly one skill; fnmatch-style patterns are rejected
+/// even when they would otherwise resolve to a real skill.
+#[test]
+fn import_rejects_patterns() {
+    let (home, project) = import_single_copy_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    import
+        .args(["import", "doc*", "--claude"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Error: import selects exactly one skill and does not accept patterns: doc*",
+        ));
+}
+
+/// When every deployment already matches the source, nothing is ambiguous
+/// and nothing is written; the message never mentions a destination it
+/// would not write to, and it exits 0 (a literal that simply is not present
+/// among changed deployments, not a pattern matching nothing).
+#[test]
+fn import_reports_nothing_to_import_when_every_deployment_matches_the_source() {
+    let (home, project) = import_single_copy_fixture();
+    fs::write(
+        home.path().join(".claude/skills/docwriter/SKILL.md"),
+        "# Doc\n",
+    )
+    .expect("resync global deployment too");
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude"])
+        .output()
+        .expect("run idle import");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output.clone()),
+        "docwriter has no changed deployment to import from the enabled targets in global or project scope.\n"
+    );
+    assert!(stderr_of(&output).is_empty());
+}
+
+/// GitHub-backed sources import only into a confirmed local alternate
+/// location; without one, the failure names the missing configuration
+/// before any plan or write is attempted.
+#[test]
+fn import_into_a_github_source_requires_a_local_alternate() {
     let home = sandbox();
     cli(home.path())
         .args(["--json", "source", "add", "acme/skills", "remote"])
         .assert()
         .success();
-    seed_github_cache(home.path(), "alpha", "# Alpha remote\n");
+    seed_github_cache(home.path(), "teach", "# teach remote\n");
     cli(home.path())
         .args(["--json", "load", "--claude", "--global", "--no-input"])
         .assert()
         .success();
+
     let idle = cli(home.path())
-        .args(["import", "alpha", "--claude", "--global", "--yes"])
+        .args(["import", "teach", "--claude", "--global"])
         .output()
         .expect("run idle import against a GitHub source");
     assert!(idle.status.success());
-    let idle_stdout = String::from_utf8(idle.stdout).expect("utf8 idle output");
-    let idle_stderr = String::from_utf8(idle.stderr).expect("utf8 idle diagnostics");
-    assert!(idle_stdout.contains("Nothing to import"));
-    assert!(
-        !idle_stdout.contains("GitHub-backed") && !idle_stderr.contains("GitHub-backed"),
-        "an up-to-date GitHub source must not ask about a destination it will not write"
+    assert_eq!(
+        stdout_of(idle),
+        "teach has no changed deployment to import from the enabled targets in global scope.\n"
     );
 
     fs::write(
-        home.path().join(".claude/skills/alpha/SKILL.md"),
-        "# Alpha remote\nagent addition\n",
+        home.path().join(".claude/skills/teach/SKILL.md"),
+        "# teach remote\nagent addition\n",
     )
     .expect("agent edits the deployed remote skill");
+    let failed = cli(home.path())
+        .args(["import", "teach", "--claude", "--global"])
+        .output()
+        .expect("run import against a GitHub source with no local alternate");
+    assert!(!failed.status.success());
+    assert!(
+        stdout_of(failed.clone()).is_empty(),
+        "no plan without a destination to plan against"
+    );
+    assert_eq!(
+        stderr_of(&failed),
+        "Error: import writes to local source checkouts only; 'remote' is GitHub-backed \
+(acme/skills) and has no local alternate location. Add one with: skill-manager source alternate remote <local-path>\n"
+    );
+}
 
+/// Once a local alternate is configured, the ordinary single-prompt plan
+/// applies against it like any other source: `Into` names the local
+/// alternate, and `--no-update --yes` applies without prompting.
+#[test]
+fn import_writes_to_a_configured_github_local_alternate_after_review() {
+    let home = sandbox();
     cli(home.path())
-        .args(["--json", "import", "alpha", "--claude", "--global", "--yes"])
+        .args(["--json", "source", "add", "acme/skills", "remote"])
         .assert()
-        .failure()
-        .stdout(predicate::str::contains(
-            "import writes to local source checkouts only",
-        ))
-        .stdout(predicate::str::contains("source alternate remote"));
+        .success();
+    seed_github_cache(home.path(), "teach", "# teach remote\n");
+    cli(home.path())
+        .args(["--json", "load", "--claude", "--global", "--no-input"])
+        .assert()
+        .success();
+    fs::write(
+        home.path().join(".claude/skills/teach/SKILL.md"),
+        "# teach remote\nagent addition\n",
+    )
+    .expect("agent edits the deployed remote skill");
 
     let checkout = home.path().join("checkout");
     fs::create_dir_all(&checkout).expect("create local alternate checkout");
@@ -2899,42 +3490,436 @@ fn import_into_a_github_source_requires_a_confirmed_local_alternate() {
         .assert()
         .success();
 
-    cli(home.path())
-        .args(["--json", "import", "alpha", "--claude", "--global", "--yes"])
-        .assert()
-        .failure()
-        .stdout(predicate::str::contains(
-            "requires interactive confirmation",
-        ));
-    assert!(!checkout.join("alpha").exists());
-
-    cli(home.path())
-        .args(["import", "alpha", "--claude", "--global", "--yes"])
-        .write_stdin("n\n")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Cancelled."))
-        .stderr(predicate::str::contains("is GitHub-backed (acme/skills)"));
-    assert!(!checkout.join("alpha").exists());
-
-    cli(home.path())
-        .args(["import", "alpha", "--claude", "--global", "--yes"])
-        .write_stdin("y\n")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Imported alpha"));
+    let applied = cli(home.path())
+        .args([
+            "import",
+            "teach",
+            "--claude",
+            "--global",
+            "--no-update",
+            "--yes",
+        ])
+        .output()
+        .expect("run import against the configured local alternate");
+    assert!(applied.status.success());
+    let applied_stdout = stdout_of(applied);
+    assert!(
+        applied_stdout.contains("local alternate"),
+        "Into must name the local alternate:\n{applied_stdout}"
+    );
+    assert!(
+        applied_stdout.contains("Imported teach from claude \u{b7} global into Remote (source).")
+    );
     assert_eq!(
-        fs::read_to_string(checkout.join("alpha/SKILL.md")).expect("alternate receives the import"),
-        "# Alpha remote\nagent addition\n"
+        fs::read_to_string(checkout.join("teach/SKILL.md")).expect("alternate receives import"),
+        "# teach remote\nagent addition\n"
     );
 }
 
-/// Displayed and reported source paths never leak Windows verbatim prefixes.
+/// Displayed source and deployment paths never leak Windows verbatim
+/// prefixes, in either human or machine output.
 #[test]
 fn import_paths_are_reported_without_verbatim_prefixes() {
+    let (home, project) = import_single_copy_fixture();
+    let expected_deployment = portable_canonicalize(home.path().join(".claude/skills/docwriter"))
+        .expect("canonical deployment");
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let human = import
+        .args(["import", "docwriter", "--claude", "--update", "--yes"])
+        .output()
+        .expect("run human import");
+    assert!(human.status.success());
+    let stdout = stdout_of(human);
+    assert!(stdout.contains("Imported docwriter"));
+    assert!(
+        !stdout.contains(VERBATIM_PREFIX),
+        "human paths must not use verbatim spellings: {stdout}"
+    );
+    assert!(stdout.contains(&expected_deployment.display().to_string()));
+
+    fs::write(
+        home.path().join(".claude/skills/docwriter/SKILL.md"),
+        "# Doc\nedited again\n",
+    )
+    .expect("edit again");
+    let mut machine = cli(home.path());
+    machine.current_dir(&project);
+    let events = json_events(
+        machine
+            .args(["--json", "import", "docwriter", "--claude", "--dry-run"])
+            .output()
+            .expect("run machine dry run"),
+    );
+    let plan = events
+        .iter()
+        .find(|event| event["event"] == "plan")
+        .expect("plan event");
+    let plan_text = plan.to_string();
+    assert!(
+        !plan_text.contains(VERBATIM_PREFIX),
+        "machine paths must not use verbatim spellings: {plan_text}"
+    );
+    let consequence_path = plan["data"]["decisions"][0]["options"][0]["consequence"]["path"]
+        .as_str()
+        .expect("the resolved candidate's option carries its own path");
+    assert!(
+        !consequence_path.contains(VERBATIM_PREFIX),
+        "the resolved candidate's own path (the only path serialized for a single-copy \
+plan) must be clean: {consequence_path}"
+    );
+}
+
+/// Apply order equals `review_sequence()`, the same order the plan showed:
+/// the resolved candidate's own now-redundant deployment is reported before
+/// the deployment that genuinely changes, exactly as the propagation
+/// preview listed them (`claude \u{b7} global` before `claude \u{b7} project`).
+#[test]
+fn import_plan_order_equals_apply_order() {
+    let (home, project) = import_ambiguous_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude"])
+        .write_stdin("2\n1\n")
+        .output()
+        .expect("run full accepted import");
+    assert!(output.status.success());
+    let stdout = stdout_of(output);
+    let synchronized_at = stdout
+        .find("Synchronized docwriter -> claude (global) (source copy)")
+        .expect("synchronized line present");
+    let updated_at = stdout
+        .find("Updated docwriter -> claude (project)")
+        .expect("updated line present");
+    assert!(
+        synchronized_at < updated_at,
+        "apply order must match the propagation preview's destination order:\n{stdout}"
+    );
+    let preview_global_at = stdout
+        .find("claude \u{b7} global   \u{2713} source copy; synchronized, no file changes")
+        .expect("preview line for the resolved copy");
+    let preview_project_at = stdout
+        .rfind("claude \u{b7} project  \u{2191} 1 file changed, +1/-1")
+        .expect("preview line for the updated copy");
+    assert!(preview_global_at < preview_project_at);
+}
+
+/// E8 regression test: propagating a candidate whose own deployment matches
+/// the source, into a deployment that has genuinely drifted apart (missing
+/// a file the candidate lacks -- gaining one, and needing its `SKILL.md`
+/// rewritten), advertises `2 files changed, +1/-1` in the plan preview. The
+/// actual apply must write exactly those two files with exactly that
+/// aggregate diff, proving both numbers are derived from the very
+/// enumeration that apply uses, not a representative copy's count (Stage
+/// 3's remove defect).
+/// E8 regression test: propagating a resolved candidate whose own diff from
+/// source is a single line, into a deployment that has genuinely drifted
+/// apart (gaining a file the candidate lacks, needing both an add/remove and
+/// its `SKILL.md` rewritten), advertises `2 files changed, +1/-1` in the
+/// plan preview -- both under the losing candidate's own nested preview and
+/// under the resolved candidate's. The actual apply must write exactly
+/// those two files with exactly that aggregate diff, proving both numbers
+/// are derived from the very enumeration that apply uses, not a
+/// representative copy's count (Stage 3's remove defect).
+#[test]
+fn import_plan_event_reports_true_per_option_totals_when_deployments_have_drifted_apart() {
+    let (home, project) = import_drifted_fixture();
+    let mut dry_run = cli(home.path());
+    dry_run.current_dir(&project);
+    let dry_output = dry_run
+        .args(["import", "docwriter", "--claude", "--dry-run"])
+        .output()
+        .expect("run drifted dry run");
+    assert!(dry_output.status.success());
+    let dry_stdout = stdout_of(dry_output);
+    assert_eq!(
+        dry_stdout
+            .matches("claude \u{b7} project  \u{2191} 2 files changed, +1/-1")
+            .count(),
+        1,
+        "only source copy 2's nested preview shows project's true drifted diff:\n{dry_stdout}"
+    );
+    assert_eq!(
+        dry_stdout
+            .matches("claude \u{b7} global   \u{2191} 2 files changed, +1/-1")
+            .count(),
+        1,
+        "source copy 1's nested preview shows global's symmetric drifted diff:\n{dry_stdout}"
+    );
+
+    let mut apply = cli(home.path());
+    apply.current_dir(&project);
+    let output = apply
+        .args(["import", "docwriter", "--claude"])
+        .write_stdin("2\n1\n")
+        .output()
+        .expect("apply the drifted propagation, choosing source copy 2 (claude · global)");
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(home.path().join("source/docwriter/SKILL.md")).expect("new source"),
+        "# Doc\nglobal edit\n"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join(".claude/skills/docwriter/SKILL.md")).expect("rewritten"),
+        "# Doc\nglobal edit\n"
+    );
+    assert!(
+        !project.join(".claude/skills/docwriter/notes.md").exists(),
+        "the extra file the new source lacks must be removed, matching the advertised diff"
+    );
+}
+
+/// The single-copy dry-run `plan` event (revision 0) already carries a
+/// resolved `source_copy` decision -- there was only ever one candidate --
+/// while `propagation` stays pending; every option carries its typed
+/// consequence, including the nested per-destination actions a source-copy
+/// option lists.
+#[test]
+fn import_emits_a_structured_plan_event_with_the_resolved_source_copy() {
+    let (home, project) = import_single_copy_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let events = json_events(
+        import
+            .args(["--json", "import", "docwriter", "--claude", "--dry-run"])
+            .output()
+            .expect("run machine dry run"),
+    );
+    let plans = events_of(&events, "plan");
+    assert_eq!(plans.len(), 1, "exactly one plan event: {events:?}");
+    let data = &plans[0]["data"];
+    assert_eq!(data["plan_id"], "import:docwriter");
+    assert_eq!(data["revision"], 0);
+    assert_eq!(data["dry_run"], true);
+    assert_eq!(data["authorization"]["kind"], "progressive");
+    assert_eq!(data["authorization"]["mode"], "dry-run");
+    assert_eq!(
+        data["authorization"]["sequence"],
+        json!(["source_copy", "propagation"])
+    );
+    assert_eq!(
+        data["authorization"]["resolved"],
+        json!({ "source_copy": "claude:global" })
+    );
+    assert_eq!(data["authorization"]["pending"], json!(["propagation"]));
+
+    let decisions = data["decisions"].as_array().expect("decisions array");
+    assert_eq!(decisions.len(), 2);
+    let source_decision = &decisions[0];
+    assert_eq!(source_decision["id"], "source_copy");
+    assert_eq!(source_decision["state"], "resolved");
+    assert_eq!(source_decision["resolved"], "claude:global");
+    let source_options = source_decision["options"].as_array().expect("options");
+    assert_eq!(source_options.len(), 1);
+    assert_eq!(source_options[0]["id"], "claude:global");
+    assert_eq!(source_options[0]["token"], "1");
+    let source_actions = source_options[0]["consequence"]["actions"]
+        .as_array()
+        .expect("nested actions");
+    assert_eq!(
+        source_actions.len(),
+        3,
+        "import + skip-self + update: {source_actions:?}"
+    );
+    assert_eq!(source_options[0]["consequence"]["totals"]["deployments"], 2);
+
+    let propagation_decision = &decisions[1];
+    assert_eq!(propagation_decision["id"], "propagation");
+    assert_eq!(propagation_decision["state"], "pending");
+    let propagation_options = propagation_decision["options"].as_array().expect("options");
+    assert_eq!(propagation_options[0]["id"], "import-update");
+    assert_eq!(propagation_options[0]["recommended"], true);
+    assert_eq!(
+        propagation_options[0]["consequence"]["totals"]["updated"],
+        1
+    );
+    assert_eq!(
+        propagation_options[0]["consequence"]["totals"]["skipped"],
+        1
+    );
+    assert_eq!(propagation_options[1]["id"], "import-only");
+    assert_eq!(propagation_options[1]["consequence"]["totals"]["stale"], 1);
+}
+
+/// The multi-copy `plan` event (revision 0) leaves both decisions pending
+/// and serializes every source-copy option's own nested propagation
+/// preview, proving the NDJSON stream never depends on human-only gating.
+#[test]
+fn import_revision_zero_serializes_every_source_option_and_its_propagation() {
+    let (home, project) = import_ambiguous_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let events = json_events(
+        import
+            .args(["--json", "import", "docwriter", "--claude", "--dry-run"])
+            .output()
+            .expect("run machine dry run"),
+    );
+    let plans = events_of(&events, "plan");
+    assert_eq!(plans.len(), 1);
+    let data = &plans[0]["data"];
+    assert_eq!(data["authorization"]["resolved"], json!({}));
+    assert_eq!(
+        data["authorization"]["pending"],
+        json!(["source_copy", "propagation"])
+    );
+    let decisions = data["decisions"].as_array().expect("decisions");
+    let source_options = decisions[0]["options"].as_array().expect("source options");
+    assert_eq!(source_options.len(), 2);
+    for option in source_options {
+        let actions = option["consequence"]["actions"]
+            .as_array()
+            .expect("actions");
+        assert_eq!(actions.len(), 3);
+        assert_eq!(option["consequence"]["totals"]["deployments"], 2);
+    }
+    assert_eq!(source_options[0]["id"], "claude:project");
+    assert_eq!(source_options[1]["id"], "claude:global");
+}
+
+/// Interactive symbol+color rendering for a terminal user: the multi-copy
+/// branch plan under `--color always` with `SKILL_MANAGER_FORCE_INTERACTIVE`
+/// colors the section headings and delta markers and leaves unchanged
+/// entries (`\u{2713} source copy; synchronized, no file changes`) uncolored.
+#[test]
+fn import_renders_the_interactive_symbol_and_color_branch_plan_for_a_terminal_user() {
+    let (home, project) = import_ambiguous_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let stdout = stdout_of(
+        import
+            .env_remove("NO_COLOR")
+            .env("SKILL_MANAGER_FORCE_INTERACTIVE", "1")
+            .args([
+                "import",
+                "docwriter",
+                "--claude",
+                "--color",
+                "always",
+                "--dry-run",
+            ])
+            .output()
+            .expect("run interactive dry-run import"),
+    );
+    let project_deployment =
+        portable_canonicalize(project.join(".claude/skills/docwriter")).expect("project path");
+    let global_deployment =
+        portable_canonicalize(home.path().join(".claude/skills/docwriter")).expect("global path");
+    assert_eq!(
+        stdout,
+        format!(
+            "\u{1b}[1;36mImport plan\u{1b}[0m\n\
+\n\
+Into  Primary (source)\n\
+\n\
+\u{1b}[1;36mSource copies (chosen first)\u{1b}[0m\n\
+\n\
+\u{20}\u{20}1  claude \u{b7} project\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}Path    {project}\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}Source  \u{1b}[33m\u{2190} 1 file changed, +1/-0\u{1b}[0m\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{1b}[33m~\u{1b}[0m  SKILL.md  +1/-0\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}\u{1b}[1;36mPropagation with import + update\u{1b}[0m  2 deployments\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}claude \u{b7} global   \u{1b}[33m\u{2191} 1 file changed, +1/-1\u{1b}[0m\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}claude \u{b7} project  \u{2713} source copy; synchronized, no file changes\n\
+\n\
+\u{20}\u{20}2  claude \u{b7} global\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}Path    {global}\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}Source  \u{1b}[33m\u{2190} 1 file changed, +1/-0\u{1b}[0m\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{1b}[33m~\u{1b}[0m  SKILL.md  +1/-0\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}\u{1b}[1;36mPropagation with import + update\u{1b}[0m  2 deployments\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}claude \u{b7} global   \u{2713} source copy; synchronized, no file changes\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}claude \u{b7} project  \u{1b}[33m\u{2191} 1 file changed, +1/-1\u{1b}[0m\n\
+\n\
+\u{1b}[1;36mPropagation modes (chosen after the source copy)\u{1b}[0m\n\
+\n\
+\u{20}\u{20}1  Import + update  (recommended)\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}Replace the source, then synchronize every deployment shown for that copy.\n\
+\n\
+\u{20}\u{20}2  Import only\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}Replace the source; write no deployments and leave the other 1 out of date.\n\
+\n\
+2 source copies; propagation decision follows source selection\n\
+\n\
+Dry run \u{2014} 2 alternatives shown; no option selected and no changes were made.\n",
+            project = project_deployment.display(),
+            global = global_deployment.display()
+        )
+    );
+}
+
+/// The same terminal user reviewing the single-copy plan sees the
+/// collapsed rendering: `From`/`Path` metadata from the start, a colored
+/// `Source replacement` and `Propagation preview` heading, and the same
+/// uncolored `\u{2713}` for the resolved copy's own now-redundant entry.
+#[test]
+fn import_renders_the_interactive_symbol_and_color_collapsed_plan_for_a_terminal_user() {
+    let (home, project) = import_single_copy_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let stdout = stdout_of(
+        import
+            .env_remove("NO_COLOR")
+            .env("SKILL_MANAGER_FORCE_INTERACTIVE", "1")
+            .args([
+                "import",
+                "docwriter",
+                "--claude",
+                "--color",
+                "always",
+                "--dry-run",
+            ])
+            .output()
+            .expect("run interactive collapsed dry-run import"),
+    );
+    let global_deployment =
+        portable_canonicalize(home.path().join(".claude/skills/docwriter")).expect("global path");
+    assert_eq!(
+        stdout,
+        format!(
+            "\u{1b}[1;36mImport plan\u{1b}[0m\n\
+\n\
+From  claude \u{b7} global\n\
+Path  {global}\n\
+Into  Primary (source)\n\
+\n\
+\u{1b}[1;36mSource replacement\u{1b}[0m\n\
+\u{20}\u{20}\u{1b}[33m\u{2190} 1 file changed, +1/-0\u{1b}[0m\n\
+\u{20}\u{20}\u{1b}[33m~\u{1b}[0m  SKILL.md  +1/-0\n\
+\n\
+\u{1b}[1;36mPropagation preview\u{1b}[0m\n\
+\u{20}\u{20}claude \u{b7} global   \u{2713} source copy; synchronized, no file changes\n\
+\u{20}\u{20}claude \u{b7} project  \u{1b}[33m\u{2191} 1 file changed, +1/-0\u{1b}[0m\n\
+\n\
+\u{1b}[1;36mPropagation modes (chosen after the source copy)\u{1b}[0m\n\
+\n\
+\u{20}\u{20}1  Import + update  (recommended)\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}Replace the source and synchronize 2 deployments (1 source copy, 1 updated).\n\
+\n\
+\u{20}\u{20}2  Import only\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}Replace the source; write no deployments and leave 1 out of date.\n\
+\n\
+1 source copy; 2 propagation modes\n\
+\n\
+Dry run \u{2014} 2 alternatives shown; no option selected and no changes were made.\n",
+            global = global_deployment.display()
+        )
+    );
+}
+
+/// E1/E9/L: exactly one deployment total (not merely one *candidate* among
+/// several deployments -- see the item-B/C fixture below for that case).
+/// Propagating a resolved source copy to "every other deployment" is
+/// vacuous when there is no other deployment, so propagation is degenerate
+/// for the only candidate there is and the whole command collapses to a
+/// plain plan with no decisions at all: no `Propagation modes` section, no
+/// zero-valued counts anywhere, and a plain `[y/N]`-shaped `--yes` recipe
+/// contract identical to `update`/`load` (item A). This is the exact
+/// harness the adversarial review used to find item A.
+fn import_degenerate_fixture() -> TempDir {
     let home = sandbox();
     let source = home.path().join("source");
-    create_skill(&source, "alpha", "# Alpha\n");
+    create_skill(&source, "alpha", "# Alpha");
     cli(home.path())
         .args([
             "--json",
@@ -2951,68 +3936,547 @@ fn import_paths_are_reported_without_verbatim_prefixes() {
         .success();
     fs::write(
         home.path().join(".claude/skills/alpha/SKILL.md"),
-        "# Alpha\nedited\n",
+        "# Alpha\nedit",
     )
-    .expect("agent edit");
+    .expect("edit the only deployment");
+    home
+}
 
-    let expected = portable_canonicalize(source.join("alpha")).expect("canonical source skill");
-    let expected_deployment = portable_canonicalize(home.path().join(".claude/skills/alpha"))
-        .expect("canonical deployment");
-    let human = cli(home.path())
+/// Two candidates whose content is byte-identical to each other (both
+/// deployments were edited to the same text), so adopting either produces
+/// the same resulting source and the same (empty) propagation -- not a
+/// genuine branch by the same rule item A applies to propagation (item I).
+/// With only these two deployments in existence, propagation is *also*
+/// degenerate once resolved, so both dimensions collapse silently and there
+/// is no prompt at all.
+fn import_identical_candidates_fixture() -> TempDir {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "alpha", "# Alpha");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 path"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args(["--json", "load", "--claude", "--global", "--no-input"])
+        .assert()
+        .success();
+    cli(home.path())
+        .args(["--json", "load", "--shared", "--global", "--no-input"])
+        .assert()
+        .success();
+    fs::write(
+        home.path().join(".claude/skills/alpha/SKILL.md"),
+        "# Alpha\nedit",
+    )
+    .expect("edit claude deployment");
+    fs::write(
+        home.path().join(".agents/skills/alpha/SKILL.md"),
+        "# Alpha\nedit",
+    )
+    .expect("edit shared deployment identically");
+    home
+}
+
+/// Same two identical candidates as [`import_identical_candidates_fixture`],
+/// plus a third, untouched deployment that still matches the *original*
+/// source and so is not itself a `source_copy` candidate -- but it is a
+/// genuine propagation target once one of the identical candidates is
+/// adopted, since the new source content differs from the untouched
+/// deployment. `source_copy` still collapses silently (item I): the only
+/// two candidates are identical to each other. Propagation, however, stays
+/// genuinely pending, so the whole session is exactly one prompt --
+/// propagation -- reached via silent collapse rather than single candidacy.
+fn import_identical_candidates_with_bystander_fixture() -> TempDir {
+    let home = import_identical_candidates_fixture();
+    cli(home.path())
+        .args(["--json", "load", "--antigravity", "--global", "--no-input"])
+        .assert()
+        .success();
+    // Left untouched: still equals the original source, so it is a genuine
+    // propagation target for either identical candidate but never itself a
+    // `source_copy` candidate.
+    home
+}
+
+/// Three deployments: `claude` and `shared` are edited to the same content
+/// (so one is a genuine `source_copy` candidate and the other merely
+/// happens to be identical to it, never itself the resolved identity), and
+/// `antigravity` is edited to *different* content (so it stays genuinely
+/// out of date after either is chosen, keeping propagation genuine and the
+/// `Propagation preview` block from being gated away). Proves item B: only
+/// the resolved copy is labelled "source copy"; a merely-identical
+/// deployment gets its own honest "synchronized, no file changes" label,
+/// and the apply-time footer breakdown accounts for it separately from
+/// "updated" so the three counts always sum to the deployment count (item
+/// C's `skill.skipped` event and item F's "already identical" clause).
+fn import_identical_bystander_fixture() -> TempDir {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "alpha", "# Alpha");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 path"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    for target in ["--claude", "--shared", "--antigravity"] {
+        cli(home.path())
+            .args(["--json", "load", target, "--global", "--no-input"])
+            .assert()
+            .success();
+    }
+    fs::write(
+        home.path().join(".claude/skills/alpha/SKILL.md"),
+        "# Alpha\nedit",
+    )
+    .expect("edit claude deployment");
+    fs::write(
+        home.path().join(".agents/skills/alpha/SKILL.md"),
+        "# Alpha\nedit",
+    )
+    .expect("edit shared deployment identically to claude");
+    fs::write(
+        home.path()
+            .join(".gemini/antigravity/skills/alpha/SKILL.md"),
+        "# Alpha\nother edit",
+    )
+    .expect("edit antigravity deployment to different content");
+    home
+}
+
+/// E1/E9/E10/A/L: with exactly one deployment total, propagation cannot
+/// possibly be genuine (there is nothing else to propagate to), so it
+/// resolves silently: no `Propagation modes` section, no `Mode` metadata
+/// line, and no zero-valued counts anywhere in the plan. The whole command
+/// degenerates to a plain-plan-plus-confirmation shape identical to
+/// `update`/`load`.
+#[test]
+fn import_degenerate_propagation_renders_a_plain_plan_with_no_decisions() {
+    let home = import_degenerate_fixture();
+    let global = portable_canonicalize(home.path().join(".claude/skills/alpha")).expect("path");
+    let output = cli(home.path())
+        .args(["import", "alpha", "--claude", "--global", "--dry-run"])
+        .output()
+        .expect("run degenerate dry-run import");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output),
+        format!(
+            "Import plan\n\
+\n\
+From  claude \u{b7} global\n\
+Path  {global}\n\
+Into  Primary (source)\n\
+\n\
+Source replacement\n\
+\u{20}\u{20}\u{2190} 1 file changed, +1/-0\n\
+\u{20}\u{20}~  SKILL.md  +1/-0\n\
+\n\
+1 source replacement from claude \u{b7} global\n\
+\n\
+Dry run \u{2014} no changes were made.\n",
+            global = global.display()
+        )
+    );
+}
+
+/// A/E: the exact adversarial-review repro. The original recipe
+/// (`yes:true` with no `update`/`no_update`) previously broke because
+/// propagation was forced as a genuine dimension even when both answers are
+/// provably identical; after the fix it succeeds again, since propagation
+/// resolves silently rather than refusing `--yes`/`yes:true`. Also restores
+/// the binary-content round-trip coverage that
+/// `import_renders_a_plain_plan_and_runs_from_a_recipe` provided before
+/// this migration (item J): a binary file present only in the deployment
+/// must be written into the source and be byte-identical on the far side.
+#[test]
+fn import_yes_alone_commits_a_degenerate_recipe_and_round_trips_binary_content() {
+    let home = import_degenerate_fixture();
+    let deployed = home.path().join(".claude/skills/alpha");
+    fs::write(deployed.join("logo.bin"), [0_u8, 1, 2, 3]).expect("agent adds binary content");
+
+    let events = json_events(
+        cli(home.path())
+            .arg("--json-input")
+            .write_stdin(
+                serde_json::json!({
+                    "command": "import",
+                    "skill": "alpha",
+                    "claude": true,
+                    "global": true,
+                    "yes": true
+                })
+                .to_string(),
+            )
+            .output()
+            .expect("run the degenerate recipe with only yes:true"),
+    );
+    assert!(events_of(&events, "command.failed").is_empty());
+    let plan = events_of(&events, "plan")[0];
+    assert_eq!(
+        plan["data"]["authorization"]["resolved"]["propagation"],
+        "import-only"
+    );
+    assert!(!events_of(&events, "skill.imported").is_empty());
+    assert!(
+        events_of(&events, "skill.skipped").is_empty(),
+        "import-only never loops the deployment list"
+    );
+
+    assert_eq!(
+        fs::read_to_string(home.path().join("source/alpha/SKILL.md")).expect("imported"),
+        "# Alpha\nedit"
+    );
+    assert_eq!(
+        fs::read(home.path().join("source/alpha/logo.bin")).expect("binary round trip"),
+        [0_u8, 1, 2, 3]
+    );
+}
+
+/// N: an explicit `--update` must stay honest in the machine stream even on
+/// a degenerate plan -- `resolved` records `import-update`, the mode the
+/// caller actually asked for, never the silent default that would apply had
+/// no flag been given. Because propagation genuinely does nothing here
+/// (`updated: 0`), the applied stream still completes with a `skill.skipped`
+/// for the sole deployment (honest completeness: import-update was recorded,
+/// so it runs and reports what it found), while the human footer keeps
+/// gating the resulting zero count and reads exactly as the plain,
+/// no-decision form -- never `(1 source copy, 0 updated)`.
+#[test]
+fn import_explicit_update_on_a_degenerate_plan_records_import_update_and_hides_the_zero_count() {
+    let home = import_degenerate_fixture();
+
+    let events = json_events(
+        cli(home.path())
+            .arg("--json-input")
+            .write_stdin(
+                serde_json::json!({
+                    "command": "import",
+                    "skill": "alpha",
+                    "claude": true,
+                    "global": true,
+                    "update": true,
+                    "yes": true
+                })
+                .to_string(),
+            )
+            .output()
+            .expect("run the degenerate recipe with an explicit update:true"),
+    );
+    assert!(events_of(&events, "command.failed").is_empty());
+    let plan = events_of(&events, "plan")[0];
+    assert_eq!(
+        plan["data"]["authorization"]["resolved"]["propagation"], "import-update",
+        "an explicit --update must be recorded honestly even when degenerate"
+    );
+    let propagation_option = plan["data"]["decisions"][1]["options"][0].clone();
+    assert_eq!(propagation_option["id"], "import-update");
+    assert_eq!(propagation_option["consequence"]["totals"]["updated"], 0);
+    assert!(!events_of(&events, "skill.imported").is_empty());
+    assert_eq!(
+        events_of(&events, "skill.skipped").len(),
+        1,
+        "import-update was recorded, so it runs and reports the one no-op deployment"
+    );
+
+    let human_home = import_degenerate_fixture();
+    let output = cli(human_home.path())
+        .args([
+            "import", "alpha", "--claude", "--global", "--update", "--yes",
+        ])
+        .output()
+        .expect("run the human-facing form of the same scenario");
+    assert!(output.status.success());
+    let human_global =
+        portable_canonicalize(human_home.path().join(".claude/skills/alpha")).expect("path");
+    assert_eq!(
+        stdout_of(output),
+        format!(
+            "Import plan\n\
+\n\
+From  claude \u{b7} global\n\
+Path  {global}\n\
+Into  Primary (source)\n\
+\n\
+Source replacement\n\
+\u{20}\u{20}\u{2190} 1 file changed, +1/-0\n\
+\u{20}\u{20}~  SKILL.md  +1/-0\n\
+\n\
+1 source replacement from claude \u{b7} global\n\
+\n\
+Imported alpha from claude \u{b7} global into Primary (source).\n\
+Synchronized alpha -> claude (global) (source copy)\n\
+\n\
+completed: 1 source replaced (1 file, +1/-0)\n",
+            global = human_global.display()
+        )
+    );
+    let dry_run_home = import_degenerate_fixture();
+    assert!(
+        !stdout_of(
+            cli(dry_run_home.path())
+                .args([
+                    "import",
+                    "alpha",
+                    "--claude",
+                    "--global",
+                    "--update",
+                    "--dry-run"
+                ])
+                .output()
+                .expect("dry-run the same scenario")
+        )
+        .contains("0 updated"),
+        "the human footer must never print a forbidden zero count"
+    );
+}
+
+/// I: when every candidate is byte-identical to every other, forcing a
+/// choice between them would ask a question with no observable answer, so
+/// `source_copy` resolves silently to the first in configured order --
+/// exactly like the single-real-candidate case. With only these two
+/// deployments, propagation is degenerate too (item A), so the whole
+/// session has zero prompts.
+#[test]
+fn import_byte_identical_candidates_resolve_source_copy_silently_with_no_prompt() {
+    let home = import_identical_candidates_fixture();
+    let claude = portable_canonicalize(home.path().join(".claude/skills/alpha")).expect("path");
+    let output = cli(home.path())
+        .args(["import", "alpha", "--dry-run"])
+        .output()
+        .expect("run identical-candidates dry-run import");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output),
+        format!(
+            "Import plan\n\
+\n\
+From  claude \u{b7} global\n\
+Path  {claude}\n\
+Into  Primary (source)\n\
+\n\
+Source replacement\n\
+\u{20}\u{20}\u{2190} 1 file changed, +1/-0\n\
+\u{20}\u{20}~  SKILL.md  +1/-0\n\
+\n\
+1 source replacement from claude \u{b7} global\n\
+\n\
+Dry run \u{2014} no changes were made.\n",
+            claude = claude.display()
+        )
+    );
+    let applied = cli(home.path())
+        .args(["import", "alpha", "--yes"])
+        .output()
+        .expect("run identical-candidates apply");
+    assert!(applied.status.success());
+    assert_eq!(
+        fs::read_to_string(home.path().join("source/alpha/SKILL.md")).expect("imported"),
+        "# Alpha\nedit"
+    );
+}
+
+/// I (bystander variant): `source_copy` still collapses silently because
+/// the two candidates are byte-identical, but a third, untouched deployment
+/// keeps propagation genuinely pending -- reached via silent collapse
+/// rather than single candidacy (E5's other route). Exactly one prompt.
+/// Also proves the pending footer never claims a choice existed for a
+/// dimension that was never rendered as one: "1 source copy" (not "2 source
+/// copies"), since only one alternative was ever genuinely on offer.
+#[test]
+fn import_identical_candidates_with_a_genuine_bystander_ask_only_about_propagation() {
+    let home = import_identical_candidates_with_bystander_fixture();
+    let claude = portable_canonicalize(home.path().join(".claude/skills/alpha")).expect("path");
+    let output = cli(home.path())
+        .args(["import", "alpha", "--dry-run"])
+        .output()
+        .expect("run identical-candidates-with-bystander dry-run import");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output),
+        format!(
+            "Import plan\n\
+\n\
+From  claude \u{b7} global\n\
+Path  {claude}\n\
+Into  Primary (source)\n\
+\n\
+Source replacement\n\
+\u{20}\u{20}\u{2190} 1 file changed, +1/-0\n\
+\u{20}\u{20}~  SKILL.md  +1/-0\n\
+\n\
+Propagation preview\n\
+\u{20}\u{20}claude \u{b7} global       \u{2713} source copy; synchronized, no file changes\n\
+\u{20}\u{20}shared \u{b7} global       \u{2713} synchronized, no file changes\n\
+\u{20}\u{20}antigravity \u{b7} global  \u{2191} 1 file changed, +1/-0\n\
+\n\
+Propagation modes (chosen after the source copy)\n\
+\n\
+\u{20}\u{20}1  Import + update  (recommended)\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}Replace the source and synchronize 3 deployments (1 source copy, 1 updated).\n\
+\n\
+\u{20}\u{20}2  Import only\n\
+\u{20}\u{20}\u{20}\u{20}\u{20}Replace the source; write no deployments and leave 1 out of date.\n\
+\n\
+1 source copy; 2 propagation modes\n\
+\n\
+Dry run \u{2014} 2 alternatives shown; no option selected and no changes were made.\n",
+            claude = claude.display()
+        )
+    );
+    let output = cli(home.path())
+        .args(["import", "alpha"])
+        .write_stdin("1\n")
+        .output()
+        .expect("run identical-candidates-with-bystander apply");
+    assert!(output.status.success());
+    assert_eq!(
+        stderr_of(&output),
+        "Select propagation [1-2, c to cancel]: "
+    );
+    assert!(
+        stdout_of(output).contains(
+            "completed: 1 source replaced (1 file, +1/-0), 3 deployments synchronized (1 source copy, 1 updated, 1 already identical)"
+        )
+    );
+}
+
+/// B/C/F: only the deployment actually resolved as the source copy is
+/// labelled "source copy"; a merely byte-identical bystander gets its own
+/// honest "synchronized, no file changes" label in every rendering
+/// (options, propagation preview, and the applied human lines), and the
+/// applied `skill.skipped` machine event fires for it (item C). The footer
+/// breakdown (`1 source copy, 1 updated, 1 already identical`) sums to the
+/// full deployment count.
+#[test]
+fn import_labels_only_the_resolved_copy_as_source_copy_and_emits_skipped_for_a_bystander() {
+    let home = import_identical_bystander_fixture();
+    let claude = portable_canonicalize(home.path().join(".claude/skills/alpha")).expect("path");
+    let output = cli(home.path())
         .args([
             "import",
             "alpha",
             "--claude",
             "--global",
-            "--yes",
-            "--no-input",
-            "--verbose",
+            "--update",
+            "--dry-run",
         ])
         .output()
-        .expect("run human import");
-    assert!(human.status.success());
-    let stdout = String::from_utf8(human.stdout).expect("utf8 import output");
-    assert!(stdout.contains("Imported alpha"));
-    assert!(
-        !stdout.contains(VERBATIM_PREFIX),
-        "human paths must not use verbatim spellings: {stdout}"
+        .expect("run bystander dry-run import");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output),
+        format!(
+            "Import plan\n\
+\n\
+From  claude \u{b7} global\n\
+Path  {claude}\n\
+Into  Primary (source)\n\
+Mode  import + update (recommended, explicitly selected)\n\
+\n\
+Source replacement\n\
+\u{20}\u{20}\u{2190} 1 file changed, +1/-0\n\
+\u{20}\u{20}~  SKILL.md  +1/-0\n\
+\n\
+Propagation preview\n\
+\u{20}\u{20}claude \u{b7} global       \u{2713} source copy; synchronized, no file changes\n\
+\u{20}\u{20}shared \u{b7} global       \u{2713} synchronized, no file changes\n\
+\u{20}\u{20}antigravity \u{b7} global  \u{2191} 1 file changed, +1/-1\n\
+\n\
+1 source replacement; 3 deployments synchronized (1 source copy, 1 updated, 1 already identical)\n\
+\n\
+Dry run \u{2014} no changes were made.\n",
+            claude = claude.display()
+        )
     );
-    assert!(stdout.contains(&expected.display().to_string()));
-    assert!(stdout.contains(&expected_deployment.display().to_string()));
 
-    fs::write(
-        home.path().join(".claude/skills/alpha/SKILL.md"),
-        "# Alpha\nedited twice\n",
-    )
-    .expect("agent edit again");
     let events = json_events(
         cli(home.path())
-            .args(["--json", "import", "alpha", "--claude", "--global", "--yes"])
+            .args([
+                "--json", "import", "alpha", "--claude", "--global", "--update", "--yes",
+            ])
             .output()
-            .expect("run machine import"),
+            .expect("run bystander apply"),
     );
-    let destination = events_of(&events, "skill.imported")[0]["data"]["destination"]
-        .as_str()
-        .expect("reported destination path")
-        .to_owned();
-    assert!(!destination.contains(VERBATIM_PREFIX), "{destination}");
-    assert_eq!(PathBuf::from(destination), expected);
-    let imported = events_of(&events, "skill.imported")[0];
+    assert!(events_of(&events, "command.failed").is_empty());
+    let skipped = events_of(&events, "skill.skipped");
     assert_eq!(
-        portable_canonicalize(Path::new(
-            imported["data"]["path"].as_str().expect("source path"),
-        ))
-        .expect("canonical event source path"),
-        expected
+        skipped.len(),
+        2,
+        "the resolved source copy and the byte-identical bystander both skip"
+    );
+    let skipped_targets: BTreeSet<&str> = skipped
+        .iter()
+        .map(|event| event["data"]["target"].as_str().expect("target"))
+        .collect();
+    assert_eq!(
+        skipped_targets,
+        BTreeSet::from(["claude", "shared"]),
+        "claude is the resolved source copy; shared merely happens to be identical"
+    );
+    let updated = events_of(&events, "skill.updated");
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0]["data"]["target"], "antigravity");
+
+    assert_eq!(
+        fs::read_to_string(home.path().join(".agents/skills/alpha/SKILL.md")).expect("bystander"),
+        "# Alpha\nedit"
     );
     assert_eq!(
-        portable_canonicalize(Path::new(
-            imported["data"]["deployment"]
-                .as_str()
-                .expect("deployment path")
-        ))
-        .expect("canonical event deployment path"),
-        expected_deployment
+        fs::read_to_string(
+            home.path()
+                .join(".gemini/antigravity/skills/alpha/SKILL.md")
+        )
+        .expect("synced"),
+        "# Alpha\nedit"
+    );
+}
+
+/// J: several changed deployments require selection, which recipes cannot
+/// supply -- but once a genuine ambiguity is resolved interactively, the
+/// opposite propagation direction (project source copy synchronized down
+/// to the global deployment) must actually apply and write, not merely be
+/// previewed. Existing coverage only applied the global-to-project
+/// direction.
+#[test]
+fn import_project_to_global_propagation_actually_writes_in_the_reverse_direction() {
+    let (home, project) = import_ambiguous_fixture();
+    let mut import = cli(home.path());
+    import.current_dir(&project);
+    let output = import
+        .args(["import", "docwriter", "--claude"])
+        .write_stdin("1\n1\n")
+        .output()
+        .expect("choose the project copy, then import + update");
+    assert!(output.status.success());
+    assert!(
+        stdout_of(output)
+            .contains("Imported docwriter from claude \u{b7} project into Primary (source).")
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join("source/docwriter/SKILL.md")).expect("imported"),
+        "# Doc\nproject edit\n"
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join(".claude/skills/docwriter/SKILL.md"))
+            .expect("global deployment synced from the project copy"),
+        "# Doc\nproject edit\n"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join(".claude/skills/docwriter/SKILL.md"))
+            .expect("project deployment is the resolved source copy, left as-is"),
+        "# Doc\nproject edit\n"
     );
 }
 
@@ -3150,7 +4614,7 @@ fn home_directory_is_global_only_across_scoped_commands_and_configs() {
         .expect("inspect import at home");
     assert!(import.status.success());
     let import_stdout = String::from_utf8(import.stdout).expect("utf8 import output");
-    assert!(import_stdout.contains("From   claude · global"));
+    assert!(import_stdout.contains("From  claude · global"));
     assert!(!import_stdout.contains("project"));
 
     let status = json_events(
@@ -3287,308 +4751,6 @@ fn symlinked_home_spelling_is_still_global_only_when_supported() {
         .stderr(predicate::str::contains(
             "project scope is unavailable because the current directory is your global home",
         ));
-}
-
-#[test]
-fn import_can_sync_other_installed_targets_after_explicit_review() {
-    let home = sandbox();
-    let source = home.path().join("source");
-    let source_skill = create_skill(&source, "alpha", "# Original\n");
-    cli(home.path())
-        .args([
-            "--json",
-            "source",
-            "add",
-            source.to_str().expect("utf8 source"),
-            "primary",
-        ])
-        .assert()
-        .success();
-    cli(home.path())
-        .args(["--json", "load", "--claude", "--shared", "--global"])
-        .assert()
-        .success();
-    fs::write(
-        home.path().join(".claude/skills/alpha/SKILL.md"),
-        "# Imported\n",
-    )
-    .expect("edit import source");
-
-    let output = cli(home.path())
-        .args(["import", "alpha", "--claude", "--global"])
-        .write_stdin("y\n\n\n")
-        .output()
-        .expect("accept import and sync");
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).expect("utf8 import output");
-    let stderr = String::from_utf8(output.stderr).expect("utf8 prompts");
-    assert!(stderr.contains("other installed deployment needs this change"));
-    assert!(stderr.contains("Apply this update plan to 3 enabled targets?"));
-    assert!(stdout.contains("Update plan"));
-    assert!(
-        stdout.contains("\n\nUpdate plan"),
-        "the embedded import follow-up plan needs a leading separator: {stdout}"
-    );
-    assert!(stdout.contains("Updated alpha -> shared (global)"));
-    assert_eq!(
-        fs::read_to_string(source_skill.join("SKILL.md")).expect("imported source"),
-        "# Imported\n"
-    );
-    assert_eq!(
-        fs::read_to_string(home.path().join(".agents/skills/alpha/SKILL.md"))
-            .expect("synced shared deployment"),
-        "# Imported\n"
-    );
-}
-
-#[test]
-fn import_syncs_the_same_targets_opposite_scope_in_both_directions() {
-    let home = sandbox();
-    let project = home.path().join("project");
-    fs::create_dir_all(&project).expect("create project");
-    let source = home.path().join("source");
-    let source_skill = create_skill(&source, "alpha", "# Original\n");
-    cli(home.path())
-        .args([
-            "--json",
-            "source",
-            "add",
-            source.to_str().expect("utf8 source"),
-            "primary",
-        ])
-        .assert()
-        .success();
-    cli(home.path())
-        .args(["--json", "load", "--claude", "--global"])
-        .assert()
-        .success();
-    let mut project_load = cli(home.path());
-    project_load
-        .current_dir(&project)
-        .args(["--json", "load", "--claude", "--project"])
-        .assert()
-        .success();
-
-    let global = home.path().join(".claude/skills/alpha/SKILL.md");
-    let project_copy = project.join(".claude/skills/alpha/SKILL.md");
-    fs::write(&global, "# From global\n").expect("edit global deployment");
-    let mut from_global = cli(home.path());
-    let output = from_global
-        .current_dir(&project)
-        .args(["import", "alpha", "--claude", "--global", "--yes"])
-        .write_stdin("\n\n")
-        .output()
-        .expect("import global then sync project");
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).expect("utf8 global import output");
-    assert!(stdout.contains("Updated alpha -> claude (project)"));
-    assert!(!stdout.contains("Updated alpha -> claude (global)"));
-    assert_eq!(stdout.matches("Updated alpha -> claude").count(), 1);
-    assert_eq!(
-        fs::read_to_string(source_skill.join("SKILL.md")).expect("source from global"),
-        "# From global\n"
-    );
-    assert_eq!(
-        fs::read_to_string(&project_copy).expect("project synced from global"),
-        "# From global\n"
-    );
-
-    fs::write(&project_copy, "# From project\n").expect("edit project deployment");
-    let mut from_project = cli(home.path());
-    let output = from_project
-        .current_dir(&project)
-        .args(["import", "alpha", "--claude", "--project", "--yes"])
-        .write_stdin("\n\n")
-        .output()
-        .expect("import project then sync global");
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).expect("utf8 project import output");
-    assert!(stdout.contains("Updated alpha -> claude (global)"));
-    assert!(!stdout.contains("Updated alpha -> claude (project)"));
-    assert_eq!(stdout.matches("Updated alpha -> claude").count(), 1);
-    assert_eq!(
-        fs::read_to_string(source_skill.join("SKILL.md")).expect("source from project"),
-        "# From project\n"
-    );
-    assert_eq!(
-        fs::read_to_string(&global).expect("global synced from project"),
-        "# From project\n"
-    );
-}
-
-#[test]
-fn declining_import_sync_plan_keeps_the_successful_import_unambiguous() {
-    let home = sandbox();
-    let source = home.path().join("source");
-    let source_skill = create_skill(&source, "alpha", "# Original\n");
-    cli(home.path())
-        .args([
-            "--json",
-            "source",
-            "add",
-            source.to_str().expect("utf8 source"),
-            "primary",
-        ])
-        .assert()
-        .success();
-    cli(home.path())
-        .args(["--json", "load", "--claude", "--shared", "--global"])
-        .assert()
-        .success();
-    fs::write(
-        home.path().join(".claude/skills/alpha/SKILL.md"),
-        "# Imported\n",
-    )
-    .expect("edit import source");
-
-    let output = cli(home.path())
-        .args(["import", "alpha", "--claude", "--global", "--yes"])
-        .write_stdin("\nn\n")
-        .output()
-        .expect("decline follow-up plan application");
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).expect("utf8 import output");
-    assert!(
-        stdout.contains("Imported successfully; other installed deployments were not updated.")
-    );
-    assert!(!stdout.contains("Cancelled."));
-    assert_eq!(
-        fs::read_to_string(source_skill.join("SKILL.md")).expect("source was imported"),
-        "# Imported\n"
-    );
-    assert_eq!(
-        fs::read_to_string(home.path().join(".agents/skills/alpha/SKILL.md"))
-            .expect("shared deployment unchanged"),
-        "# Original\n"
-    );
-}
-
-#[test]
-fn import_follow_up_can_be_declined_and_is_skipped_noninteractively() {
-    for noninteractive in [false, true] {
-        let home = sandbox();
-        let source = home.path().join("source");
-        create_skill(&source, "alpha", "# Original\n");
-        cli(home.path())
-            .args([
-                "--json",
-                "source",
-                "add",
-                source.to_str().expect("utf8 source"),
-                "primary",
-            ])
-            .assert()
-            .success();
-        cli(home.path())
-            .args(["--json", "load", "--claude", "--shared", "--global"])
-            .assert()
-            .success();
-        fs::write(
-            home.path().join(".claude/skills/alpha/SKILL.md"),
-            "# Imported\n",
-        )
-        .expect("edit import source");
-
-        let output = if noninteractive {
-            cli(home.path())
-                .args([
-                    "import",
-                    "alpha",
-                    "--claude",
-                    "--global",
-                    "--yes",
-                    "--no-input",
-                ])
-                .output()
-                .expect("noninteractive import")
-        } else {
-            cli(home.path())
-                .args(["import", "alpha", "--claude", "--global", "--yes"])
-                .write_stdin("n\n")
-                .output()
-                .expect("declined import sync")
-        };
-        assert!(output.status.success());
-        let stderr = String::from_utf8(output.stderr).expect("utf8 prompts");
-        if noninteractive {
-            assert!(!stderr.contains("other installed deployment"));
-        } else {
-            assert!(stderr.contains("other installed deployment"));
-        }
-        assert_eq!(
-            fs::read_to_string(home.path().join(".agents/skills/alpha/SKILL.md"))
-                .expect("shared remains unchanged"),
-            "# Original\n"
-        );
-    }
-}
-
-#[test]
-fn import_follow_up_is_absent_without_an_outdated_target_and_during_dry_run() {
-    let home = sandbox();
-    let source = home.path().join("source");
-    create_skill(&source, "alpha", "# Original\n");
-    cli(home.path())
-        .args([
-            "--json",
-            "source",
-            "add",
-            source.to_str().expect("utf8 source"),
-            "primary",
-        ])
-        .assert()
-        .success();
-    cli(home.path())
-        .args(["--json", "load", "--claude", "--global"])
-        .assert()
-        .success();
-    fs::write(
-        home.path().join(".claude/skills/alpha/SKILL.md"),
-        "# Imported\n",
-    )
-    .expect("edit deployment");
-    let single = cli(home.path())
-        .args(["import", "alpha", "--claude", "--global"])
-        .write_stdin("y\n")
-        .output()
-        .expect("single-target import");
-    assert!(single.status.success());
-    assert!(
-        !String::from_utf8(single.stderr)
-            .expect("utf8 prompts")
-            .contains("other installed deployment")
-    );
-
-    cli(home.path())
-        .args(["--json", "load", "--shared", "--global"])
-        .assert()
-        .success();
-    fs::write(
-        home.path().join(".claude/skills/alpha/SKILL.md"),
-        "# Dry run\n",
-    )
-    .expect("edit deployment again");
-    let dry_run = cli(home.path())
-        .args([
-            "import",
-            "alpha",
-            "--claude",
-            "--global",
-            "--dry-run",
-            "--no-input",
-        ])
-        .output()
-        .expect("dry-run import");
-    assert!(dry_run.status.success());
-    assert!(
-        !String::from_utf8(dry_run.stderr)
-            .expect("utf8 dry-run diagnostics")
-            .contains("other installed deployment")
-    );
-    assert_eq!(
-        fs::read_to_string(source.join("alpha/SKILL.md")).expect("dry-run source"),
-        "# Imported\n"
-    );
 }
 
 #[test]

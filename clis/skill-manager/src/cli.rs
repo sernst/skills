@@ -224,6 +224,7 @@ pub struct UpdateArgs {
 }
 
 /// Arguments for `import`.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Default, Args)]
 pub struct ImportArgs {
     /// Exactly one deployed skill name; patterns are not accepted.
@@ -235,6 +236,15 @@ pub struct ImportArgs {
     /// Installation scope narrowing the scanned deployments.
     #[command(flatten)]
     pub scope: ScopeSelection,
+    /// Resolve propagation to import + update (recommended).
+    ///
+    /// Mutually exclusive with `--no-update`: this answers the propagation
+    /// dimension itself, never implied by `--yes`.
+    #[arg(long, conflicts_with = "no_update")]
+    pub update: bool,
+    /// Resolve propagation to import only, leaving other deployments as-is.
+    #[arg(long)]
+    pub no_update: bool,
     /// Plan without changing the source.
     #[arg(long)]
     pub dry_run: bool,

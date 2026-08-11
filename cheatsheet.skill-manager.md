@@ -146,33 +146,46 @@ skill as the new canonical source content.
 | `--all` | Consider all enabled configured targets. |
 | `--target NAME` | Narrow detection to a configured target; repeatable. |
 | `--global`/`-g`, `--project`/`-p` | Narrow detection to one scope. |
+| `--update` | Resolve propagation to import + update (recommended); mutually exclusive with `--no-update`. |
+| `--no-update` | Resolve propagation to import only, leaving other deployments as-is. |
 | `--dry-run` | Show the plan without writing to the source. |
-| `--yes`/`-y` | Skip the destructive source-overwrite confirmation. |
+| `--yes`/`-y` | Skip the destructive source-overwrite confirmation; does not resolve propagation. |
 
 Exactly one skill name is accepted; patterns are not. The skill is resolved
 through the same first-source-wins discovery as `load`. Candidates are deployed
 copies that differ from the source; identical copies are never candidates, and
-having none is a clean success. One candidate is preselected, and several
-require an interactive choice or narrower target/scope flags.
+having none is a clean success.
 
-Before writing, `import` prints concise source and `target · scope` names, a
-git-style per-file summary (`added`/`modified`/`deleted` with `+N/-N`, or a byte
-delta for binary content), and a totals line; `--verbose` adds full paths. The
-confirmation defaults to no.
-Applying it makes the source directory byte-identical to the chosen deployed
-copy, including deleting source files the deployment no longer has, through the
-same staged, journaled transaction used for deployments.
+Import has two decision dimensions, and the complete plan for both always
+renders before any prompt. With more than one candidate copy, the plan numbers
+each one with its path, its diff against the source, and a nested per-copy
+preview of what propagating that copy would do to every other deployment,
+under a deferred `Propagation modes (chosen after the source copy)` heading.
+A single token resolves source copy (`c` cancels; invalid/empty input
+reprompts, never auto-selects); with exactly one candidate, or when every
+candidate is byte-identical to the others, this dimension resolves silently
+in configured order. Answering it re-renders the plan narrowed by that
+choice: the resolved dimension and every non-selected copy disappear, and the
+chosen copy demotes to ordinary `From`/`Path` metadata.
 
-After a successful interactive import, other enabled installed copies that are
-now outdated can be reviewed in the standard update plan and synchronized after
-a second confirmation. This includes another scope of the imported target.
-Nothing is offered when every other copy is current, or in JSON, `--no-input`,
-or `--dry-run` mode. Import `--yes` never approves this follow-up implicitly.
+The remaining dimension is propagation mode — `1 Import + update
+(recommended)` or `2 Import only` — resolved by `--update`/`--no-update` or
+one more single-token prompt; neither flag is implied by `--yes`. It resolves
+silently instead, with no flag and no prompt, whenever the resolved source
+copy would leave nothing else out of date. When asked, this is always the
+final prompt, so its answer applies immediately with **no trailing `[y/N]`**.
+Applying makes the source directory byte-identical to the chosen deployed
+copy, including deleting source files the deployment no longer has, through
+the same staged, journaled transaction used for deployments, then performs
+the resolved propagation. `--verbose` adds full paths. `--dry-run` renders
+the complete plan and writes nothing.
 
 Import writes to local source checkouts only. A GitHub-backed source needs a
-local alternate location and an interactive confirmation;
-without a resolvable local destination the command fails rather than guessing.
-Both only apply once a candidate exists, so an up-to-date source never prompts.
+configured local alternate location; without one the command fails rather
+than guessing. Once an alternate is configured, import proceeds exactly like
+any other source, interactively or not. The alternate check only runs once a
+changed candidate exists, so an up-to-date source never fails over a
+destination it would not write.
 
 ### `copy`
 
@@ -384,7 +397,7 @@ errors are NDJSON on stdout. A partial transaction emits committed action events
 before `command.failed`; do not discard them.
 
 Important events include `skill.loaded`, `skill.updated`, `skill.copied`,
-`skill.removed`, `skill.skipped`, `skill.import-planned`, `skill.imported`,
+`skill.removed`, `skill.skipped`, `skill.imported`,
 `skill.import-skipped`, `status.row`, `collision.detected`,
 `collision.resolved`, source/target/config lifecycle events, `diagnostic`,
 `summary`, `command.cancelled`, and `command.failed`. See

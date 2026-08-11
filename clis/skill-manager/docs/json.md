@@ -74,10 +74,25 @@ and paths but never include backup bytes. Layout migration emits
 A mutating command that renders a plan for review also emits one event per
 rendered revision, always before anything is written: `plan` for revision `0`
 and `plan.updated` for every narrowed re-render that follows. `update`, `load`,
-`copy`, and `remove` emit it today; `import` adopts it as it migrates. `remove`
-always emits a single revision `0` — an ambiguous scope is one decision
-resolved by one prompt, not a re-rendered sequence, so it never emits
-`plan.updated`.
+`copy`, `remove`, and `import` all emit it. `remove` always emits a single
+revision `0` — an ambiguous scope is one decision resolved by one prompt, not
+a re-rendered sequence, so it never emits `plan.updated`. `import` is the only
+command whose plan can carry more than one decision (source copy, then
+propagation mode), so it is the only command that can emit `plan.updated` —
+one per nonfinal answer, before the corresponding narrowed re-render; the
+final answer needs no extra revision because applying begins immediately.
+Propagation resolves silently (no flag, no prompt) whenever the resolved
+source copy would leave nothing else out of date, so a single-deployment or
+already-synchronized import can commit with `yes:true` alone. Otherwise, every
+non-interactive carrier (`--json`, `--json-input`, `--input`, plain
+`--no-input`) resolves a decision only when the caller actually supplied the
+flag or recipe field it needs — an unresolved decision is never guessed. A
+`--dry-run` render can therefore still show decisions pending (see
+`authorization.pending` in the example below), and a committed `--yes`/
+`yes:true` call fails outright while a genuine decision remains open.
+`plan.updated` is only ever produced by a live interactive terminal session,
+since every non-interactive carrier either commits or fails at revision `0`
+without narrowing.
 
 ```json
 {

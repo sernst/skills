@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 
+use crate::authorize::selection_range;
 use crate::authorize::{Authorization, Authorizer, SelectionOption};
 use crate::cache::{GitHubTransport, materialize_source};
 use crate::cli::{
@@ -28,15 +29,14 @@ use crate::domain::{
 use crate::error::{Result, SkillManagerError};
 use crate::event::{Level, Reporter};
 use crate::plan::{
-    DiffStat, GroupedUpdateEntry, PlanAction, creation_line, diff_directories, file_change_lines,
-    grouped_update_table, totals_line,
+    DiffStat, FileChange, FileDelta, PlanAction, creation_line, diff_directories, totals_line,
 };
 use crate::prompt::Prompt;
 use crate::review::{
     ChangePlan, Decision, DecisionOption, Destination, DestinationKind, OptionConsequence,
-    PlanAuthorization, PlanRow, PlanSelection, PlannedAction, RenderStyle, ResultEntry,
-    ResultMarker, colored, destination_label, location_of, location_text, plan_event_data,
-    render_plan, result_footer,
+    OptionDetail, PlanAuthorization, PlanRow, PlanSelection, PlannedAction, PreviewBlock,
+    PreviewEntry, PreviewField, RenderStyle, ResultEntry, ResultMarker, colored, destination_label,
+    location_of, location_text, plan_event_data, plan_event_name, render_plan, result_footer,
 };
 use crate::skills::{
     PatternExpansion, deployed_skills, detect_skill_dirs, directories_equal, directory_files,
@@ -60,8 +60,6 @@ struct SyncStep {
     same: bool,
 }
 
-type TargetSpecificChangeDetails = Vec<(String, Vec<(String, Scope, String)>)>;
-
 /// One deployed copy that differs from its source and can be imported.
 #[derive(Clone)]
 struct ImportCandidate {
@@ -69,6 +67,22 @@ struct ImportCandidate {
     scope: Scope,
     deployment: PathBuf,
     stat: DiffStat,
+}
+
+/// One enabled, populated deployment considered for propagation, regardless
+/// of whether it becomes the resolved import source.
+///
+/// Propagation breadth is invariant to `--target`/`--scope`: it always walks
+/// every enabled target and both scopes, mirroring the legacy
+/// `offer_import_sync` sweep, so narrowing which copy supplies the source
+/// content never narrows what that content would reach.
+#[derive(Clone)]
+struct ImportDeployment {
+    id: String,
+    label: String,
+    target: Target,
+    scope: Scope,
+    path: PathBuf,
 }
 
 /// Scope roots and whether the current directory represents a real project.
@@ -121,20 +135,6 @@ struct RemoveApplyItem {
     target: Target,
     scope: Scope,
     root: PathBuf,
-}
-
-#[derive(Clone, Copy)]
-struct UpdatePlanOptions {
-    implicit_targets: bool,
-    dry_run: bool,
-    confirmed: bool,
-    context: UpdatePlanContext,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum UpdatePlanContext {
-    Direct,
-    ImportFollowUp,
 }
 
 /// Everything `update` needs after discovery to review, authorize, and apply.
@@ -1432,6 +1432,25 @@ where
         })
     }
 
+    /// Emit the import summary event from one shared, auditable site.
+    fn report_import_summary(
+        &mut self,
+        imported: usize,
+        skipped: usize,
+        dry_run: bool,
+    ) -> Result<()> {
+        self.reporter.event(
+            "summary",
+            Level::Info,
+            json!({
+                "action": "import",
+                "imported": imported,
+                "skipped": skipped,
+                "dry_run": dry_run
+            }),
+        )
+    }
+
     /// Emit the load/update summary event from one shared, auditable site.
     fn report_sync_summary(
         &mut self,
@@ -2024,93 +2043,6 @@ where
         self.reporter.human(&message)
     }
 
-    /// Display the update plan and, when interactive, confirm it once.
-    ///
-    /// Machine mode keeps its existing event-only contract, so the plan is a
-    /// human-output feature. A dry run and `--yes` both display the plan
-    /// without prompting.
-    fn confirm_update_plan(
-        &mut self,
-        steps: &[SyncStep],
-        target_names: &[String],
-        options: UpdatePlanOptions,
-    ) -> Result<bool> {
-        if self.reporter.is_json() || steps.is_empty() {
-            return Ok(true);
-        }
-        let actionable = steps.iter().filter(|step| !step.same).collect::<Vec<_>>();
-        if actionable.is_empty() {
-            let skills = steps
-                .iter()
-                .map(|step| step.candidate.name.as_str())
-                .collect::<BTreeSet<_>>();
-            let message = if skills.len() == 1 {
-                format!(
-                    "{} is up to date across {}.",
-                    skills
-                        .iter()
-                        .next()
-                        .copied()
-                        .unwrap_or("The selected skill"),
-                    target_selection_label(target_names.len(), options.implicit_targets)
-                )
-            } else {
-                format!(
-                    "All installed skills are up to date across {}.",
-                    target_selection_label(target_names.len(), options.implicit_targets)
-                )
-            };
-            self.reporter.human(&message)?;
-            return Ok(true);
-        }
-
-        let (entries, target_specific_details) = grouped_update_entries(&actionable, target_names)?;
-        if options.context == UpdatePlanContext::ImportFollowUp {
-            self.reporter.human("")?;
-        }
-        self.reporter.human(&styled_heading(
-            "Update plan",
-            self.reporter.color_enabled(),
-        ))?;
-        self.reporter.human("")?;
-        for line in grouped_update_table(&entries, target_names, self.reporter.color_enabled()) {
-            self.reporter.human(&line)?;
-        }
-        if !target_specific_details.is_empty() {
-            self.reporter.human("")?;
-            self.reporter.human("Target-specific changes")?;
-            for (skill, deployments) in target_specific_details {
-                self.reporter.human(&format!("  {skill}"))?;
-                for (target, scope, totals) in deployments {
-                    self.reporter
-                        .human(&format!("    {target} · {}  {totals}", scope.as_str()))?;
-                }
-            }
-        }
-        self.reporter.human("")?;
-        self.reporter.human(&format!(
-            "{} across {}",
-            counted_noun(actionable.len(), "update"),
-            target_selection_label(target_names.len(), options.implicit_targets)
-        ))?;
-        if options.dry_run || options.confirmed || self.no_input {
-            return Ok(true);
-        }
-        if self.prompt.confirm(
-            &format!(
-                "Apply this update plan to {}?",
-                target_selection_label(target_names.len(), options.implicit_targets)
-            ),
-            true,
-        )? {
-            return Ok(true);
-        }
-        if options.context == UpdatePlanContext::Direct {
-            self.report_cancelled("update")?;
-        }
-        Ok(false)
-    }
-
     /// Review, authorize, and apply the copy plan.
     ///
     /// `copy` has one arbitrary path destination, so its plan is the shared
@@ -2308,8 +2240,20 @@ where
             .is_approved())
     }
 
-    // Import resolves one source, detects divergent deployments, plans, confirms,
-    // and mirrors in a single ordered operation.
+    /// Import an explicit skill by reviewing the complete two-dimensional
+    /// plan -- source-copy selection, then propagation mode -- before any
+    /// prompt.
+    ///
+    /// Both dimensions live in the shared plan-review model as sibling
+    /// [`Decision`]s: `source_copy` first, `propagation` deferred behind it.
+    /// `source_copy` is always present, even with exactly one candidate, so
+    /// the resolved/pending shape never varies by candidate count; gating
+    /// alone decides whether it ever earns a rendered question. Answering
+    /// `source_copy` narrows and re-renders `propagation` (unless
+    /// `propagation` was already resolved by flag, in which case answering
+    /// `source_copy` was the final decision and apply begins immediately, per
+    /// the "no extra revision" rule); answering `propagation` always applies
+    /// immediately, since it is provably the last dimension.
     #[allow(clippy::too_many_lines)]
     fn run_import(&mut self, config: &Config, args: &ImportArgs) -> Result<bool> {
         if is_fnmatch_operand(&args.skill) {
@@ -2336,9 +2280,12 @@ where
                 kind: "source skill",
                 reference: args.skill.clone(),
             })?;
-        // Detection compares deployments with the materialized source, so it runs
-        // before the destination is resolved. Nothing to import must never ask
-        // where an import would have been written.
+
+        // Detection compares deployments with the source's own content, so it
+        // runs before the destination is resolved: nothing-to-import must
+        // never ask where an import would have been written. `--target`/
+        // `--scope` narrow which candidate can become the source here, but
+        // never the propagation breadth computed further below.
         let target_templates = self.select_target_templates(config, &args.targets)?;
         let scope_context = scope_context(&self.home)?;
         let project_root = &scope_context.project_root;
@@ -2354,345 +2301,734 @@ where
                 detected.push((target.target, *scope, deployment));
             }
         }
-
-        let mut imported = 0_usize;
-        let mut skipped = 0_usize;
         if detected.is_empty() {
-            skipped = 1;
             self.reporter.human(&format!(
-                "Nothing to import: {} source is up to date with every selected deployment.",
-                candidate.name
+                "{} has no changed deployment to import from the enabled targets in {} scope.",
+                candidate.name,
+                scope_phrase(&args.scope)
             ))?;
             self.reporter.event(
                 "skill.import-skipped",
                 Level::Info,
                 skill_import_skipped_data(&candidate, args.dry_run),
             )?;
-        } else {
-            let Some(destination) = self.import_destination(&candidate)? else {
-                return Ok(false);
+            self.report_import_summary(0, 1, args.dry_run)?;
+            return Ok(true);
+        }
+
+        let (destination, used_alternate) = import_destination(&candidate)?;
+        let mut candidates = Vec::with_capacity(detected.len());
+        for (target, scope, deployment) in detected {
+            let stat = diff_directories(&destination, &deployment)?;
+            candidates.push(ImportCandidate {
+                target,
+                scope,
+                deployment,
+                stat,
+            });
+        }
+        // Source copies follow effective project scope first, then
+        // configured target order -- deliberately different from the
+        // propagation breadth below, which stays target-major so it matches
+        // `remove_destinations`'s own convention.
+        candidates.sort_by_key(|item| {
+            let scope_rank = match item.scope {
+                Scope::Project => 0,
+                Scope::Global => 1,
             };
-            let mut candidates = Vec::with_capacity(detected.len());
-            for (target, scope, deployment) in detected {
-                let stat = diff_directories(&destination, &deployment)?;
-                candidates.push(ImportCandidate {
-                    target,
-                    scope,
-                    deployment,
-                    stat,
+            let target_rank = target_templates
+                .iter()
+                .position(|template| fold(&template.target.name) == fold(&item.target.name))
+                .unwrap_or(usize::MAX);
+            (scope_rank, target_rank)
+        });
+
+        let source_label = source_display_name(&candidate.source.entry).to_owned();
+        let source_destination_id = format!("{source_label}:source");
+        let into_value = if used_alternate {
+            format!(
+                "{source_label} local alternate ({})",
+                portable_canonicalize(&destination).display()
+            )
+        } else {
+            format!("{source_label} (source)")
+        };
+
+        let propagation_templates =
+            self.select_target_templates(config, &TargetSelection::default())?;
+        let propagation_target_names = propagation_templates
+            .iter()
+            .map(|template| template.target.name.clone())
+            .collect::<Vec<_>>();
+        let propagation_scopes =
+            available_scopes(&ScopeSelection::default(), scope_context.project_available);
+        let mut deployed = Vec::new();
+        for template in &propagation_templates {
+            for scope in &propagation_scopes {
+                let target = scoped_target(template, *scope, &self.home, project_root);
+                let path = target.target.path.join(&candidate.name);
+                if !path.is_dir() {
+                    continue;
+                }
+                deployed.push(ImportDeployment {
+                    id: destination_id(&template.target.name, *scope),
+                    label: format!("{} · {}", template.target.name, scope.as_str()),
+                    target: target.target,
+                    scope: *scope,
+                    path,
                 });
             }
-            let index = self.select_import_candidate(&candidate.name, &candidates)?;
-            let selection = candidates.get(index).cloned().ok_or_else(|| {
-                SkillManagerError::InvalidInput("import selection is out of range".into())
-            })?;
-            self.render_import_plan(&candidate, &selection, &destination)?;
-            self.reporter.event(
-                "skill.import-planned",
-                Level::Info,
-                skill_import_data(
-                    &candidate,
-                    &selection,
-                    &destination,
-                    args.dry_run,
-                    "planned",
-                ),
-            )?;
-            if !self.confirm_import(&candidate, &selection, args.dry_run, args.yes)? {
-                return Ok(false);
-            }
-            if !args.dry_run && !args.yes && !self.no_input {
-                self.reporter.human("")?;
-            }
-            if !args.dry_run {
-                import_skill(
-                    &selection.deployment,
-                    &destination,
-                    self.repository.cache_root(),
-                    self.hook,
-                )?;
-            }
-            imported = 1;
-            let source_label = source_display_name(&candidate.source.entry);
-            self.reporter.human(&format!(
-                "Imported {} from {} · {} into {} (source){}.",
-                candidate.name,
-                selection.target.name,
-                selection.scope.as_str(),
-                source_label,
-                if args.dry_run { " (dry-run)" } else { "" }
-            ))?;
-            self.reporter.event(
-                "skill.imported",
-                Level::Info,
-                skill_import_data(
-                    &candidate,
-                    &selection,
-                    &destination,
-                    args.dry_run,
-                    "imported",
-                ),
-            )?;
-            if !args.dry_run && !self.no_input && !self.reporter.is_json() {
-                self.offer_import_sync(config, &candidate, &selection, &destination)?;
-            }
         }
-        self.reporter.event(
-            "summary",
-            Level::Info,
-            json!({
-                "action": "import",
-                "imported": imported,
-                "skipped": skipped,
-                "dry_run": args.dry_run
-            }),
-        )?;
-        Ok(true)
-    }
 
-    /// Resolve the local source directory an import may overwrite.
-    ///
-    /// Returns `Ok(None)` when the user declines a GitHub-backed source's local
-    /// alternate location.
-    fn import_destination(&mut self, candidate: &SkillCandidate) -> Result<Option<PathBuf>> {
-        let entry = &candidate.source.entry;
-        if entry.source_type == SourceType::Local {
-            return Ok(Some(portable_path(&candidate.path)));
+        let mut destinations = vec![import_source_destination(&source_label)];
+        destinations.extend(remove_destinations(&propagation_target_names));
+
+        let mut source_options = Vec::with_capacity(candidates.len());
+        // `updated`/`skipped` per candidate, in the same order as `candidates`,
+        // so genuineness (below) can be evaluated per option without
+        // recomputing every candidate's own propagation diff twice.
+        let mut per_candidate = Vec::with_capacity(candidates.len());
+        for (index, item) in candidates.iter().enumerate() {
+            let (option, entries, updated, skipped) =
+                import_source_option(item, index, &source_destination_id, &deployed)?;
+            source_options.push(option);
+            per_candidate.push((entries, updated, skipped));
         }
-        let Some(SourceLocation::Local { path }) = entry.alternate.clone() else {
-            return Err(SkillManagerError::InvalidInput(format!(
-                "import writes to local source checkouts only; '{}' is GitHub-backed ({}) and has no local alternate location. Add one with: skill-manager source alternate {} <local-path>",
-                entry.name,
-                source_reference(entry),
-                entry.name
-            )));
-        };
-        let destination = portable_path(&if entry.mode == SourceMode::Single {
-            path
+
+        // A source copy that is byte-identical to every other candidate is
+        // not a genuine branch either -- adopting any of them produces the
+        // same resulting source and the same (empty) propagation, so forcing
+        // a choice between them would ask a question with no observable
+        // answer. Resolve to the first in configured order instead, exactly
+        // like the single-real-candidate case already does.
+        let all_candidates_identical = candidates.len() > 1
+            && candidates.iter().skip(1).all(|item| {
+                diff_directories(&candidates[0].deployment, &item.deployment)
+                    .is_ok_and(|stat| stat.is_empty())
+            });
+        let source_resolved_index =
+            (candidates.len() == 1 || all_candidates_identical).then_some(0);
+        // The footer's "N source copies" wording describes how many genuine
+        // alternatives a reader could have been asked to choose between.
+        // When every candidate collapsed to one by byte-identity (never
+        // offered as a choice at all), that count is 1, not `candidates.len()`
+        // -- otherwise a plan that never rendered an `Available source
+        // copies` section would still claim "2 source copies" pending,
+        // falsely implying an unresolved choice existed.
+        let genuine_candidates = if all_candidates_identical {
+            1
         } else {
-            path.join(&candidate.name)
-        });
-        if self.no_input {
-            return Err(SkillManagerError::InteractionRequired(format!(
-                "'{}' is GitHub-backed; importing into its local alternate requires interactive confirmation",
-                entry.name
-            )));
-        }
-        if self.prompt.confirm(
-            &format!(
-                "'{}' is GitHub-backed ({}); import into its local alternate instead?",
-                entry.name,
-                source_reference(entry)
-            ),
-            false,
-        )? {
-            return Ok(Some(destination));
-        }
-        self.report_cancelled("import")?;
-        Ok(None)
-    }
+            candidates.len()
+        };
 
-    /// Choose which divergent deployment supplies the imported content.
-    fn select_import_candidate(
-        &mut self,
-        skill: &str,
-        candidates: &[ImportCandidate],
-    ) -> Result<usize> {
-        if candidates.len() == 1 {
-            return Ok(0);
-        }
-        if self.no_input {
-            return Err(SkillManagerError::InteractionRequired(format!(
-                "{} changed deployments of {skill} are importable; narrow the selection with --target, --global, or --project",
-                candidates.len()
-            )));
-        }
-        let choices = candidates
-            .iter()
-            .map(|item| {
-                format!(
-                    "{} · {}  {}",
-                    item.target.name,
-                    item.scope.as_str(),
-                    totals_line(&item.stat)
-                )
-            })
-            .collect::<Vec<_>>();
-        self.prompt
-            .choose(&format!("Choose the {skill} copy to import"), &choices)
-    }
+        // Propagation is a genuine second dimension only when the resolved
+        // source copy would actually leave at least one other deployment
+        // out of date. When every candidate is degenerate this way, no
+        // possible answer to `source_copy` could ever make propagation
+        // matter, so it resolves silently right here, at revision 0, rather
+        // than deferring a question whose answer is already known. A mixed
+        // population (some candidates genuine, some not) is provably
+        // unreachable under this per-candidate diff model: degeneracy for a
+        // candidate requires every *other* deployment (candidate or
+        // bystander) to already match it, so if any two deployments differ
+        // anywhere in the set, every candidate is genuine; otherwise every
+        // candidate is degenerate. There is no in-between at revision 0.
+        //
+        // An explicit `--update`/`--no-update` always wins over the silent
+        // degenerate default: the degenerate default exists only to spare
+        // the user a question with no observable answer, never to overrule
+        // a choice they actually made. The machine `resolved` value must
+        // stay honest about which mode was asked for even when it turns out
+        // to change nothing -- see `import_resolved_footer` and
+        // `import_result_footer` for how the human-facing renders still
+        // avoid printing the resulting zero counts.
+        let all_degenerate = per_candidate.iter().all(|(_, updated, _)| *updated == 0);
+        let propagation_resolved_id: Option<String> = if args.update {
+            Some("import-update".to_owned())
+        } else if args.no_update || all_degenerate {
+            Some("import-only".to_owned())
+        } else {
+            None
+        };
 
-    /// Render the human-reviewable import plan.
-    fn render_import_plan(
-        &mut self,
-        candidate: &SkillCandidate,
-        selection: &ImportCandidate,
-        destination: &Path,
-    ) -> Result<()> {
-        let color = self.reporter.color_enabled();
-        let location = format!("{} · {}", selection.target.name, selection.scope.as_str());
-        let source_label = format!("{} (source)", source_display_name(&candidate.source.entry));
-        self.reporter.human("")?;
-        self.reporter.human(&styled_heading(
-            &format!("Import {}", candidate.name),
-            color,
-        ))?;
-        self.reporter.human("")?;
-        self.reporter.human(&format!("  From   {location}"))?;
-        self.reporter.human(&format!("  Into   {source_label}"))?;
-        if self.reporter.verbose() {
-            self.reporter.human("")?;
-            self.reporter.human(&format!(
-                "  Deployment path   {}",
-                portable_canonicalize(&selection.deployment).display()
-            ))?;
-            self.reporter.human(&format!(
-                "  Source path       {}",
-                portable_canonicalize(destination).display()
-            ))?;
-        }
-        self.reporter.human("")?;
-        self.reporter.human(&styled_heading("Changes", color))?;
-        if !selection.stat.is_empty() {
-            self.reporter.human("")?;
-            for line in file_change_lines(&selection.stat, self.reporter.is_interactive(), color) {
-                self.reporter.human(&line)?;
+        // Reference totals use the first candidate whenever the source is
+        // still pending: nothing can be applied before a source is chosen, so
+        // a pre-resolution propagation preview is necessarily provisional.
+        // Once a candidate is resolved -- from the start or via the first
+        // prompt -- the propagation preview is always recomputed from that
+        // exact candidate (see the narrowing branch below and the E8 test),
+        // so the advertised numbers can never drift from what apply writes.
+        let reference_index = source_resolved_index.unwrap_or(0);
+        let (reference_entries, reference_updated, reference_skipped) = {
+            let (entries, updated, skipped) = &per_candidate[reference_index];
+            (entries.clone(), *updated, *skipped)
+        };
+
+        let source_decision = import_source_decision(
+            source_options.clone(),
+            source_resolved_index.map(|index| {
+                destination_id(&candidates[index].target.name, candidates[index].scope)
+            }),
+        );
+        let propagation_decision = import_propagation_decision(
+            deployed.len(),
+            reference_updated,
+            reference_skipped,
+            source_resolved_index.is_some(),
+            propagation_resolved_id.clone(),
+        );
+
+        // The "Mode" metadata line is reserved for a propagation answer the
+        // caller actually supplied; a silent (degenerate) resolution never
+        // earns it, since nothing was decided.
+        let both_resolved_from_start =
+            source_resolved_index.is_some() && !all_degenerate && propagation_resolved_id.is_some();
+        let mut metadata = Vec::new();
+        let mut blocks = Vec::new();
+        if let Some(index) = source_resolved_index {
+            let resolved = &candidates[index];
+            metadata.push((
+                "From".to_owned(),
+                format!("{} · {}", resolved.target.name, resolved.scope.as_str()),
+            ));
+            metadata.push((
+                "Path".to_owned(),
+                portable_canonicalize(&resolved.deployment)
+                    .display()
+                    .to_string(),
+            ));
+            metadata.push(("Into".to_owned(), into_value.clone()));
+            if both_resolved_from_start {
+                let mode_label = if propagation_resolved_id.as_deref() == Some("import-update") {
+                    "import + update (recommended, explicitly selected)"
+                } else {
+                    "import only (explicitly selected)"
+                };
+                metadata.push(("Mode".to_owned(), mode_label.to_owned()));
             }
+            blocks.push(PreviewBlock {
+                heading: "Source replacement".to_owned(),
+                heading_value: None,
+                lead: Some(format!(
+                    "{} {}",
+                    PlanAction::Import.symbol(),
+                    totals_line(&resolved.stat)
+                )),
+                lead_color: Some(33),
+                entries: import_source_entries(&resolved.stat),
+            });
+            // Every entry in this preview reads as a none-value (nothing to
+            // update anywhere) exactly when `reference_updated` is zero, so
+            // the whole block is elided then rather than showing an
+            // all-"already synchronized" block with nothing to teach.
+            if reference_updated > 0 {
+                if propagation_resolved_id.as_deref() == Some("import-only") {
+                    // Propagation was explicitly resolved to import-only, so
+                    // nothing will be written -- rendering this as a
+                    // "Propagation preview" using the update symbol would
+                    // promise writes on the very line before the footer
+                    // says those deployments are being left out of date.
+                    // Reframe as staleness instead, using the same
+                    // "actions" the option's own consequence carries (never
+                    // a fresh diff), so the count can never drift from what
+                    // choosing this candidate actually enumerated. Entries
+                    // that are already synchronized -- including the
+                    // resolved copy's own identity -- carry nothing under
+                    // this framing and are dropped.
+                    let reference_actions =
+                        &source_options[reference_index].consequence.actions[1..];
+                    blocks.push(import_staleness_block(&deployed, reference_actions));
+                } else {
+                    blocks.push(PreviewBlock {
+                        heading: "Propagation preview".to_owned(),
+                        entries: reference_entries.clone(),
+                        ..PreviewBlock::default()
+                    });
+                }
+            }
+        } else {
+            metadata.push(("Into".to_owned(), into_value.clone()));
         }
-        self.reporter.human(&totals_line(&selection.stat))?;
-        self.reporter.human("")
-    }
 
-    /// Confirm the destructive source overwrite unless it was pre-approved.
-    fn confirm_import(
-        &mut self,
-        candidate: &SkillCandidate,
-        selection: &ImportCandidate,
-        dry_run: bool,
-        confirmed: bool,
-    ) -> Result<bool> {
-        if dry_run || confirmed {
+        let style = self.render_style();
+        let prompting = !args.dry_run && !args.yes && !self.no_input;
+        let plan = ChangePlan {
+            command: "import".to_owned(),
+            plan_id: format!("import:{}", candidate.name),
+            heading: "Import plan".to_owned(),
+            metadata,
+            destinations,
+            body_heading: None,
+            metric_header: None,
+            detail_heading: "Destination-specific changes".to_owned(),
+            connector: None,
+            rows: Vec::new(),
+            blocks,
+            decisions: vec![source_decision, propagation_decision],
+            prompting,
+            distinguishes_overwrites: false,
+        };
+        let view = plan.view();
+        let pending_ids = view
+            .decisions()
+            .iter()
+            .map(|decision| decision.id.clone())
+            .collect::<Vec<_>>();
+        // Import's plan carries no rows, so `view.uniform_scope()` (which
+        // derives a value from row destinations) can never recover the
+        // scope the caller actually selected or the candidates actually
+        // share. Source it directly from the selection instead: the
+        // explicit flag when one was given, or the one scope every
+        // candidate shares when there is one.
+        let selection_scope = if args.scope.global {
+            Some(Scope::Global)
+        } else if args.scope.project {
+            Some(Scope::Project)
+        } else {
+            let scopes = candidates
+                .iter()
+                .map(|item| item.scope)
+                .collect::<BTreeSet<_>>();
+            (scopes.len() == 1).then(|| {
+                *scopes.iter().next().unwrap_or_else(|| {
+                    unreachable!("a non-empty candidate list has at least one scope")
+                })
+            })
+        };
+        let selection = PlanSelection {
+            targets: target_templates
+                .iter()
+                .map(|template| template.target.name.clone())
+                .collect(),
+            targets_explicit: args.targets.is_explicit(),
+            scope: selection_scope,
+            scope_explicit: args.scope.is_explicit(),
+        };
+        let authorization = self.import_authorization(args, &pending_ids, prompting);
+        let data = plan_event_data(&view, 0, args.dry_run, authorization, &selection);
+        self.reporter.event(plan_event_name(0), Level::Info, data)?;
+        for line in render_plan(&view, style) {
+            self.reporter.human(&line)?;
+        }
+
+        if pending_ids.is_empty() {
+            // Both dimensions were pre-resolved (one candidate, plus an
+            // explicit `--update`/`--no-update`), so this is an ordinary
+            // binary confirmation over one fully-resolved plan -- never the
+            // "final prompt applies immediately" shape, because nothing was
+            // interactively narrowed to reach here.
+            let resolved_index = source_resolved_index.unwrap_or_else(|| {
+                unreachable!("an empty pending list requires a resolved source copy")
+            });
+            let resolved = &candidates[resolved_index];
+            let update = propagation_resolved_id.as_deref() == Some("import-update");
+            let target_label = format!("{} · {}", resolved.target.name, resolved.scope.as_str());
+            self.reporter.human(&import_resolved_footer(
+                update,
+                &target_label,
+                deployed.len(),
+                reference_updated,
+                reference_skipped,
+            ))?;
+            if args.dry_run {
+                self.reporter.human("")?;
+                self.reporter.human("Dry run — no changes were made.")?;
+                self.report_import_summary(0, 0, true)?;
+                return Ok(true);
+            }
+            if args.yes {
+                self.reporter.human("")?;
+            } else if self.no_input {
+                return Err(SkillManagerError::InteractionRequired(
+                    "applying this plan noninteractively requires --yes.".into(),
+                ));
+            } else {
+                let question = format!(
+                    "Apply this import plan from {} · {}?",
+                    resolved.target.name,
+                    resolved.scope.as_str()
+                );
+                if Authorizer::new(self.prompt)
+                    .confirm(&question, true)?
+                    .is_approved()
+                {
+                    self.reporter.human("")?;
+                } else {
+                    self.report_cancelled("import")?;
+                    return Ok(false);
+                }
+            }
+            return self.apply_import(
+                &candidate,
+                resolved,
+                &destination,
+                &source_label,
+                update,
+                &deployed,
+                style,
+            );
+        }
+
+        if args.dry_run {
+            self.reporter.human(&import_pending_footer(
+                genuine_candidates,
+                pending_ids.iter().any(|id| id == "source_copy"),
+                pending_ids.iter().any(|id| id == "propagation"),
+                false,
+            ))?;
+            self.reporter.human("")?;
+            let alternatives = plan
+                .decisions
+                .iter()
+                .find(|decision| pending_ids.contains(&decision.id))
+                .map_or(0, |decision| decision.options.len());
+            self.reporter.human(&format!(
+                "Dry run — {alternatives} alternatives shown; no option selected and no changes were made."
+            ))?;
+            self.report_import_summary(0, 0, true)?;
             return Ok(true);
+        }
+        if args.yes {
+            let message = if pending_ids.iter().any(|id| id == "source_copy") {
+                "import requires a source copy and propagation mode before --yes; choose exactly one target and scope, then pass --update or --no-update."
+            } else {
+                "propagation choice is required before --yes; pass --update or --no-update."
+            };
+            return Err(SkillManagerError::InteractionRequired(message.into()));
         }
         if self.no_input {
             return Err(SkillManagerError::InteractionRequired(
-                "import overwrites source content; pass --yes in noninteractive mode".into(),
+                "applying this plan noninteractively requires --yes.".into(),
             ));
         }
-        if self.prompt.confirm(
-            &format!(
-                "Replace {} (source) with the {} · {} copy?",
-                source_display_name(&candidate.source.entry),
-                selection.target.name,
-                selection.scope.as_str()
-            ),
-            false,
-        )? {
-            return Ok(true);
-        }
-        self.report_cancelled("import")?;
-        Ok(false)
-    }
 
-    /// Offer to propagate freshly imported content to every other installed,
-    /// enabled deployment that is now outdated.
-    fn offer_import_sync(
-        &mut self,
-        config: &Config,
-        candidate: &SkillCandidate,
-        imported: &ImportCandidate,
-        destination: &Path,
-    ) -> Result<()> {
-        let templates = self.select_target_templates(config, &TargetSelection::default())?;
-        let target_names = templates
-            .iter()
-            .map(|target| target.target.name.clone())
-            .collect::<Vec<_>>();
-        let context = scope_context(&self.home)?;
-        let scopes = available_scopes(&ScopeSelection::default(), context.project_available);
-        let mut imported_candidate = candidate.clone();
-        imported_candidate.path = destination.to_path_buf();
-        let mut steps = Vec::new();
-        for template in &templates {
-            for scope in &scopes {
-                if fold(&template.target.name) == fold(&imported.target.name)
-                    && *scope == imported.scope
-                {
-                    continue;
+        let mut resolved_index = source_resolved_index;
+        if pending_ids.first().map(String::as_str) == Some("source_copy") {
+            self.reporter.human(&import_pending_footer(
+                genuine_candidates,
+                true,
+                propagation_resolved_id.is_none(),
+                false,
+            ))?;
+            let options = source_options
+                .iter()
+                .map(|option| SelectionOption {
+                    token: option.token.clone(),
+                    label: option.label.clone(),
+                    destructive: true,
+                })
+                .collect::<Vec<_>>();
+            let question = format!("Select source copy [{}]", selection_range(&options));
+            let choice = match Authorizer::new(self.prompt).select(&question, &options)? {
+                Authorization::Cancelled => {
+                    self.report_cancelled("import")?;
+                    return Ok(false);
                 }
-                let target = scoped_target(template, *scope, &self.home, &context.project_root);
-                let deployment = target.target.path.join(&candidate.name);
-                if !deployment.is_dir() || directories_equal(destination, &deployment)? {
-                    continue;
-                }
-                steps.push(SyncStep {
-                    candidate: imported_candidate.clone(),
-                    target: target.target,
-                    scope: *scope,
-                    destination: deployment,
-                    existed: true,
-                    same: false,
+                Authorization::Approved(index) => index,
+            };
+            resolved_index = Some(choice);
+            self.reporter.human("")?;
+
+            let resolved = &candidates[choice];
+            let resolved_source_id = destination_id(&resolved.target.name, resolved.scope);
+            let (entries, actions) =
+                import_propagation(&deployed, &resolved.deployment, &resolved_source_id)?;
+            let (updated, skipped) = import_propagation_counts(&actions);
+            // Defensive only: reaching this branch at all means source_copy
+            // was genuinely pending (2+ non-identical candidates), and a
+            // mixed population where some candidates are degenerate and
+            // others are not is unreachable there -- degeneracy requires
+            // every *other* deployment to already match a candidate, so any
+            // two differing deployments anywhere in the set make every
+            // candidate genuine. `all_degenerate` above already covers the
+            // only case where a candidate can be degenerate. This fallback
+            // exists purely so a future change to candidacy rules fails
+            // loudly (a real second prompt) rather than silently, should it
+            // ever make a mixed population possible; do not remove it on
+            // the assumption it is provably dead today.
+            let narrowed_propagation_resolved = propagation_resolved_id
+                .clone()
+                .or_else(|| (updated == 0).then(|| "import-only".to_owned()));
+            let narrowed_metadata = vec![
+                (
+                    "From".to_owned(),
+                    format!("{} · {}", resolved.target.name, resolved.scope.as_str()),
+                ),
+                (
+                    "Path".to_owned(),
+                    portable_canonicalize(&resolved.deployment)
+                        .display()
+                        .to_string(),
+                ),
+                ("Into".to_owned(), into_value.clone()),
+            ];
+            let mut narrowed_blocks = vec![PreviewBlock {
+                heading: "Source replacement".to_owned(),
+                heading_value: None,
+                lead: Some(format!(
+                    "{} {}",
+                    PlanAction::Import.symbol(),
+                    totals_line(&resolved.stat)
+                )),
+                lead_color: Some(33),
+                entries: import_source_entries(&resolved.stat),
+            }];
+            if updated > 0 {
+                narrowed_blocks.push(PreviewBlock {
+                    heading: "Propagation preview".to_owned(),
+                    entries,
+                    ..PreviewBlock::default()
                 });
             }
-        }
-        if steps.is_empty() {
-            return Ok(());
+            let narrowed_propagation = import_propagation_decision(
+                deployed.len(),
+                updated,
+                skipped,
+                true,
+                narrowed_propagation_resolved.clone(),
+            );
+            let narrowed_plan = ChangePlan {
+                command: "import".to_owned(),
+                plan_id: plan.plan_id.clone(),
+                heading: format!("Import plan — source copy {} selected", choice + 1),
+                metadata: narrowed_metadata,
+                destinations: plan.destinations.clone(),
+                body_heading: None,
+                metric_header: None,
+                detail_heading: "Destination-specific changes".to_owned(),
+                connector: None,
+                rows: Vec::new(),
+                blocks: narrowed_blocks,
+                decisions: vec![
+                    import_source_decision(source_options.clone(), Some(resolved_source_id)),
+                    narrowed_propagation,
+                ],
+                prompting: true,
+                distinguishes_overwrites: false,
+            };
+            let narrowed_view = narrowed_plan.view();
+            let narrowed_pending = narrowed_view
+                .decisions()
+                .iter()
+                .map(|decision| decision.id.clone())
+                .collect::<Vec<_>>();
+            if narrowed_pending.is_empty() {
+                // Propagation was already resolved -- by flag, or silently
+                // because this copy leaves nothing out of date -- so
+                // answering `source_copy` was the final decision: apply
+                // begins immediately, with no extra render to narrow.
+                let update = narrowed_propagation_resolved.as_deref() == Some("import-update");
+                return self.apply_import(
+                    &candidate,
+                    resolved,
+                    &destination,
+                    &source_label,
+                    update,
+                    &deployed,
+                    style,
+                );
+            }
+            let narrowed_authorization = self.import_authorization(args, &narrowed_pending, true);
+            let narrowed_data = plan_event_data(
+                &narrowed_view,
+                1,
+                args.dry_run,
+                narrowed_authorization,
+                &selection,
+            );
+            self.reporter
+                .event(plan_event_name(1), Level::Info, narrowed_data)?;
+            for line in render_plan(&narrowed_view, style) {
+                self.reporter.human(&line)?;
+            }
+            self.reporter
+                .human(&import_pending_footer(candidates.len(), false, true, true))?;
+        } else {
+            self.reporter.human(&import_pending_footer(
+                genuine_candidates,
+                false,
+                true,
+                false,
+            ))?;
         }
 
-        self.reporter.human("")?;
-        let deployments = counted_noun(steps.len(), "other installed deployment");
-        let verb = if steps.len() == 1 { "needs" } else { "need" };
-        if !self.prompt.confirm(
-            &format!("{deployments} {verb} this change. Review an update plan?"),
-            true,
-        )? {
-            self.reporter
-                .human("Other installed deployments were not updated.")?;
-            return Ok(());
-        }
-        if !self.confirm_update_plan(
-            &steps,
-            &target_names,
-            UpdatePlanOptions {
-                implicit_targets: true,
-                dry_run: false,
-                confirmed: false,
-                context: UpdatePlanContext::ImportFollowUp,
+        // Propagation is now provably the sole remaining dimension: its
+        // answer is the last authorization, and apply begins immediately.
+        let resolved = &candidates[resolved_index
+            .unwrap_or_else(|| unreachable!("source copy is resolved before propagation"))];
+        let options = vec![
+            SelectionOption {
+                token: "1".to_owned(),
+                label: "Import + update".to_owned(),
+                destructive: true,
             },
-        )? {
-            self.reporter.human("")?;
-            self.reporter
-                .human("Imported successfully; other installed deployments were not updated.")?;
-            return Ok(());
+            SelectionOption {
+                token: "2".to_owned(),
+                label: "Import only".to_owned(),
+                destructive: true,
+            },
+        ];
+        let question = format!("Select propagation [{}]", selection_range(&options));
+        let update = match Authorizer::new(self.prompt).select(&question, &options)? {
+            Authorization::Cancelled => {
+                self.report_cancelled("import")?;
+                return Ok(false);
+            }
+            Authorization::Approved(0) => true,
+            Authorization::Approved(_) => false,
+        };
+        self.reporter.human("")?;
+        self.apply_import(
+            &candidate,
+            resolved,
+            &destination,
+            &source_label,
+            update,
+            &deployed,
+            style,
+        )
+    }
+
+    /// Apply the resolved import: replace the source, then -- when
+    /// propagation is `import + update` -- synchronize every deployment the
+    /// plan already promised, in the same order the plan enumerated them, so
+    /// plan order equals apply order.
+    fn apply_import(
+        &mut self,
+        candidate: &SkillCandidate,
+        resolved: &ImportCandidate,
+        destination: &Path,
+        source_label: &str,
+        update: bool,
+        deployed: &[ImportDeployment],
+        style: RenderStyle,
+    ) -> Result<bool> {
+        import_skill(
+            &resolved.deployment,
+            destination,
+            self.repository.cache_root(),
+            self.hook,
+        )?;
+        self.reporter.human(&format!(
+            "Imported {} from {} · {} into {source_label} (source).",
+            candidate.name,
+            resolved.target.name,
+            resolved.scope.as_str()
+        ))?;
+        self.reporter.event(
+            "skill.imported",
+            Level::Info,
+            skill_import_data(candidate, resolved, destination, false, "imported"),
+        )?;
+        let resolved_source_id = destination_id(&resolved.target.name, resolved.scope);
+        let mut updated = 0_usize;
+        let mut skipped = 0_usize;
+        if update {
+            // A destination whose diff comes back empty is already
+            // synchronized -- either because it *is* the copy just
+            // imported, or because it happened to already match -- so the
+            // preview shown before the prompt and what actually gets
+            // written here can never disagree. Only the copy that was
+            // actually chosen is labeled "(source copy)"; a merely-identical
+            // deployment gets its own honest label, and the footer
+            // breakdown below counts both so it always sums to the total.
+            for entry in deployed {
+                let diff = diff_directories(&entry.path, &resolved.deployment)?;
+                if diff.is_empty() {
+                    skipped += 1;
+                    let suffix = if entry.id == resolved_source_id {
+                        "(source copy)"
+                    } else {
+                        "(already up to date)"
+                    };
+                    self.reporter.human(&format!(
+                        "Synchronized {} -> {} ({}) {suffix}",
+                        candidate.name,
+                        entry.target.name,
+                        entry.scope.as_str()
+                    ))?;
+                    self.reporter.event(
+                        "skill.skipped",
+                        Level::Info,
+                        skill_action_data(
+                            candidate,
+                            &entry.target,
+                            Some(entry.scope),
+                            &entry.path,
+                            false,
+                            "skipped",
+                        ),
+                    )?;
+                    continue;
+                }
+                deploy_skill(
+                    &resolved.deployment,
+                    &entry.target.path,
+                    self.repository.cache_root(),
+                    self.hook,
+                )?;
+                updated += 1;
+                self.reporter.human(&format!(
+                    "Updated {} -> {} ({})",
+                    candidate.name,
+                    entry.target.name,
+                    entry.scope.as_str()
+                ))?;
+                self.reporter.event(
+                    "skill.updated",
+                    Level::Info,
+                    skill_action_data(
+                        candidate,
+                        &entry.target,
+                        Some(entry.scope),
+                        &entry.path,
+                        false,
+                        "updated",
+                    ),
+                )?;
+            }
         }
         self.reporter.human("")?;
-        for step in &steps {
-            deploy_skill(
-                &step.candidate.path,
-                &step.target.path,
-                self.repository.cache_root(),
-                self.hook,
-            )?;
-            self.reporter.human(&format!(
-                "Updated {} -> {} ({})",
-                step.candidate.name,
-                step.target.name,
-                step.scope.as_str()
-            ))?;
-            self.reporter.event(
-                "skill.updated",
-                Level::Info,
-                skill_action_data(
-                    &step.candidate,
-                    &step.target,
-                    Some(step.scope),
-                    &step.destination,
-                    false,
-                    "updated",
-                ),
-            )?;
+        self.reporter.human(&import_result_footer(
+            &resolved.stat,
+            update,
+            deployed.len(),
+            updated,
+            skipped,
+            style,
+        ))?;
+        self.report_import_summary(1, 0, false)?;
+        Ok(true)
+    }
+
+    /// Describe how this invocation authorizes its import plan.
+    fn import_authorization(
+        &self,
+        args: &ImportArgs,
+        pending: &[String],
+        prompting: bool,
+    ) -> PlanAuthorization {
+        let mode = if args.dry_run {
+            "dry-run"
+        } else if args.yes {
+            "yes"
+        } else if self.no_input {
+            "noninteractive"
+        } else {
+            "prompt"
+        };
+        let kind = if pending.is_empty() {
+            "binary"
+        } else {
+            "progressive"
+        };
+        PlanAuthorization {
+            kind,
+            mode,
+            default: (kind == "binary")
+                .then_some(prompting.then_some(false))
+                .flatten(),
         }
-        Ok(())
     }
 
     /// Review, authorize, and apply the remove plan.
@@ -4844,65 +5180,510 @@ fn target_flag_hint(target_names: &[String]) -> String {
     format!("{}, or --target NAME", flags.join(", "))
 }
 
-fn grouped_update_entries(
-    actionable: &[&SyncStep],
-    target_names: &[String],
-) -> Result<(Vec<GroupedUpdateEntry>, TargetSpecificChangeDetails)> {
-    let mut grouped = BTreeMap::<String, Vec<&SyncStep>>::new();
-    for step in actionable {
-        grouped
-            .entry(fold(&step.candidate.name))
-            .or_default()
-            .push(step);
-    }
-    let mut entries = Vec::with_capacity(grouped.len());
-    let mut target_specific_details = Vec::new();
-    for steps in grouped.values() {
-        let mut changes = BTreeSet::new();
-        let mut scopes = vec![Vec::new(); target_names.len()];
-        let mut deployment_changes = Vec::new();
-        for step in steps {
-            let totals = totals_line(&diff_directories(&step.destination, &step.candidate.path)?);
-            changes.insert(totals.clone());
-            deployment_changes.push((step.target.name.clone(), step.scope, totals));
-            if let Some(index) = target_names
-                .iter()
-                .position(|target| fold(target) == fold(&step.target.name))
-            {
-                scopes[index].push(step.scope);
-            }
-        }
-        let target_scopes = scopes
-            .into_iter()
-            .map(|scopes| match scopes.as_slice() {
-                [] => None,
-                [Scope::Global] => Some("global".into()),
-                [Scope::Project] => Some("project".into()),
-                _ => Some("both".into()),
-            })
-            .collect();
-        if changes.len() > 1 {
-            target_specific_details.push((steps[0].candidate.name.clone(), deployment_changes));
-        }
-        entries.push(GroupedUpdateEntry {
-            skill: steps[0].candidate.name.clone(),
-            change: if changes.len() == 1 {
-                changes.into_iter().next().unwrap_or_default()
-            } else {
-                format!("{} target-specific changes", changes.len())
-            },
-            target_scopes,
-        });
-    }
-    Ok((entries, target_specific_details))
-}
-
 fn styled_heading(text: &str, color: bool) -> String {
     if color {
         format!("\u{1b}[1;36m{text}\u{1b}[0m")
     } else {
         text.to_owned()
     }
+}
+
+/// Resolve the local source directory an import would overwrite.
+///
+/// A GitHub-backed source with a configured local alternate resolves to that
+/// alternate automatically, before any plan renders — the owner rejected a
+/// preliminary "use the alternate?" confirmation, so the alternate is simply
+/// folded into the plan instead of asked about. A GitHub-backed source with
+/// no alternate fails immediately, before rendering any alternatives.
+fn import_destination(candidate: &SkillCandidate) -> Result<(PathBuf, bool)> {
+    let entry = &candidate.source.entry;
+    if entry.source_type == SourceType::Local {
+        return Ok((portable_path(&candidate.path), false));
+    }
+    let Some(SourceLocation::Local { path }) = entry.alternate.clone() else {
+        return Err(SkillManagerError::InvalidInput(format!(
+            "import writes to local source checkouts only; '{}' is GitHub-backed ({}) and has no local alternate location. Add one with: skill-manager source alternate {} <local-path>",
+            entry.name,
+            source_reference(entry),
+            entry.name
+        )));
+    };
+    let destination = portable_path(&if entry.mode == SourceMode::Single {
+        path
+    } else {
+        path.join(&candidate.name)
+    });
+    Ok((destination, true))
+}
+
+/// The single [`Destination`] representing the canonical source itself.
+fn import_source_destination(source_label: &str) -> Destination {
+    Destination {
+        id: format!("{source_label}:source"),
+        column: source_label.to_owned(),
+        label: format!("{source_label} (source)"),
+        kind: DestinationKind::Source {
+            source: source_label.to_owned(),
+        },
+        path: None,
+    }
+}
+
+/// Replicate `plan::delta_cell`'s private formatting locally: `+ins/-del`, or
+/// a signed byte count for binary content.
+fn import_delta_value(file: &FileDelta) -> String {
+    if file.binary {
+        let sign = if file.bytes < 0 { "-" } else { "+" };
+        return format!("bin {sign}{} bytes", file.bytes.unsigned_abs());
+    }
+    format!("+{}/-{}", file.insertions, file.deletions)
+}
+
+/// One nested consequence line per changed file in a source copy's own diff.
+fn import_source_entries(stat: &DiffStat) -> Vec<PreviewEntry> {
+    stat.files
+        .iter()
+        .map(|file| PreviewEntry {
+            marker: Some(file.change.symbol().to_owned()),
+            marker_color: Some(match file.change {
+                FileChange::Added => 32,
+                FileChange::Deleted => 31,
+                FileChange::Modified => 33,
+            }),
+            label: file.path.clone(),
+            value: import_delta_value(file),
+            value_color: None,
+        })
+        .collect()
+}
+
+/// Build one destination's propagation preview entry and planned action.
+///
+/// `incoming` is always the source copy's own content — the same content
+/// that would flow into every other deployment if this copy were chosen.
+/// Diffing each deployment's current directory (`existing`) against that one
+/// path, rather than combining a per-skill representative count, is what
+/// keeps an option's advertised propagation preview identical to what
+/// `apply_import` would actually write for that exact copy. `own_id` is the
+/// resolved candidate's own destination identity: only that entry is labeled
+/// "source copy", because that is the one actually being adopted. A
+/// *different* destination that merely happens to already carry identical
+/// content is still a no-write, but it is labeled "synchronized" on its own
+/// — never "source copy" — since content equality is not the same as being
+/// the copy chosen.
+fn import_propagation(
+    deployed: &[ImportDeployment],
+    incoming: &Path,
+    own_id: &str,
+) -> Result<(Vec<PreviewEntry>, Vec<PlannedAction>)> {
+    let mut entries = Vec::with_capacity(deployed.len());
+    let mut actions = Vec::with_capacity(deployed.len());
+    for item in deployed {
+        let stat = diff_directories(&item.path, incoming)?;
+        let synchronized = stat.is_empty();
+        let value = if item.id == own_id {
+            "✓ source copy; synchronized, no file changes".to_owned()
+        } else if synchronized {
+            "✓ synchronized, no file changes".to_owned()
+        } else {
+            format!("{} {}", PlanAction::Update.symbol(), totals_line(&stat))
+        };
+        entries.push(PreviewEntry {
+            marker: None,
+            marker_color: None,
+            label: item.label.clone(),
+            value,
+            value_color: (!synchronized).then_some(33),
+        });
+        actions.push(PlannedAction {
+            destination: item.id.clone(),
+            action: if synchronized {
+                PlanAction::Skip
+            } else {
+                PlanAction::Update
+            },
+            existed: true,
+            description: String::new(),
+            stat,
+        });
+    }
+    Ok((entries, actions))
+}
+
+/// Build the "Left out of date" block that replaces "Propagation preview"
+/// once propagation is resolved to import-only: nothing will be written, so
+/// entries must read as staleness (`N file(s) behind, +ins/-del`) rather
+/// than a pending write (`↑ ...`), which would promise a synchronization
+/// that import-only deliberately does not perform. Built from `actions` --
+/// the exact per-destination consequences the resolved option already
+/// carries -- rather than a fresh diff, so the rendered count can never
+/// drift from what the option actually enumerated. A destination whose
+/// action is `Skip` (already synchronized, or the resolved copy's own
+/// identity) reads as a none-value under this framing and is dropped, same
+/// as any other recursively-gated none-value column.
+///
+/// `actions` must be in the same order as `deployed` (as `import_propagation`
+/// produces them), so the two can be zipped by position.
+fn import_staleness_block(
+    deployed: &[ImportDeployment],
+    actions: &[PlannedAction],
+) -> PreviewBlock {
+    let entries = deployed
+        .iter()
+        .zip(actions)
+        .filter(|(_, action)| action.action == PlanAction::Update)
+        .map(|(item, action)| PreviewEntry {
+            marker: None,
+            marker_color: None,
+            label: item.label.clone(),
+            value: format!(
+                "{} behind, +{}/-{}",
+                counted_noun(action.stat.files_changed(), "file"),
+                action.stat.insertions(),
+                action.stat.deletions()
+            ),
+            value_color: Some(33),
+        })
+        .collect();
+    PreviewBlock {
+        heading: "Left out of date".to_owned(),
+        entries,
+        ..PreviewBlock::default()
+    }
+}
+
+/// Count how many propagation actions are genuine updates versus already
+/// synchronized skips (normally exactly one skip: the copy's own deployment).
+fn import_propagation_counts(actions: &[PlannedAction]) -> (usize, usize) {
+    let updated = actions
+        .iter()
+        .filter(|action| action.action == PlanAction::Update)
+        .count();
+    let skipped = actions
+        .iter()
+        .filter(|action| action.action == PlanAction::Skip)
+        .count();
+    (updated, skipped)
+}
+
+/// Build one source-copy alternative: its own diff, and — only when
+/// choosing it would actually leave something to propagate — a nested
+/// preview of what it would propagate to every other deployment.
+///
+/// Propagation is not a genuine dimension for a candidate whose own content
+/// already matches every other deployment: nothing would be written either
+/// way, so the nested "Propagation with import + update" block is elided for
+/// that candidate the same way a genuinely empty preview would be gated
+/// anywhere else. The caller uses the returned `(updated, skipped)` counts to
+/// decide whether the whole `propagation` dimension is genuine across every
+/// candidate.
+fn import_source_option(
+    item: &ImportCandidate,
+    index: usize,
+    source_destination_id: &str,
+    deployed: &[ImportDeployment],
+) -> Result<(DecisionOption, Vec<PreviewEntry>, usize, usize)> {
+    let id = destination_id(&item.target.name, item.scope);
+    let path_string = portable_canonicalize(&item.deployment)
+        .display()
+        .to_string();
+    let (entries, propagation_actions) = import_propagation(deployed, &item.deployment, &id)?;
+    let (updated, skipped) = import_propagation_counts(&propagation_actions);
+    let mut actions = propagation_actions.clone();
+    actions.insert(
+        0,
+        PlannedAction {
+            destination: source_destination_id.to_owned(),
+            action: PlanAction::Import,
+            existed: true,
+            description: String::new(),
+            stat: item.stat.clone(),
+        },
+    );
+    let mut detail = vec![OptionDetail::Fields(vec![
+        PreviewField {
+            label: "Path".to_owned(),
+            value: path_string.clone(),
+            ..PreviewField::default()
+        },
+        PreviewField {
+            label: "Source".to_owned(),
+            value: format!(
+                "{} {}",
+                PlanAction::Import.symbol(),
+                totals_line(&item.stat)
+            ),
+            value_color: Some(33),
+            entries: import_source_entries(&item.stat),
+        },
+    ])];
+    if updated > 0 {
+        detail.push(OptionDetail::Block(PreviewBlock {
+            heading: "Propagation with import + update".to_owned(),
+            heading_value: Some(counted_noun(deployed.len(), "deployment")),
+            entries: entries.clone(),
+            ..PreviewBlock::default()
+        }));
+    }
+    let option = DecisionOption {
+        id,
+        token: (index + 1).to_string(),
+        label: format!("{} · {}", item.target.name, item.scope.as_str()),
+        detail,
+        consequence: OptionConsequence {
+            operation: Some(PlanAction::Import),
+            path: Some(PathBuf::from(path_string)),
+            actions,
+            totals: vec![("deployments".to_owned(), deployed.len() as u64)],
+        },
+        ..DecisionOption::default()
+    };
+    Ok((option, entries, updated, skipped))
+}
+
+/// The two propagation alternatives, with notes and typed consequences
+/// computed from the actual candidate rather than a fixed formula, so the
+/// promised counts can never drift from what applying that option writes.
+///
+/// `updated` is how many deployments differ from the resolved source copy —
+/// exactly what stays out of date if `Import only` is chosen instead, which
+/// is why the same number appears in both options' prose.
+fn import_propagation_options(
+    deployed_len: usize,
+    updated: usize,
+    skipped: usize,
+    resolved: bool,
+) -> Vec<DecisionOption> {
+    // A zero count is never printed, even in the shared provisional note
+    // rendered while the source copy is still pending: this branch is not
+    // normally reachable once the source resolves (a degenerate candidate
+    // auto-resolves `propagation` before this text renders again), but the
+    // guard stays unconditional so no future caller can slip a literal `0`
+    // past it.
+    let update_note = if resolved {
+        if updated == 0 {
+            format!(
+                "Replace the source and synchronize {} (1 source copy).",
+                counted_noun(deployed_len, "deployment")
+            )
+        } else {
+            format!(
+                "Replace the source and synchronize {} (1 source copy, {updated} updated).",
+                counted_noun(deployed_len, "deployment")
+            )
+        }
+    } else {
+        "Replace the source, then synchronize every deployment shown for that copy.".to_owned()
+    };
+    let only_note = if updated == 0 {
+        "Replace the source; write no deployments.".to_owned()
+    } else if resolved {
+        format!("Replace the source; write no deployments and leave {updated} out of date.")
+    } else {
+        format!(
+            "Replace the source; write no deployments and leave the other {updated} out of date."
+        )
+    };
+    vec![
+        DecisionOption {
+            id: "import-update".to_owned(),
+            token: "1".to_owned(),
+            label: "Import + update".to_owned(),
+            recommended: true,
+            detail: vec![OptionDetail::Note(update_note)],
+            consequence: OptionConsequence {
+                operation: Some(PlanAction::Update),
+                totals: vec![
+                    ("deployments".to_owned(), deployed_len as u64),
+                    ("updated".to_owned(), updated as u64),
+                    ("skipped".to_owned(), skipped as u64),
+                ],
+                ..OptionConsequence::default()
+            },
+            ..DecisionOption::default()
+        },
+        DecisionOption {
+            id: "import-only".to_owned(),
+            token: "2".to_owned(),
+            label: "Import only".to_owned(),
+            detail: vec![OptionDetail::Note(only_note)],
+            consequence: OptionConsequence {
+                operation: Some(PlanAction::Import),
+                totals: vec![("stale".to_owned(), updated as u64)],
+                ..OptionConsequence::default()
+            },
+            ..DecisionOption::default()
+        },
+    ]
+}
+
+/// Build `import`'s `source_copy` decision.
+///
+/// Carries both headings, unlike `propagation`: the mocks show a bare
+/// numbered list only while `source_copy` is genuinely active. Every other
+/// render — `--dry-run`, an ambiguous `--yes`, a `--no-input` refusal — still
+/// shows the same numbered list without a live prompt, and it needs its own
+/// label there too so two numbered `1`/`2` lists (this one and
+/// `propagation`'s) are never left to read as one.
+fn import_source_decision(options: Vec<DecisionOption>, resolved: Option<String>) -> Decision {
+    Decision {
+        id: "source_copy".to_owned(),
+        heading: Some("Available source copies".to_owned()),
+        deferred_heading: Some("Source copies (chosen first)".to_owned()),
+        prompt: "Select source copy".to_owned(),
+        options,
+        resolved,
+        ..Decision::default()
+    }
+}
+
+/// Build `import`'s `propagation` decision.
+///
+/// `heading` stays `None` even while active: the mocks never show a heading
+/// line above the propagation options, only the deferred heading while the
+/// dimension is still pending behind `source_copy`.
+fn import_propagation_decision(
+    deployed_len: usize,
+    updated: usize,
+    skipped: usize,
+    resolved_note: bool,
+    resolved: Option<String>,
+) -> Decision {
+    Decision {
+        id: "propagation".to_owned(),
+        deferred_heading: Some("Propagation modes (chosen after the source copy)".to_owned()),
+        prompt: "Select propagation".to_owned(),
+        options: import_propagation_options(deployed_len, updated, skipped, resolved_note),
+        resolved,
+        ..Decision::default()
+    }
+}
+
+/// The plan footer shown just before a prompt (or, for `--dry-run`, before
+/// the alternatives message): how many source copies and propagation modes
+/// remain to choose between.
+fn import_pending_footer(
+    candidates_len: usize,
+    source_pending: bool,
+    propagation_pending: bool,
+    source_selected_by_prompt: bool,
+) -> String {
+    let copies = if candidates_len == 1 {
+        "1 source copy".to_owned()
+    } else {
+        format!("{candidates_len} source copies")
+    };
+    if source_pending && propagation_pending {
+        return format!("{copies}; propagation decision follows source selection");
+    }
+    if source_pending {
+        // Propagation was already resolved by flag: the deferred clause no
+        // longer applies, since there is nothing left to defer it behind.
+        return copies;
+    }
+    let source_clause = if source_selected_by_prompt {
+        "1 source copy selected".to_owned()
+    } else {
+        copies
+    };
+    format!("{source_clause}; {}", counted_noun(2, "propagation mode"))
+}
+
+/// The pre-apply footer for a plan whose both dimensions were already
+/// resolved when it rendered — never narrowed by an interactive answer.
+///
+/// Grammar per the normative spec: the import-only form always names the
+/// resolved target/scope (`1 source replacement from claude · global`) and
+/// only appends the staleness consequence when it is non-zero, since that
+/// consequence is genuinely significant (import-only deliberately creates
+/// staleness) even though the target/scope naming already satisfies the
+/// spec's minimum. The import+update form keeps its existing wording and
+/// additionally reports any deployment that was already identical to the
+/// resolved copy, so the breakdown always sums to `deployed_len`.
+///
+/// The sync form is used only when `update` is set AND `updated` is
+/// non-zero: an explicit `--update`/`update:true` on a degenerate plan
+/// records an honest `import-update` in the machine stream (see
+/// `propagation_resolved_id`), but there is nothing to synchronize, and the
+/// sync form's `{updated} updated` clause has no way to omit a zero count
+/// the way the plain form's trailing clause can. Falling back to the plain
+/// form keeps the human render free of the forbidden `0 updated`, which
+/// still teaches correctly here since nothing was written either way.
+fn import_resolved_footer(
+    update: bool,
+    target_label: &str,
+    deployed_len: usize,
+    updated: usize,
+    skipped: usize,
+) -> String {
+    use std::fmt::Write as _;
+    if update && updated > 0 {
+        let already_identical = skipped.saturating_sub(1);
+        let mut footer = format!(
+            "1 source replacement; {} synchronized (1 source copy, {updated} updated",
+            counted_noun(deployed_len, "deployment")
+        );
+        if already_identical > 0 {
+            let _ = write!(footer, ", {already_identical} already identical");
+        }
+        footer.push(')');
+        footer
+    } else {
+        let mut footer = format!("1 source replacement from {target_label}");
+        if updated > 0 {
+            let _ = write!(
+                footer,
+                "; {} left out of date",
+                counted_noun(updated, "deployment")
+            );
+        }
+        footer
+    }
+}
+
+/// The post-apply result footer: one `ResultEntry` describing the source
+/// replacement and, when propagation genuinely ran, the deployments it
+/// synchronized. Same `update && updated > 0` guard as
+/// `import_resolved_footer`: an explicit `--update` on a degenerate plan
+/// still applies with `update: true` (so the applied stream honestly emits
+/// a `skill.skipped` per destination), but `updated` is then always zero,
+/// so the synchronized clause -- which has no way to omit that count --
+/// must be omitted entirely rather than print the forbidden `0 updated`.
+fn import_result_footer(
+    stat: &DiffStat,
+    update: bool,
+    deployed_len: usize,
+    updated: usize,
+    skipped: usize,
+    style: RenderStyle,
+) -> String {
+    let mut description = format!(
+        "source replaced ({}, +{}/-{})",
+        counted_noun(stat.files_changed(), "file"),
+        stat.insertions(),
+        stat.deletions()
+    );
+    if update && updated > 0 {
+        use std::fmt::Write as _;
+        let already_identical = skipped.saturating_sub(1);
+        let _ = write!(
+            description,
+            ", {} synchronized (1 source copy, {updated} updated",
+            counted_noun(deployed_len, "deployment")
+        );
+        if already_identical > 0 {
+            let _ = write!(description, ", {already_identical} already identical");
+        }
+        description.push(')');
+    }
+    result_footer(
+        &[ResultEntry {
+            marker: ResultMarker::Completed,
+            count: 1,
+            description,
+        }],
+        style,
+    )
 }
 
 fn enabled_target_label(count: usize) -> String {

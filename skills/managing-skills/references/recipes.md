@@ -90,22 +90,29 @@ the apply step, so `yes` is accepted but not required to commit.
 {"command":"update","sources":["managing-*"],"all_targets":true,"dry_run":true}
 ```
 
-<!-- recipe-command: import fields: all,all_targets,antigravity,claude,command,dry_run,global,no_input,project,shared,skill,target,targets,yes -->
+<!-- recipe-command: import fields: all,all_targets,antigravity,claude,command,dry_run,global,no_input,no_update,project,shared,skill,target,targets,update,yes -->
 ### `import`
 
 Adopt a deployed, possibly agent-modified copy of one skill as the new source
 content. Required: `skill` (`string`), exactly one skill name and never a
-pattern. Optional: target selection, scope selection, `dry_run`, `yes`, and
-`no_input`.
+pattern. Optional: target selection, scope selection, `update`/`no_update`,
+`dry_run`, `yes`, and `no_input`.
 
 Import is the reverse of `load`, so it fully mirrors the chosen deployment over
 the configured local source directory, including deleting source files the
 deployment no longer has. It writes to local source checkouts only. A
-GitHub-backed source requires a local alternate location and an interactive
-confirmation, so a machine call against such a source fails instead of
-guessing. A committed non-interactive call requires `yes:true`, and it must
-narrow target/scope selection whenever more than one deployment differs from
-the source.
+GitHub-backed source requires a local alternate location, so a machine call
+against such a source fails instead of guessing. Import has two decision
+dimensions: which deployed copy to adopt (skipped when only one deployment
+differs from the source, or when several do but are byte-identical to one
+another) and whether to propagate the imported content back to every other
+deployment afterward (`update:true` for import + update, recommended;
+`update:false`/`no_update:true` for import only). Propagation resolves
+silently with no flag needed whenever the resolved copy would leave nothing
+else out of date. Neither `update` nor `no_update` is implied by `yes:true`.
+`import` is destructive like `remove`, so a committed non-interactive call
+requires `yes:true`, and it must narrow target/scope selection whenever more
+than one deployment differs from the source.
 
 ```json
 {"command":"import","skill":"managing-skills","claude":true,"global":true,"dry_run":true}
