@@ -1617,6 +1617,122 @@ fn collisions_are_first_source_wins_and_resolve_persists_exclude() {
     );
 }
 
+/// Regression test for the same dangerous "empty patterns select everything"
+/// contract that caused the `remove` data-loss bug: `resolve <literal-name>`
+/// (a bare name, no fnmatch metacharacters) must resolve only the named
+/// collision. It must never widen to every other collision just because no
+/// fnmatch pattern operand was supplied. Two distinct skill names collide
+/// between two sources; resolving one by its literal name must leave the
+/// other collision untouched (no exclude persisted, still ambiguous).
+#[test]
+fn resolve_literal_skill_name_resolves_only_that_collision_leaving_the_other_unresolved() {
+    let home = sandbox();
+    let first = home.path().join("first");
+    let second = home.path().join("second");
+    create_skill(&first, "alpha", "# First Alpha");
+    create_skill(&first, "beta", "# First Beta");
+    create_skill(&second, "alpha", "# Second Alpha");
+    create_skill(&second, "beta", "# Second Beta");
+
+    for (path, name) in [(&first, "first"), (&second, "second")] {
+        cli(home.path())
+            .args([
+                "--json",
+                "source",
+                "add",
+                path.to_str().expect("utf8 path"),
+                name,
+            ])
+            .assert()
+            .success();
+    }
+
+    cli(home.path())
+        .args([
+            "--json",
+            "resolve",
+            "alpha",
+            "--prefer-source",
+            "second",
+            "--no-input",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"skill\":\"alpha\""))
+        .stdout(predicate::str::contains("\"resolved\":1"))
+        .stdout(predicate::str::contains("\"skill\":\"beta\"").not());
+
+    let config = read_config(home.path());
+    let sources = config["sources"].as_array().expect("sources array");
+    let first_source = sources
+        .iter()
+        .find(|source| source["name"] == "first")
+        .expect("first source");
+    let excluded = first_source["exclude"].as_array().expect("exclude array");
+    assert!(
+        excluded.iter().any(|value| value == "alpha"),
+        "alpha collision must be resolved: {excluded:?}"
+    );
+    assert!(
+        !excluded.iter().any(|value| value == "beta"),
+        "beta collision must remain unresolved: {excluded:?}"
+    );
+}
+
+/// Companion coverage for the documented "omitted means every collision"
+/// contract (`ResolveArgs::skills`): a bare `resolve` with no operands at
+/// all -- no literal names and no patterns -- must still resolve every
+/// pending collision. This is the one legitimate "select everything" path,
+/// and it must keep working even though `resolve <literal-name>` no longer
+/// implicitly expands to everything.
+#[test]
+fn resolve_with_no_operands_resolves_every_collision() {
+    let home = sandbox();
+    let first = home.path().join("first");
+    let second = home.path().join("second");
+    create_skill(&first, "alpha", "# First Alpha");
+    create_skill(&first, "beta", "# First Beta");
+    create_skill(&second, "alpha", "# Second Alpha");
+    create_skill(&second, "beta", "# Second Beta");
+
+    for (path, name) in [(&first, "first"), (&second, "second")] {
+        cli(home.path())
+            .args([
+                "--json",
+                "source",
+                "add",
+                path.to_str().expect("utf8 path"),
+                name,
+            ])
+            .assert()
+            .success();
+    }
+
+    cli(home.path())
+        .args([
+            "--json",
+            "resolve",
+            "--prefer-source",
+            "second",
+            "--no-input",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"skill\":\"alpha\""))
+        .stdout(predicate::str::contains("\"skill\":\"beta\""))
+        .stdout(predicate::str::contains("\"resolved\":2"));
+
+    let config = read_config(home.path());
+    let sources = config["sources"].as_array().expect("sources array");
+    let first_source = sources
+        .iter()
+        .find(|source| source["name"] == "first")
+        .expect("first source");
+    let excluded = first_source["exclude"].as_array().expect("exclude array");
+    assert!(excluded.iter().any(|value| value == "alpha"));
+    assert!(excluded.iter().any(|value| value == "beta"));
+}
+
 #[test]
 fn human_prompts_cover_text_confirmation_cancellation_and_invalid_answers() {
     let home = sandbox();
@@ -1698,6 +1814,78 @@ fn human_prompts_cover_text_confirmation_cancellation_and_invalid_answers() {
         .success()
         .stderr(predicate::str::contains("Remove 1 skill deployment(s)?"));
     assert!(!target.join("alpha").exists());
+}
+
+/// Regression test for a data-loss bug: `remove <literal-name>` (a bare skill
+/// name, with no fnmatch metacharacters) must resolve to only that one name.
+/// It must never widen to every deployed skill just because no fnmatch
+/// pattern operand was supplied. Deploys three distinct skills to two
+/// targets, removes one skill by its literal name, and asserts the other two
+/// skills' deployments survive untouched in both targets.
+#[test]
+fn remove_literal_skill_name_does_not_touch_other_deployed_skills() {
+    let home = sandbox();
+    let source = home.path().join("source");
+    let target_a = home.path().join("target-a");
+    let target_b = home.path().join("target-b");
+    create_skill(&source, "alpha", "# Alpha");
+    create_skill(&source, "beta", "# Beta");
+    create_skill(&source, "gamma", "# Gamma");
+
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 path"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args(["--json", "target", "add", "target-a", "target-a"])
+        .assert()
+        .success();
+    cli(home.path())
+        .args(["--json", "target", "add", "target-b", "target-b"])
+        .assert()
+        .success();
+
+    cli(home.path())
+        .args([
+            "--json", "load", "--target", "target-a", "--target", "target-b", "--global",
+        ])
+        .assert()
+        .success();
+
+    for target in [&target_a, &target_b] {
+        for skill in ["alpha", "beta", "gamma"] {
+            assert!(
+                target.join(skill).join("SKILL.md").is_file(),
+                "expected {skill} deployed to {target:?} before remove"
+            );
+        }
+    }
+
+    cli(home.path())
+        .args(["remove", "alpha", "--global", "--yes"])
+        .assert()
+        .success();
+
+    for target in [&target_a, &target_b] {
+        assert!(
+            !target.join("alpha").exists(),
+            "alpha must be removed from {target:?}"
+        );
+        assert!(
+            target.join("beta").join("SKILL.md").is_file(),
+            "beta must survive removing alpha from {target:?}"
+        );
+        assert!(
+            target.join("gamma").join("SKILL.md").is_file(),
+            "gamma must survive removing alpha from {target:?}"
+        );
+    }
 }
 
 #[test]

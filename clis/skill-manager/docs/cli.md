@@ -179,6 +179,29 @@ name, source name, and unique source-label fields. Each unmatched positional
 pattern emits a warning; matching patterns still run. If supplied positional
 patterns leave no actionable skill, the command fails.
 
+An empty pattern set never means "match every candidate": a literal skill
+name given to `remove` or `resolve` resolves to only that name, plus any
+genuine fnmatch pattern operands given alongside it. For `load`, `update`,
+and `remove`, positional operands (literal names and patterns) union
+together first, and the repeatable `--filter` patterns then intersect that
+union — a name that unions in but matches no `--filter` pattern is dropped.
+`resolve` has no `--filter` flag. Each command's "everything" fallback is
+keyed on the absence of skill-name/pattern selectors, not on an empty operand
+list: `load` and `update` also accept source references and paths as
+operands, and supplying only those (for example `load some-source`) still
+triggers the fallback, because a source operand narrows the discovery
+universe rather than suppressing the fallback — the command then selects
+every winner discovered from that narrowed set of sources. `remove` and
+`resolve` operands are always skill selectors (a name, pattern, or
+skill/collection path for `remove`; a name or pattern for `resolve`), so for
+those two the fallback fires only when the operand list is fully empty: bare
+`remove` falls back to discovered source winners (still narrowed by
+`--filter`) rather than to every existing deployment, so a deployment whose
+skill is no longer present in any configured source is left untouched by a
+bare `remove`; bare `resolve` falls back to every unresolved collision. Each
+command opts into its own fallback explicitly rather than treating an empty
+selector set as "select everything".
+
 ## Status values and locations
 
 Each effective source/target pair is `up-to-date`, `needs-update`,

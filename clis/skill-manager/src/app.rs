@@ -1215,17 +1215,14 @@ where
             .values()
             .map(|candidate| candidate.name.as_str())
             .collect::<Vec<_>>();
-        // Only call the expander when glob patterns were actually supplied.
-        // `expand_skill_patterns` returns every candidate for an empty
-        // pattern list by design (the plain "no operands: deploy
-        // everything" contract), so calling it unconditionally here would
-        // silently select all candidates even when only literal skill names
-        // narrowed the selection.
-        let expansion = if glob_patterns.is_empty() {
-            PatternExpansion::default()
-        } else {
-            expand_skill_patterns(&glob_patterns, candidate_names)?
-        };
+        // `expand_skill_patterns` now matches nothing for an empty pattern
+        // list (see its doc comment), which is exactly what's wanted here:
+        // this call site only ever means "narrow by glob pattern", never
+        // "select everything". The separate "no operands: deploy everything"
+        // opt-in lives below, in the `glob_patterns.is_empty() &&
+        // literal_skill_names.is_empty()` branch, which reads straight from
+        // `discovery.winners` instead of going through the expander.
+        let expansion = expand_skill_patterns(&glob_patterns, candidate_names)?;
         self.emit_unmatched_patterns(&expansion.unmatched_patterns)?;
         // A literal skill name that resolved successfully must count as a
         // positional match on its own, even when an unrelated unmatched glob
@@ -2008,6 +2005,13 @@ where
                 }
             }
         }
+        // `positional_patterns` holds only genuine fnmatch operands (see the
+        // `is_fnmatch_operand` split above); literal skill names never land
+        // here. With `expand_skill_patterns` matching nothing for an empty
+        // pattern list, this correctly expands to nothing extra when the
+        // caller passed only literal names -- it must never widen to every
+        // deployed skill. The `args.skills.is_empty()` branch above is the
+        // sole, explicit "no operands: every discovered skill" opt-in.
         let expansion = expand_skill_patterns(
             &positional_patterns,
             deployed_names.values().map(String::as_str),
@@ -2370,12 +2374,31 @@ where
             .filter(|value| is_fnmatch_operand(value))
             .cloned()
             .collect::<Vec<_>>();
-        let expansion = expand_skill_patterns(
-            &positional_patterns,
-            discovery.collisions.values().filter_map(|candidates| {
-                candidates.first().map(|candidate| candidate.name.as_str())
-            }),
-        )?;
+        // `ResolveArgs::skills` documents "omitted means every collision" as
+        // an explicit contract. Opt in to that here instead of relying on
+        // `expand_skill_patterns` to treat an empty pattern list as "select
+        // everything" (it no longer does, and never implicitly should): a
+        // bare literal skill name with no patterns must resolve to just that
+        // name, not silently widen to every collision.
+        let expansion = if args.skills.is_empty() {
+            PatternExpansion {
+                matched: discovery
+                    .collisions
+                    .values()
+                    .filter_map(|candidates| {
+                        candidates.first().map(|candidate| candidate.name.clone())
+                    })
+                    .collect(),
+                unmatched_patterns: Vec::new(),
+            }
+        } else {
+            expand_skill_patterns(
+                &positional_patterns,
+                discovery.collisions.values().filter_map(|candidates| {
+                    candidates.first().map(|candidate| candidate.name.as_str())
+                }),
+            )?
+        };
         self.emit_unmatched_patterns(&expansion.unmatched_patterns)?;
         let mut selected: BTreeSet<String> = args
             .skills

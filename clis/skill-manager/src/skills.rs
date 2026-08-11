@@ -453,8 +453,19 @@ pub struct PatternExpansion {
 /// Expand positional patterns against a supplied candidate universe.
 ///
 /// Pattern operands are OR-combined. The caller can then AND [`PatternExpansion::matched`]
-/// with its existing filter selection. An empty pattern set selects all candidates.
-/// This helper intentionally does not interpret a candidate as a path or source.
+/// with its existing filter selection. This helper intentionally does not interpret a
+/// candidate as a path or source.
+///
+/// # Contract
+///
+/// An empty `patterns` slice matches **nothing**: both
+/// [`PatternExpansion::matched`] and [`PatternExpansion::unmatched_patterns`] come back
+/// empty. This function never treats "no patterns" as "select every candidate" — a
+/// caller that wants the historical "no operands means every candidate" behavior must
+/// opt in explicitly at the call site (for example by substituting the full candidate
+/// universe itself before/instead of calling this helper) rather than relying on an
+/// implicit fallback here. Folding that opt-in into this helper is exactly the footgun
+/// that once let `remove <literal-name>` silently expand to "every deployed skill".
 ///
 /// # Errors
 ///
@@ -463,16 +474,13 @@ pub fn expand_skill_patterns<'a>(
     patterns: &[String],
     universe: impl IntoIterator<Item = &'a str>,
 ) -> Result<PatternExpansion> {
+    if patterns.is_empty() {
+        return Ok(PatternExpansion::default());
+    }
     let candidates = universe
         .into_iter()
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
-    if patterns.is_empty() {
-        return Ok(PatternExpansion {
-            matched: candidates,
-            unmatched_patterns: Vec::new(),
-        });
-    }
 
     let mut matched = Vec::new();
     for candidate in &candidates {
@@ -763,10 +771,13 @@ mod tests {
         assert_eq!(expanded.matched, ["grill-me", "beta", "grill-plan"]);
         assert_eq!(expanded.unmatched_patterns, ["missing-*"]);
 
-        let all = expand_skill_patterns(&[], ["alpha", "beta"])
+        // An empty pattern slice matches nothing: callers that want "every
+        // candidate" for empty input must opt in explicitly rather than rely
+        // on `expand_skill_patterns` to do it implicitly.
+        let none = expand_skill_patterns(&[], ["alpha", "beta"])
             .unwrap_or_else(|error| unreachable!("{error}"));
-        assert_eq!(all.matched, ["alpha", "beta"]);
-        assert!(all.unmatched_patterns.is_empty());
+        assert!(none.matched.is_empty());
+        assert!(none.unmatched_patterns.is_empty());
     }
 
     #[cfg(unix)]
