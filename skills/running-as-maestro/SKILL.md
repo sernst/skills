@@ -84,32 +84,41 @@ the closest lighter-weight option when these exact names aren't available.
 
 ## GitHub Copilot
 
-This profile applies only if you are running in GitHub Copilot. If that is
-not you, skip this profile entirely. GitHub Copilot has broader provider and
-model coverage and an `auto` mode that can often choose well for the task:
+This profile applies only if you are running in GitHub Copilot and not running
+in Cursor. If that is not you, skip this profile entirely. It targets the
+Copilot CLI/app, where model, effort, and context tier are all explicit per
+dispatch; a closing paragraph covers other Copilot surfaces.
 
-1. Default to `auto` for most subagent dispatches — the router's exact label
-   varies by surface (for example `Auto` in VS Code), so use whatever label
-   your surface exposes; every reference to `auto` in this document means
-   that router, however it is labeled.
-2. Exception: judge subagents. Pin the judge to a specific model that
-   satisfies the judge floor defined in the Rules for every harness section
-   below. Weak auto-routed judges have been observed specifically in this
-   harness, so this exception is not optional.
-3. Pin a specific model only by exception, when you have a clear task-driven
-   reason (specialized capability, latency, cost, or reliability).
-4. Optimize across providers by task fit; do not default to GPT-family models
-   when another provider is better for the sub-task.
-5. If you assign the same model/provider repeatedly across independent
-   sub-tasks, explicitly justify why diversification is not better for ROI.
-6. If `auto` is unavailable, choose the cheapest model that can credibly do
-   the task, then escalate only if needed.
+Never dispatch a subagent on the inherited session model or a router's `auto`
+selection — this harness has no `auto` for subagent dispatch, so an unset one
+just inherits an unreliable router pick. The one exception is when the user's
+own prompt explicitly permits it, electing that cost saving; absent that, you
+always choose.
 
-In practice: route broad exploratory research across unknown code paths
-through `auto`, pin a stronger model explicitly when a specific provider is a
-clearly better fit for heavy synthesis or nuanced reasoning, and pin a
-low-cost fast model for high-volume triage/mechanical checks, escalating only
-on failure.
+Model capability class is your primary escalation lever, not reasoning effort.
+Set both deliberately on every dispatch — pick the class the task's depth
+warrants, then a matching effort level, but never lean on higher effort to
+rescue an under-provisioned tier. Raise the context tier only when inputs
+demand the larger window, not as a quality lever.
+
+Choose tiers in the abstract, by capability class, never by naming a provider
+or model slug as routing guidance. Provider breadth here is an opportunity: an
+executor/judge pair from different providers sharpens adversarial review, and
+some tasks have better ROI on one provider's model than another's at the same
+class. Treat that as a preference under the diversity and judge-floor rules
+below, not a requirement of this profile — the floor is never traded for
+provider variety. This harness also lists several generations of the same model
+class; confirm you picked the newest generally-available release of that class.
+
+Picking a specialized subagent type (exploration, research, review, and so on)
+is separate from model choice: it shapes tooling and default behavior, and
+several types default to deliberately lightweight settings. Choosing one never
+excuses skipping an explicit model and effort level.
+
+On Copilot surfaces without per-subagent controls, apply the general rules and
+skip whichever knobs aren't offered — but still set the session's own model
+deliberately rather than leaving it on the router. A missing knob is never
+permission to fall back to `auto`.
 
 ## Any other harness
 
