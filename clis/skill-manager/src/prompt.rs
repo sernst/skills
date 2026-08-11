@@ -36,6 +36,17 @@ pub trait Prompt {
     ///
     /// Returns an error when input/output fails or the selection is invalid.
     fn choose(&mut self, message: &str, choices: &[String]) -> Result<usize>;
+    /// Print guidance beside a prompt without asking anything.
+    ///
+    /// Used to reprompt after an unusable answer. The default is a no-op so
+    /// test doubles stay source-compatible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when output fails.
+    fn note(&mut self, _message: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Standard-input interactive prompt implementation.
@@ -130,6 +141,11 @@ impl Prompt for StdioPrompt {
         }
         let raw = Self::read_line("Choice: ")?;
         parse_choice(&raw, choices.len())
+    }
+
+    fn note(&mut self, message: &str) -> Result<()> {
+        writeln!(io::stderr().lock(), "{message}")
+            .map_err(|error| SkillManagerError::io("<stderr>", error))
     }
 }
 

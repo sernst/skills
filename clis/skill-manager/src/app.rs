@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 
+use crate::authorize::Authorizer;
 use crate::cache::{GitHubTransport, materialize_source};
 use crate::cli::{
     Command, ConfigsAction, ConfigsArgs, CopyArgs, ImportArgs, RemoveArgs, ResolveArgs,
@@ -27,10 +28,15 @@ use crate::domain::{
 use crate::error::{Result, SkillManagerError};
 use crate::event::{Level, Reporter};
 use crate::plan::{
-    DiffStat, GroupedUpdateEntry, diff_directories, file_change_lines, grouped_update_table,
-    totals_line,
+    DiffStat, GroupedUpdateEntry, PlanAction, diff_directories, file_change_lines,
+    grouped_update_table, totals_line,
 };
 use crate::prompt::Prompt;
+use crate::review::{
+    ChangePlan, Destination, DestinationKind, PlanAuthorization, PlanRow, PlanSelection,
+    PlannedAction, RenderStyle, ResultEntry, ResultMarker, destination_label, location_of,
+    location_text, plan_event_data, render_plan, result_footer,
+};
 use crate::skills::{
     PatternExpansion, deployed_skills, detect_skill_dirs, directories_equal, discover_skills,
     expand_skill_patterns, is_fnmatch_operand, is_path_or_github_shaped, matches_patterns,
@@ -82,6 +88,25 @@ struct UpdatePlanOptions {
 enum UpdatePlanContext {
     Direct,
     ImportFollowUp,
+}
+
+/// Everything `update` needs after discovery to review, authorize, and apply.
+///
+/// `update` is the first command migrated onto the shared review pipeline, so
+/// this bundle exists to keep that pipeline a single, testable call rather than
+/// threading a dozen discovery outputs through it.
+struct UpdateRun<'r> {
+    args: &'r SyncArgs,
+    steps: Vec<SyncStep>,
+    target_names: Vec<String>,
+    /// Skill names the user gave positionally, in the order they gave them.
+    requested: Vec<String>,
+    /// Folded skill names in the single order both review and apply follow.
+    review_order: Vec<String>,
+    glob_patterns: Vec<String>,
+    has_targets: bool,
+    positional_matched: bool,
+    confirmed: bool,
 }
 
 /// Outcome converted to the executable exit code.
@@ -1232,6 +1257,10 @@ where
         let positional_matched = !literal_skill_names.is_empty()
             || glob_patterns.is_empty()
             || !expansion.matched.is_empty();
+        // The names the user actually asked for, before folding, so a plan that
+        // resolves to nothing can name the request back instead of a count.
+        let mut requested = literal_skill_names.clone();
+        requested.extend(expansion.matched.iter().cloned());
         let selected = if glob_patterns.is_empty() && literal_skill_names.is_empty() {
             // No positional selector narrowed skills at all: keep the
             // long-standing "select every discovered candidate" behavior
@@ -1288,40 +1317,34 @@ where
             }
         }
 
-        let target_names = target_templates
-            .iter()
-            .map(|target| target.target.name.clone())
-            .collect::<Vec<_>>();
-        let implicit_targets = !args.targets.is_explicit();
-        if update_only && steps.is_empty() && positional_matched && !self.reporter.is_json() {
-            let message = if target_templates.is_empty() {
-                if implicit_targets {
-                    "No enabled targets are available for update."
-                } else {
-                    "No selected targets are available for update."
-                }
-            } else {
-                "No installed skills matched this update."
+        if update_only {
+            let target_names = target_templates
+                .iter()
+                .map(|target| target.target.name.clone())
+                .collect::<Vec<_>>();
+            // Review order and apply order are derived from one sequence so
+            // they cannot drift: the CLI must never act in an order other than
+            // the one it showed.
+            let review_order = review_sequence(&steps, &requested);
+            let mut steps = steps;
+            let rank = |step: &SyncStep| {
+                review_order
+                    .iter()
+                    .position(|key| *key == fold(&step.candidate.name))
+                    .unwrap_or(usize::MAX)
             };
-            self.reporter.human(message)?;
-        }
-        if update_only
-            && !self.confirm_update_plan(
-                &steps,
-                &target_names,
-                UpdatePlanOptions {
-                    implicit_targets,
-                    dry_run: args.dry_run,
-                    confirmed,
-                    context: UpdatePlanContext::Direct,
-                },
-            )?
-        {
-            return Ok(false);
-        }
-
-        if update_only && !self.reporter.is_json() && steps.iter().any(|step| !step.same) {
-            self.reporter.human("")?;
+            steps.sort_by_key(rank);
+            return self.run_update(&UpdateRun {
+                args,
+                steps,
+                target_names,
+                requested,
+                review_order,
+                glob_patterns,
+                has_targets: !target_templates.is_empty(),
+                positional_matched,
+                confirmed,
+            });
         }
 
         let mut changed = 0_usize;
@@ -1353,26 +1376,19 @@ where
             }
             changed += 1;
             self.reporter.human(&format!(
-                "{} {} -> {} ({}){}",
-                if update_only { "Updated" } else { "Loaded" },
+                "Loaded {} -> {} ({}){}",
                 step.candidate.name,
                 step.target.name,
                 step.scope.as_str(),
                 if args.dry_run { " (dry-run)" } else { "" }
             ))?;
-            let action = if update_only {
-                "updated"
-            } else if step.existed {
+            let action = if step.existed {
                 "overwritten"
             } else {
                 "loaded"
             };
             self.reporter.event(
-                if update_only {
-                    "skill.updated"
-                } else {
-                    "skill.loaded"
-                },
+                "skill.loaded",
                 Level::Info,
                 skill_action_data(
                     &step.candidate,
@@ -1390,17 +1406,315 @@ where
                 reference: glob_patterns.join(", "),
             });
         }
+        self.report_sync_summary("load", changed, skipped, args.dry_run)?;
+        Ok(true)
+    }
+
+    /// Emit the load/update summary event from one shared, auditable site.
+    fn report_sync_summary(
+        &mut self,
+        action: &str,
+        changed: usize,
+        skipped: usize,
+        dry_run: bool,
+    ) -> Result<()> {
         self.reporter.event(
             "summary",
             Level::Info,
             json!({
-                "action": if update_only { "update" } else { "load" },
+                "action": action,
                 "changed": changed,
                 "skipped": skipped,
-                "dry_run": args.dry_run
+                "dry_run": dry_run
             }),
-        )?;
+        )
+    }
+
+    /// Review, authorize, and apply the update plan.
+    ///
+    /// The complete plan is rendered before anything is asked, every render is
+    /// significance gated, and cancelling names only the decisions that were
+    /// inferred, so the next invocation is obvious rather than guessed.
+    fn run_update(&mut self, run: &UpdateRun<'_>) -> Result<bool> {
+        if !run.positional_matched {
+            return Err(SkillManagerError::NotFound {
+                kind: "skill matching positional pattern",
+                reference: run.glob_patterns.join(", "),
+            });
+        }
+        let implicit_targets = !run.args.targets.is_explicit();
+        let actionable = run
+            .steps
+            .iter()
+            .filter(|step| !step.same)
+            .collect::<Vec<_>>();
+        let style = self.render_style();
+        let mut uniform_scope = None;
+        if actionable.is_empty() {
+            self.report_update_no_work(run, implicit_targets)?;
+        } else {
+            let plan = update_change_plan(
+                &actionable,
+                &run.target_names,
+                run.args,
+                &run.review_order,
+                style,
+                !run.args.dry_run && !run.confirmed && !self.no_input,
+            )?;
+            let view = plan.view();
+            uniform_scope = view.uniform_scope();
+            let label = destination_label(
+                view.columns().len(),
+                run.target_names.len(),
+                !implicit_targets,
+                "target",
+            );
+            let selection = PlanSelection {
+                targets: run.target_names.clone(),
+                targets_explicit: !implicit_targets,
+                scope: uniform_scope,
+                scope_explicit: run.args.scope.is_explicit(),
+            };
+            let revision = 0;
+            let data = plan_event_data(
+                &view,
+                revision,
+                run.args.dry_run,
+                self.update_authorization(run),
+                &selection,
+            );
+            let event = if revision == 0 {
+                "plan"
+            } else {
+                "plan.updated"
+            };
+            self.reporter.event(event, Level::Info, data)?;
+            for line in render_plan(&view, style) {
+                self.reporter.human(&line)?;
+            }
+            self.reporter.human(&format!(
+                "{} across {label}",
+                counted_noun(view.actions(), "update")
+            ))?;
+            if run.args.dry_run {
+                self.reporter.human("")?;
+                self.reporter.human("Dry run — no changes were made.")?;
+            } else if self.authorize_update(run, &label)? {
+                self.reporter.human("")?;
+            } else {
+                self.report_update_cancelled(run, implicit_targets)?;
+                return Ok(false);
+            }
+        }
+
+        let mut changed = 0_usize;
+        let mut skipped = 0_usize;
+        self.apply_update_steps(run, uniform_scope, &mut changed, &mut skipped)?;
+        if changed > 0 && !run.args.dry_run {
+            self.reporter.human("")?;
+            let footer = result_footer(
+                &[
+                    ResultEntry {
+                        marker: ResultMarker::Completed,
+                        count: changed,
+                        description: format!(
+                            "deployment{} updated",
+                            if changed == 1 { "" } else { "s" }
+                        ),
+                    },
+                    ResultEntry {
+                        marker: ResultMarker::Unchanged,
+                        count: skipped,
+                        description: "unchanged".to_owned(),
+                    },
+                ],
+                style,
+            );
+            self.reporter.human(&footer)?;
+        }
+        self.report_sync_summary("update", changed, skipped, run.args.dry_run)?;
         Ok(true)
+    }
+
+    /// Apply every planned step, reporting progress the plan already promised.
+    fn apply_update_steps(
+        &mut self,
+        run: &UpdateRun<'_>,
+        uniform_scope: Option<Scope>,
+        changed: &mut usize,
+        skipped: &mut usize,
+    ) -> Result<()> {
+        for step in &run.steps {
+            if step.same {
+                *skipped += 1;
+                self.reporter.event(
+                    "skill.skipped",
+                    Level::Info,
+                    skill_action_data(
+                        &step.candidate,
+                        &step.target,
+                        Some(step.scope),
+                        &step.destination,
+                        run.args.dry_run,
+                        "skipped",
+                    ),
+                )?;
+                continue;
+            }
+            if !run.args.dry_run {
+                deploy_skill(
+                    &step.candidate.path,
+                    &step.target.path,
+                    self.repository.cache_root(),
+                    self.hook,
+                )?;
+                // A uniform scope is already stated once above the plan, so
+                // repeating it on every progress line would add no information.
+                let scope = if uniform_scope.is_some() {
+                    String::new()
+                } else {
+                    format!(" ({})", step.scope.as_str())
+                };
+                self.reporter.human(&format!(
+                    "Updated {} -> {}{scope}",
+                    step.candidate.name, step.target.name
+                ))?;
+            }
+            *changed += 1;
+            self.reporter.event(
+                "skill.updated",
+                Level::Info,
+                skill_action_data(
+                    &step.candidate,
+                    &step.target,
+                    Some(step.scope),
+                    &step.destination,
+                    run.args.dry_run,
+                    "updated",
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Rendering vocabulary for this invocation's output stream.
+    fn render_style(&self) -> RenderStyle {
+        RenderStyle {
+            symbols: self.reporter.is_interactive(),
+            color: self.reporter.color_enabled(),
+        }
+    }
+
+    /// Describe how this invocation authorizes its plan.
+    fn update_authorization(&self, run: &UpdateRun<'_>) -> PlanAuthorization {
+        let prompted = !run.args.dry_run && !run.confirmed && !self.no_input;
+        let mode = if run.args.dry_run {
+            "dry-run"
+        } else if run.confirmed {
+            "yes"
+        } else if self.no_input {
+            "noninteractive"
+        } else {
+            "prompt"
+        };
+        PlanAuthorization {
+            kind: "binary",
+            mode,
+            default: prompted.then_some(true),
+        }
+    }
+
+    /// Obtain consent for the rendered update plan.
+    fn authorize_update(&mut self, run: &UpdateRun<'_>, label: &str) -> Result<bool> {
+        if run.confirmed {
+            return Ok(true);
+        }
+        if self.no_input {
+            // Machine mode keeps its established event-only contract; an
+            // interactive-shaped stream still has to say yes explicitly.
+            if self.reporter.is_json() {
+                return Ok(true);
+            }
+            return Err(SkillManagerError::InteractionRequired(
+                "applying this plan noninteractively requires --yes.".into(),
+            ));
+        }
+        Ok(Authorizer::new(self.prompt)
+            .confirm(&format!("Apply this update plan to {label}?"), false)?
+            .is_approved())
+    }
+
+    /// Explain a declined update plan and how to narrow the next one.
+    fn report_update_cancelled(
+        &mut self,
+        run: &UpdateRun<'_>,
+        implicit_targets: bool,
+    ) -> Result<()> {
+        self.report_cancelled("update")?;
+        let inferred_scope = !run.args.scope.is_explicit();
+        let hint = match (implicit_targets, inferred_scope) {
+            (true, true) => Some(format!(
+                "Hint: targets and deployed scopes were inferred. Re-run with {}, and --global or --project, to narrow this plan.",
+                target_flag_hint(&run.target_names)
+            )),
+            (true, false) => Some(format!(
+                "Hint: targets were inferred. Re-run with {} to narrow this plan.",
+                target_flag_hint(&run.target_names)
+            )),
+            (false, true) => Some(
+                "Hint: deployed scopes were inferred. Re-run with --global or --project to narrow this plan."
+                    .to_owned(),
+            ),
+            (false, false) => None,
+        };
+        match hint {
+            Some(line) => self.reporter.human(&line),
+            None => Ok(()),
+        }
+    }
+
+    /// State precisely why an update plan has nothing to do.
+    fn report_update_no_work(&mut self, run: &UpdateRun<'_>, implicit_targets: bool) -> Result<()> {
+        let qualifier = if implicit_targets {
+            "enabled"
+        } else {
+            "selected"
+        };
+        if run.steps.is_empty() {
+            let message = if run.has_targets {
+                if run.args.filters.is_empty() && run.requested.len() == 1 {
+                    format!(
+                        "{} is not deployed to any {qualifier} target in {} scope.",
+                        run.requested.first().map_or("", String::as_str),
+                        scope_phrase(&run.args.scope)
+                    )
+                } else {
+                    "No installed skills matched this update.".to_owned()
+                }
+            } else {
+                format!("No {qualifier} targets are available for update.")
+            };
+            return self.reporter.human(&message);
+        }
+        let skills = run
+            .steps
+            .iter()
+            .map(|step| step.candidate.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let label = target_selection_label(run.target_names.len(), implicit_targets);
+        let message = if skills.len() == 1 {
+            format!(
+                "{} is up to date across {label}.",
+                skills
+                    .iter()
+                    .next()
+                    .copied()
+                    .unwrap_or("The selected skill")
+            )
+        } else {
+            format!("All installed skills are up to date across {label}.")
+        };
+        self.reporter.human(&message)
     }
 
     /// Display the update plan and, when interactive, confirm it once.
@@ -2918,6 +3232,167 @@ fn update_scopes(
         }
     }
     scopes
+}
+
+/// Build the shared change plan for one `update` invocation.
+///
+/// Every enabled target contributes both scope destinations even when only one
+/// is planned: significance gating, not this builder, decides which survive, so
+/// the same construction works unchanged when `load`, `remove`, `copy`, and
+/// `import` migrate onto it.
+/// The single skill order both plan review and apply follow.
+///
+/// Names the user gave positionally come first, in the order they gave them;
+/// everything else keeps discovery order. Deriving one sequence and ranking
+/// both the plan rows and the apply steps from it is what makes it impossible
+/// for the CLI to act in an order other than the one it rendered.
+fn review_sequence(steps: &[SyncStep], requested: &[String]) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut push = |key: String| {
+        if !order.contains(&key) {
+            order.push(key);
+        }
+    };
+    let present = steps
+        .iter()
+        .map(|step| fold(&step.candidate.name))
+        .collect::<BTreeSet<_>>();
+    for name in requested {
+        let key = fold(name);
+        if present.contains(&key) {
+            push(key);
+        }
+    }
+    for step in steps {
+        push(fold(&step.candidate.name));
+    }
+    order
+}
+
+fn update_change_plan(
+    actionable: &[&SyncStep],
+    target_names: &[String],
+    args: &SyncArgs,
+    review_order: &[String],
+    style: RenderStyle,
+    prompting: bool,
+) -> Result<ChangePlan> {
+    let mut destinations = Vec::new();
+    for name in target_names {
+        for scope in [Scope::Global, Scope::Project] {
+            destinations.push(Destination {
+                id: destination_id(name, scope),
+                column: name.clone(),
+                label: format!("{name} · {}", scope.as_str()),
+                kind: DestinationKind::Deployment {
+                    target: name.clone(),
+                    scope,
+                },
+                path: None,
+            });
+        }
+    }
+
+    let mut grouped = BTreeMap::<String, Vec<&SyncStep>>::new();
+    for step in actionable {
+        grouped
+            .entry(fold(&step.candidate.name))
+            .or_default()
+            .push(step);
+    }
+    let order = review_order
+        .iter()
+        .filter(|key| grouped.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut rows = Vec::with_capacity(order.len());
+    let mut identities = Vec::with_capacity(order.len());
+    for key in &order {
+        let Some(steps) = grouped.get(key) else {
+            continue;
+        };
+        let mut actions = Vec::with_capacity(steps.len());
+        for step in steps {
+            let stat = diff_directories(&step.destination, &step.candidate.path)?;
+            actions.push(PlannedAction {
+                destination: destination_id(&step.target.name, step.scope),
+                action: PlanAction::Update,
+                existed: step.existed,
+                description: totals_line(&stat),
+                stat,
+            });
+        }
+        let identity = steps
+            .first()
+            .map(|step| step.candidate.name.clone())
+            .unwrap_or_default();
+        identities.push(identity.clone());
+        rows.push(PlanRow {
+            identity,
+            actions,
+            ..PlanRow::default()
+        });
+    }
+
+    let scopes = actionable
+        .iter()
+        .map(|step| step.scope)
+        .collect::<BTreeSet<_>>();
+    let mut metadata = Vec::new();
+    if let [scope] = scopes.iter().copied().collect::<Vec<_>>().as_slice()
+        && !args.scope.is_explicit()
+        && let Some(location) = review_location(*scope)
+    {
+        metadata.push((
+            "Scope".to_owned(),
+            format!("{} (inferred)", location_text(location, style.symbols)),
+        ));
+    }
+
+    Ok(ChangePlan {
+        command: "update".to_owned(),
+        plan_id: format!("update:{}", identities.join(",")),
+        heading: "Update plan".to_owned(),
+        metadata,
+        destinations,
+        body_heading: None,
+        metric_header: None,
+        detail_heading: "Destination-specific changes".to_owned(),
+        connector: Some("->".to_owned()),
+        rows,
+        blocks: Vec::new(),
+        decisions: Vec::new(),
+        prompting,
+    })
+}
+
+fn destination_id(target: &str, scope: Scope) -> String {
+    format!("{}:{}", fold(target), scope.as_str())
+}
+
+fn review_location(scope: Scope) -> Option<SkillLocation> {
+    location_of(&BTreeSet::from([scope]))
+}
+
+/// Describe the scope a plan searched, for a plan that found nothing.
+fn scope_phrase(scope: &ScopeSelection) -> &'static str {
+    match (scope.global, scope.project) {
+        (true, false) => "global",
+        (false, true) => "project",
+        _ => "global or project",
+    }
+}
+
+/// Render the target flags that would make an inferred target set explicit.
+fn target_flag_hint(target_names: &[String]) -> String {
+    let mut flags = target_names
+        .iter()
+        .filter(|name| is_builtin_name(name))
+        .map(|name| format!("--{name}"))
+        .collect::<Vec<_>>();
+    flags.push("--all".to_owned());
+    format!("{}, or --target NAME", flags.join(", "))
 }
 
 fn grouped_update_entries(

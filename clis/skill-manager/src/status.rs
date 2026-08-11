@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use crate::domain::{Scope, SkillState};
 use unicode_width::UnicodeWidthStr;
 
-const COLUMN_GAP: &str = "  ";
+/// Two ASCII spaces separate every rendered column.
+pub(crate) const COLUMN_GAP: &str = "  ";
 
 /// One source shown in the status preamble.
 #[derive(Clone, Debug, Eq, PartialEq)]

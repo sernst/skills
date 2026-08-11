@@ -216,10 +216,12 @@ fn documented_recipe_fields(markdown: &str) -> BTreeMap<String, BTreeSet<String>
 fn is_event_name(value: &str) -> bool {
     value == "summary"
         || value == "diagnostic"
+        || value == "plan"
         || [
             "collision.",
             "command.",
             "config.",
+            "plan.",
             "skill.",
             "source.",
             "status.",
@@ -282,6 +284,22 @@ fn object_fields(text: &str) -> BTreeSet<String> {
         }
     }
     fields
+}
+
+/// Top-level keys inserted into one named map variable.
+///
+/// Payloads assembled with `serde_json::Map` rather than `json!` need their own
+/// extractor so nested maps built in the same function stay out of the family.
+fn insert_fields(block: &str, variable: &str) -> BTreeSet<String> {
+    let marker = format!("{variable}.insert(\"");
+    block
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix(&marker)?;
+            let (field, _) = rest.split_once('"')?;
+            Some(field.to_owned())
+        })
+        .collect()
 }
 
 fn json_object_after(source: &str, start: usize) -> &str {
@@ -496,6 +514,16 @@ fn config_and_summary_payload_references_match_production_emit_sites() {
         "config.shown backup fields drifted"
     );
 
+    let review = read(&root.join("clis/skill-manager/src/review.rs"));
+    assert_eq!(
+        documented.get("plan"),
+        Some(&insert_fields(
+            function_block(&review, "plan_event_data"),
+            "data"
+        )),
+        "plan payload fields drifted"
+    );
+
     let summaries = event_json_payloads(app, "summary");
     assert_eq!(summaries.len(), 8, "production summary emit-site count");
     let summary_fields = summaries
@@ -546,7 +574,9 @@ fn config_and_summary_payload_references_match_production_emit_sites() {
         "\"displaced_backup_path\": outcome.displaced.raw_path",
         "\"present\": outcome.restored.metadata.present",
         "\"sources\": config.sources.len()",
-        "\"action\": if update_only { \"update\" } else { \"load\" }",
+        "\"action\": action,",
+        "self.report_sync_summary(\"load\", changed, skipped, args.dry_run)",
+        "self.report_sync_summary(\"update\", changed, skipped, run.args.dry_run)",
         "\"action\": \"copy\", \"copied\": copied",
         "\"action\": \"remove\", \"removed\": 0",
         "\"action\": \"remove\", \"removed\": removed",
@@ -647,6 +677,8 @@ fn every_production_event_has_a_source_derived_payload_family() {
         ("config.restored", "config-restored"),
         ("config.shown", "config-shown"),
         ("diagnostic", "diagnostic-message"),
+        ("plan", "plan"),
+        ("plan.updated", "plan"),
         ("skill.copied", "skill-action"),
         ("skill.import-planned", "skill-import"),
         ("skill.import-skipped", "skill-import-skipped"),

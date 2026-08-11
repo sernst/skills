@@ -242,6 +242,8 @@ pub enum PlanAction {
     Update,
     /// Create a deployment that does not exist yet.
     Load,
+    /// Delete an existing deployment.
+    Remove,
     /// Leave identical content untouched.
     Skip,
 }
@@ -254,6 +256,7 @@ impl PlanAction {
             Self::Import => "import",
             Self::Update => "update",
             Self::Load => "load",
+            Self::Remove => "remove",
             Self::Skip => "skip",
         }
     }
@@ -265,14 +268,22 @@ impl PlanAction {
             Self::Import => "←",
             Self::Update => "↑",
             Self::Load => "+",
+            Self::Remove => "−",
             Self::Skip => "✓",
         }
+    }
+
+    /// Semantic ANSI color code, when this action has one.
+    #[must_use]
+    pub const fn color_code(self) -> Option<u8> {
+        self.color()
     }
 
     const fn color(self) -> Option<u8> {
         match self {
             Self::Import | Self::Update => Some(33),
             Self::Load => Some(32),
+            Self::Remove => Some(31),
             Self::Skip => None,
         }
     }
@@ -463,6 +474,20 @@ pub fn totals_line(stat: &DiffStat) -> String {
     rendered
 }
 
+/// Render the first-write description, such as `new deployment, 2 files, +86/-0`.
+///
+/// `load` and `copy` differ only in the noun, so the shared plan renderer keeps
+/// one grammar instead of two nearly identical sentences.
+#[must_use]
+pub fn creation_line(noun: &str, stat: &DiffStat) -> String {
+    format!(
+        "new {noun}, {}, +{}/-{}",
+        pluralized(stat.files_changed(), "file"),
+        stat.insertions(),
+        stat.deletions()
+    )
+}
+
 /// Render the one-line count summary below a plan table.
 #[must_use]
 pub fn plan_summary(entries: &[PlanEntry]) -> String {
@@ -470,6 +495,7 @@ pub fn plan_summary(entries: &[PlanEntry]) -> String {
         (PlanAction::Import, "to import"),
         (PlanAction::Update, "to update"),
         (PlanAction::Load, "to load"),
+        (PlanAction::Remove, "to remove"),
         (PlanAction::Skip, "unchanged"),
     ];
     let rendered = counts
@@ -500,6 +526,7 @@ fn action_cell(action: PlanAction, symbols: bool) -> &'static str {
 fn change_cell(entry: &PlanEntry) -> String {
     match entry.action {
         PlanAction::Skip => "up to date".into(),
+        PlanAction::Remove => "remove deployment".into(),
         PlanAction::Load => format!(
             "new deployment, {}, +{}/-{}",
             pluralized(entry.stat.files_changed(), "file"),

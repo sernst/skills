@@ -3,6 +3,8 @@
 
 /// Application service and command orchestration.
 pub mod app;
+/// Rendered-plan authorization boundary.
+pub mod authorize;
 /// GitHub source transport and persistent cache.
 pub mod cache;
 /// Command-line interface types.
@@ -21,6 +23,8 @@ pub mod plan;
 pub mod prompt;
 /// Strict JSON invocation input.
 pub mod recipe;
+/// Shared plan review: destinations, rendering, and plan events.
+pub mod review;
 /// Skill discovery and status helpers.
 pub mod skills;
 /// Human-readable status table rendering.

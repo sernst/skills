@@ -107,10 +107,26 @@ impl ConsoleReporter {
         Self::with_human_options(json, policy, false)
     }
 
+    /// Environment override that forces the interactive symbol vocabulary on.
+    ///
+    /// Golden tests must be able to review the symbol rendering a terminal user
+    /// sees, and a spawned test process never owns a TTY. This is a deliberate,
+    /// narrow injection seam matching how `SKILL_MANAGER_HOME` redirects
+    /// configuration, and `--color` remains the supported way to influence
+    /// color.
+    ///
+    /// The override is one-directional on purpose. Opting a redirected stream
+    /// into symbols is harmless and self-describing, but silently downgrading a
+    /// real terminal is not, so any value other than `1` — including `0` and a
+    /// stray leftover value — falls through to the real terminal probe rather
+    /// than suppressing it.
+    const FORCE_INTERACTIVE: &'static str = "SKILL_MANAGER_FORCE_INTERACTIVE";
+
     /// Create a reporter with explicit human-output options.
     #[must_use]
     pub fn with_human_options(json: bool, policy: ColorChoice, verbose: bool) -> Self {
-        let interactive = io::stdout().is_terminal();
+        let forced = std::env::var_os(Self::FORCE_INTERACTIVE).is_some_and(|value| value == "1");
+        let interactive = forced || io::stdout().is_terminal();
         let no_color = std::env::var_os("NO_COLOR").is_some();
         let color = !json
             && match policy {

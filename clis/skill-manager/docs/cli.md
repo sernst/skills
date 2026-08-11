@@ -68,16 +68,43 @@ spelling for configured-source-only behavior.
 ## Change plans for update and import
 
 Interactive `update` immediately uses all enabled targets unless selectors
-narrow them. Its plan omits unchanged skills and groups each changed skill into
-one row with a column per selected target (all enabled targets when selectors
-are omitted); cells identify `global`, `project`, `both`, or no action. When
-deployments have different file/line totals, compact target-specific details
-preserve every delta below the grouped row. A no-op prints one concise result
-without a table or confirmation. Changed plans end with a count summary and one
-confirmation defaulting to yes. Declining cancels with exit `0`, emits
-`command.cancelled`, and deploys nothing. `--yes`/`-y` and `--dry-run` print the
-same plan without prompting. `load` never adds this confirmation, and machine
-mode keeps its existing event-only contract.
+narrow them. It always renders a complete plan before it asks anything.
+
+The plan omits unchanged skills and groups each changed skill into one row with
+a column per destination target. Rows appear in the order the skills were named
+on the command line, so review order matches request order, and apply follows
+the same order the plan promised. Every render is significance gated: a target
+column whose every cell would be the none value is dropped, an inferred scope
+shared by every planned deployment is hoisted to a single `Scope` line instead
+of being repeated per cell, an explicitly stated scope is not restated at all,
+and zero counts are omitted rather than printed. When one skill has exactly one
+planned deployment the table degrades to a single sentence. When deployments
+have different file/line totals, compact destination-specific details preserve
+every delta below the grouped row. Interactive output uses the symbol
+vocabulary (`↑`, `↕ both`, `🌐 global`, `📁 project`, `—`, `✓`); a redirected
+stream uses the equivalent words.
+
+The plan ends with a count summary naming its blast radius, such as `4 updates
+across 2 targets`. The qualifier (`enabled` or `selected`) survives only while
+every target does; once gating drops one, the phrase degrades to a bare count so
+it never overstates what will be written.
+
+One confirmation follows, defaulting to yes because an update is regenerable.
+Declining cancels with exit `0`, emits `command.cancelled`, deploys nothing, and
+prints a hint naming only the decisions the CLI inferred, so the next invocation
+is obvious. A no-op prints one precise result without a table or confirmation:
+either that the skill is up to date, or that it is not deployed to any target in
+the searched scope.
+
+`--yes`/`-y` renders the same plan and then applies it. `--dry-run` renders the
+plan and stops with a single `Dry run — no changes were made.` conclusion rather
+than echoing every item. Applying prints one progress line per deployment—with
+the scope only when the plan has more than one—followed by a summary footer such
+as `✓: 4 deployments updated`, whose zero categories are omitted entirely.
+Under `--no-input`, inferred defaults still apply but `--yes` is required to
+authorize the write. `load` never adds this confirmation, and machine mode keeps
+its existing event-only contract while additionally emitting the structured
+`plan` event described in [json.md](json.md).
 
 `import SKILL` reverses `load`. It resolves exactly one skill—patterns are
 rejected—through the same first-source-wins discovery, then scans the selected

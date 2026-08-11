@@ -3038,8 +3038,9 @@ fn update_confirms_a_rendered_plan_before_deploying() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Update plan"))
-        .stdout(predicate::str::contains("skill  change"))
-        .stdout(predicate::str::contains("alpha"))
+        .stdout(predicate::str::contains(
+            "update alpha -> claude: 1 file changed, +1/-0",
+        ))
         .stdout(predicate::str::contains("beta").not())
         .stdout(predicate::str::contains(
             "1 update across 1 selected target",
@@ -3061,7 +3062,12 @@ fn update_confirms_a_rendered_plan_before_deploying() {
     assert!(accepted.status.success());
     let stdout = String::from_utf8(accepted.stdout).expect("utf8 update output");
     assert!(stdout.contains("Update plan"));
-    assert!(stdout.contains("Updated alpha -> claude (global)"));
+    assert!(stdout.contains("Updated alpha -> claude"));
+    assert!(
+        !stdout.contains("Updated alpha -> claude (global)"),
+        "an explicit uniform scope is stated once, not on every progress line"
+    );
+    assert!(stdout.contains("completed: 1 deployment updated"));
     assert!(!stdout.contains('\u{1b}'), "plain output must be ANSI-free");
     assert_eq!(
         fs::read_to_string(&deployed).expect("accepted update deploys"),
@@ -3618,9 +3624,12 @@ fn grouped_update_plan_uses_target_columns_both_scopes_and_up_alias() {
     assert!(stdout.contains("skill  change"));
     assert!(stdout.contains("claude"));
     assert!(stdout.contains("shared"));
-    assert!(stdout.contains("antigravity"));
-    assert_eq!(stdout.matches("↑ both").count(), 2);
-    assert!(stdout.contains("4 updates across 3 enabled targets"));
+    assert!(
+        !stdout.contains("antigravity"),
+        "a target with no deployment contributes no information: {stdout}"
+    );
+    assert_eq!(stdout.matches("update both").count(), 2);
+    assert!(stdout.contains("4 updates across 2 targets"));
     assert!(!stderr.contains("Use all"));
 
     fs::write(source_skill.join("SKILL.md"), "# Alias\n").expect("change source again");
@@ -3630,9 +3639,7 @@ fn grouped_update_plan_uses_target_columns_both_scopes_and_up_alias() {
         .args(["up", "--yes"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "4 updates across 3 enabled targets",
-        ));
+        .stdout(predicate::str::contains("4 updates across 2 targets"));
 
     let mut no_op = cli(home.path());
     no_op.current_dir(&project);
@@ -3791,13 +3798,10 @@ fn grouped_update_plan_preserves_each_divergent_target_delta() {
         .args(["update", "--claude", "--shared", "--global", "--dry-run"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("2 target-specific changes"))
-        .stdout(predicate::str::contains(
-            "claude · global  1 file changed, +2/-1",
-        ))
-        .stdout(predicate::str::contains(
-            "shared · global  2 files changed, +2/-2",
-        ));
+        .stdout(predicate::str::contains("2 destination-specific changes"))
+        .stdout(predicate::str::contains("claude  1 file changed, +2/-1"))
+        .stdout(predicate::str::contains("shared  2 files changed, +2/-2"))
+        .stdout(predicate::str::contains("Dry run — no changes were made."));
 }
 
 #[test]
@@ -3881,13 +3885,22 @@ fn update_sections_have_one_blank_line_before_results_in_every_confirmation_mode
             stdout.starts_with("Update plan\n\n"),
             "direct update must begin with its plan heading:\n{stdout}"
         );
+        let tail = if dry_run {
+            "1 update across 1 selected target\n\nDry run — no changes were made."
+        } else {
+            "1 update across 1 selected target\n\nUpdated alpha"
+        };
         assert!(
-            stdout.contains("1 update across 1 selected target\n\nUpdated alpha"),
+            stdout.contains(tail),
             "unexpected update section spacing:\n{stdout}"
         );
         assert!(
             !stdout.contains("\n\n\n"),
             "duplicate blank line:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("(dry-run)"),
+            "a dry run concludes once instead of echoing every item:\n{stdout}"
         );
         if dry_run {
             cli(home.path())
@@ -3896,6 +3909,511 @@ fn update_sections_have_one_blank_line_before_results_in_every_confirmation_mode
                 .success();
         }
     }
+}
+
+/// Two skills deployed to two of three enabled targets in global scope.
+///
+/// Antigravity stays enabled but empty, so every plan built from this fixture
+/// exercises significance gating rather than target selection.
+fn update_review_fixture() -> (TempDir, PathBuf) {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "writing-for-agents", "# Writing\n");
+    create_skill(&source, "drafting-commit-message", "# Drafting\n");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    cli(home.path())
+        .args(["--json", "load", "--claude", "--shared", "--global"])
+        .assert()
+        .success();
+    (home, source)
+}
+
+fn change_skill(source: &Path, name: &str, body: &str) {
+    fs::write(source.join(name).join("SKILL.md"), body).expect("change source skill");
+}
+
+fn stdout_of(output: std::process::Output) -> String {
+    String::from_utf8(output.stdout)
+        .expect("utf8 stdout")
+        .replace("\r\n", "\n")
+}
+
+fn stderr_of(output: &std::process::Output) -> String {
+    String::from_utf8(output.stderr.clone())
+        .expect("utf8 stderr")
+        .replace("\r\n", "\n")
+}
+
+/// The approved invocation, whose positional order the plan must preserve.
+const UPDATE_REVIEW_ARGS: [&str; 3] = ["update", "writing-for-agents", "drafting-commit-message"];
+
+const UPDATE_REVIEW_PLAN: &str = "\
+Update plan
+
+Scope  global (inferred)
+
+skill                    change                 claude  shared
+-----------------------  ---------------------  ------  ------
+writing-for-agents       1 file changed, +1/-0  update  update
+drafting-commit-message  1 file changed, +1/-0  update  update
+
+4 updates across 2 targets
+";
+
+/// The whole plan is rendered before the single confirmation, and declining it
+/// says exactly which decisions were inferred.
+#[test]
+fn update_renders_its_whole_plan_before_one_confirmation_and_cancels_specifically() {
+    let (home, source) = update_review_fixture();
+    change_skill(&source, "writing-for-agents", "# Writing\nmore\n");
+    change_skill(&source, "drafting-commit-message", "# Drafting\nmore\n");
+
+    let declined = cli(home.path())
+        .args(UPDATE_REVIEW_ARGS)
+        .write_stdin("n\n")
+        .output()
+        .expect("run declined update");
+    assert!(declined.status.success(), "cancelling is not a failure");
+    assert_eq!(
+        stdout_of(declined.clone()),
+        format!(
+            "{UPDATE_REVIEW_PLAN}Cancelled.\n\
+Hint: targets and deployed scopes were inferred. Re-run with --claude, --shared, --antigravity, --all, or --target NAME, and --global or --project, to narrow this plan.\n"
+        )
+    );
+    assert_eq!(
+        stderr_of(&declined),
+        "Apply this update plan to 2 targets? [Y/n] "
+    );
+    assert_eq!(
+        fs::read_to_string(
+            home.path()
+                .join(".claude/skills/writing-for-agents/SKILL.md")
+        )
+        .expect("declined update writes nothing"),
+        "# Writing\n"
+    );
+}
+
+/// A dry run reviews the plan and concludes once instead of echoing every item.
+#[test]
+fn update_dry_run_renders_the_plan_and_concludes_once() {
+    let (home, source) = update_review_fixture();
+    change_skill(&source, "writing-for-agents", "# Writing\nmore\n");
+    change_skill(&source, "drafting-commit-message", "# Drafting\nmore\n");
+
+    let output = cli(home.path())
+        .args([UPDATE_REVIEW_ARGS.as_slice(), ["--dry-run"].as_slice()].concat())
+        .output()
+        .expect("run dry-run update");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output),
+        format!("{UPDATE_REVIEW_PLAN}\nDry run — no changes were made.\n")
+    );
+    assert_eq!(
+        fs::read_to_string(
+            home.path()
+                .join(".claude/skills/writing-for-agents/SKILL.md")
+        )
+        .expect("dry run writes nothing"),
+        "# Writing\n"
+    );
+}
+
+/// `--yes` still renders the plan, then applies it with a styled summary footer.
+#[test]
+fn update_yes_renders_the_plan_then_applies_with_a_summary_footer() {
+    let (home, source) = update_review_fixture();
+    change_skill(&source, "writing-for-agents", "# Writing\nmore\n");
+    change_skill(&source, "drafting-commit-message", "# Drafting\nmore\n");
+
+    let output = cli(home.path())
+        .args([UPDATE_REVIEW_ARGS.as_slice(), ["--yes"].as_slice()].concat())
+        .output()
+        .expect("run preconfirmed update");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output.clone()),
+        format!(
+            "{UPDATE_REVIEW_PLAN}\n\
+Updated writing-for-agents -> claude\n\
+Updated writing-for-agents -> shared\n\
+Updated drafting-commit-message -> claude\n\
+Updated drafting-commit-message -> shared\n\
+\n\
+completed: 4 deployments updated\n"
+        )
+    );
+    assert!(
+        !stderr_of(&output).contains("Apply this update plan"),
+        "--yes authorizes the plan without asking again"
+    );
+}
+
+/// A target with nothing to do is dropped from the plan, not printed empty.
+#[test]
+fn update_drops_a_target_column_whose_every_cell_is_the_none_value() {
+    let (home, source) = update_review_fixture();
+    change_skill(&source, "writing-for-agents", "# Writing\nmore\n");
+    change_skill(&source, "drafting-commit-message", "# Drafting\nmore\n");
+    let targets = cli(home.path())
+        .args(["--json", "target", "list"])
+        .output()
+        .expect("list targets");
+    let listed = json_events(targets);
+    let antigravity = events_of(&listed, "target.listed")
+        .into_iter()
+        .find(|event| event["data"]["name"] == "antigravity")
+        .expect("antigravity is a configured target");
+    assert_eq!(
+        antigravity["data"]["enabled"], true,
+        "the dropped column must be an enabled target, not an unselected one"
+    );
+
+    let stdout = stdout_of(
+        cli(home.path())
+            .args(["update", "--dry-run"])
+            .output()
+            .expect("run gated update"),
+    );
+    assert!(
+        !stdout.contains("antigravity"),
+        "an all-none column carries no information:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("4 updates across 2 targets"),
+        "a degraded destination phrase must not claim every enabled target:\n{stdout}"
+    );
+}
+
+/// A zero result category is omitted entirely rather than reported as zero.
+#[test]
+fn update_result_footer_omits_zero_categories() {
+    let (home, source) = update_review_fixture();
+    change_skill(&source, "writing-for-agents", "# Writing\nmore\n");
+
+    let partial = stdout_of(
+        cli(home.path())
+            .args(["update", "--yes"])
+            .output()
+            .expect("run partial update"),
+    );
+    assert!(
+        partial.ends_with("completed: 2 deployments updated, unchanged: 2\n"),
+        "both nonzero categories must survive:\n{partial}"
+    );
+
+    change_skill(&source, "writing-for-agents", "# Writing\nmore\nstill\n");
+    change_skill(&source, "drafting-commit-message", "# Drafting\nmore\n");
+    let complete = stdout_of(
+        cli(home.path())
+            .args(["update", "--yes"])
+            .output()
+            .expect("run complete update"),
+    );
+    assert!(
+        complete.ends_with("completed: 4 deployments updated\n"),
+        "an empty unchanged category must vanish, not print as zero:\n{complete}"
+    );
+}
+
+/// An explicitly stated scope is never repeated back as an inferred default.
+#[test]
+fn update_omits_the_scope_line_when_the_scope_was_stated() {
+    let (home, source) = update_review_fixture();
+    change_skill(&source, "writing-for-agents", "# Writing\nmore\n");
+
+    let stdout = stdout_of(
+        cli(home.path())
+            .args(["update", "--global", "--dry-run"])
+            .output()
+            .expect("run explicitly scoped update"),
+    );
+    assert!(
+        !stdout.contains("Scope"),
+        "a stated scope adds nothing when repeated:\n{stdout}"
+    );
+    assert_eq!(
+        stdout,
+        "\
+Update plan
+
+skill               change                 claude  shared
+------------------  ---------------------  ------  ------
+writing-for-agents  1 file changed, +1/-0  update  update
+
+2 updates across 2 targets
+
+Dry run — no changes were made.
+"
+    );
+}
+
+/// The plan is reviewed and applied in the order the user named the skills.
+#[test]
+fn update_reviews_and_applies_skills_in_the_order_they_were_requested() {
+    let (home, source) = update_review_fixture();
+    change_skill(&source, "writing-for-agents", "# Writing\nmore\n");
+    change_skill(&source, "drafting-commit-message", "# Drafting\nmore\n");
+
+    let reversed = stdout_of(
+        cli(home.path())
+            .args([
+                "update",
+                "drafting-commit-message",
+                "writing-for-agents",
+                "--yes",
+            ])
+            .output()
+            .expect("run reversed update"),
+    );
+    let rows = reversed
+        .lines()
+        .filter(|line| line.contains("1 file changed"))
+        .map(|line| line.split_whitespace().next().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        ["drafting-commit-message", "writing-for-agents"],
+        "reviewing in request order is not alphabetical order:\n{reversed}"
+    );
+    let applied = reversed
+        .lines()
+        .filter(|line| line.starts_with("Updated "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        applied,
+        [
+            "Updated drafting-commit-message -> claude",
+            "Updated drafting-commit-message -> shared",
+            "Updated writing-for-agents -> claude",
+            "Updated writing-for-agents -> shared",
+        ],
+        "apply must honour the order the plan promised:\n{reversed}"
+    );
+}
+
+/// With no positional names the sequence comes from discovery, not the
+/// alphabet, and apply must still follow exactly what the plan rendered.
+#[test]
+fn update_reviews_and_applies_in_discovery_order_when_nothing_was_named() {
+    let home = sandbox();
+    let later = home.path().join("later");
+    create_skill(&later, "zebra-skill", "# Zebra\n");
+    let earlier = home.path().join("earlier");
+    create_skill(&earlier, "alpha-skill", "# Alpha\n");
+    for (path, name) in [(&later, "later"), (&earlier, "earlier")] {
+        cli(home.path())
+            .args([
+                "--json",
+                "source",
+                "add",
+                path.to_str().expect("utf8 source"),
+                name,
+            ])
+            .assert()
+            .success();
+    }
+    cli(home.path())
+        .args(["--json", "load", "--claude", "--global"])
+        .assert()
+        .success();
+    change_skill(&later, "zebra-skill", "# Zebra\nmore\n");
+    change_skill(&earlier, "alpha-skill", "# Alpha\nmore\n");
+
+    let stdout = stdout_of(
+        cli(home.path())
+            .args(["update", "--yes"])
+            .output()
+            .expect("run unnamed update"),
+    );
+    let rows = stdout
+        .lines()
+        .filter(|line| line.contains("1 file changed"))
+        .map(|line| line.split_whitespace().next().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        ["zebra-skill", "alpha-skill"],
+        "the fallback sequence is discovery order, not alphabetical:\n{stdout}"
+    );
+    let applied = stdout
+        .lines()
+        .filter(|line| line.starts_with("Updated "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        applied,
+        [
+            "Updated zebra-skill -> claude",
+            "Updated alpha-skill -> claude",
+        ],
+        "apply must honour the order the plan promised:\n{stdout}"
+    );
+}
+
+/// A terminal user reviews the same plan in the symbol vocabulary, in color.
+#[test]
+fn update_renders_the_interactive_symbol_and_color_plan_for_a_terminal_user() {
+    let (home, source) = update_review_fixture();
+    change_skill(&source, "writing-for-agents", "# Writing\nmore\n");
+    change_skill(&source, "drafting-commit-message", "# Drafting\nmore\n");
+
+    let stdout = stdout_of(
+        cli(home.path())
+            .env_remove("NO_COLOR")
+            .env("SKILL_MANAGER_FORCE_INTERACTIVE", "1")
+            .args(
+                [
+                    UPDATE_REVIEW_ARGS.as_slice(),
+                    ["--color", "always", "--dry-run"].as_slice(),
+                ]
+                .concat(),
+            )
+            .output()
+            .expect("run interactive dry-run update"),
+    );
+    assert_eq!(
+        stdout,
+        "\u{1b}[1;36mUpdate plan\u{1b}[0m\n\
+\n\
+Scope  🌐 global (inferred)\n\
+\n\
+skill                    change                 claude  shared\n\
+-----------------------  ---------------------  ------  ------\n\
+writing-for-agents       1 file changed, +1/-0  \u{1b}[33m↑\u{1b}[0m       \u{1b}[33m↑\u{1b}[0m\n\
+drafting-commit-message  1 file changed, +1/-0  \u{1b}[33m↑\u{1b}[0m       \u{1b}[33m↑\u{1b}[0m\n\
+\n\
+4 updates across 2 targets\n\
+\n\
+Dry run — no changes were made.\n"
+    );
+}
+
+/// A skill that exists but is deployed nowhere reports precisely that.
+#[test]
+fn update_names_a_skill_that_is_deployed_nowhere() {
+    let (home, source) = update_review_fixture();
+    create_skill(&source, "wait-what", "# Wait\n");
+
+    let output = cli(home.path())
+        .args(["update", "wait-what"])
+        .output()
+        .expect("run undeployed update");
+    assert!(
+        output.status.success(),
+        "an accurate no-op is not a failure"
+    );
+    assert_eq!(
+        stdout_of(output),
+        "wait-what is not deployed to any enabled target in global or project scope.\n"
+    );
+}
+
+/// A noninteractive human-facing run must authorize its plan explicitly.
+#[test]
+fn update_requires_explicit_authorization_without_input() {
+    let (home, source) = update_review_fixture();
+    change_skill(&source, "writing-for-agents", "# Writing\nmore\n");
+
+    let output = cli(home.path())
+        .args(["update", "--no-input"])
+        .output()
+        .expect("run noninteractive update");
+    assert!(!output.status.success());
+    assert!(stdout_of(output.clone()).contains("2 updates across 2 targets"));
+    assert!(
+        stderr_of(&output).contains("applying this plan noninteractively requires --yes."),
+        "{}",
+        stderr_of(&output)
+    );
+
+    cli(home.path())
+        .args(["update", "--no-input", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("completed: 2 deployments updated"));
+}
+
+/// The structured plan event mirrors the rendered plan before anything applies.
+#[test]
+fn update_emits_a_structured_plan_event_before_applying() {
+    let (home, source) = update_review_fixture();
+    change_skill(&source, "writing-for-agents", "# Writing\nmore\n");
+
+    let events = json_events(
+        cli(home.path())
+            .args(["--json", "update"])
+            .output()
+            .expect("run machine update"),
+    );
+    let plans = events_of(&events, "plan");
+    assert_eq!(plans.len(), 1, "one revision was reviewed");
+    let data = plans[0]["data"].clone();
+    assert_eq!(data["plan_id"], "update:writing-for-agents");
+    assert_eq!(data["revision"], 0);
+    assert_eq!(data["command"], "update");
+    assert_eq!(data["dry_run"], false);
+    assert_eq!(data["authorization"]["kind"], "binary");
+    assert_eq!(data["authorization"]["mode"], "noninteractive");
+    assert_eq!(data["selection"]["targets"]["mode"], "inferred");
+    assert_eq!(
+        data["selection"]["targets"]["names"],
+        serde_json::json!(["claude", "shared", "antigravity"]),
+        "the machine stream reports the resolved selection, never the gated columns"
+    );
+    assert_eq!(
+        data["selection"]["scope"],
+        serde_json::json!({ "mode": "inferred", "value": "global" })
+    );
+    assert_eq!(
+        data["destinations"],
+        serde_json::json!([
+            {
+                "id": "claude:global",
+                "kind": "deployment",
+                "label": "claude · global",
+                "target": "claude",
+                "scope": "global"
+            },
+            {
+                "id": "shared:global",
+                "kind": "deployment",
+                "label": "shared · global",
+                "target": "shared",
+                "scope": "global"
+            }
+        ])
+    );
+    assert_eq!(data["entries"][0]["skill"], "writing-for-agents");
+    assert_eq!(data["entries"][0]["actions"][0]["operation"], "update");
+    assert_eq!(
+        data["entries"][0]["actions"][0]["destination"],
+        "claude:global"
+    );
+    assert_eq!(data["entries"][0]["actions"][0]["existed"], true);
+    assert_eq!(
+        data["summary"],
+        serde_json::json!({ "skills": 1, "actions": 2, "update": 2 })
+    );
+    let plan_index = events
+        .iter()
+        .position(|event| event["event"] == "plan")
+        .expect("plan event position");
+    let first_write = events
+        .iter()
+        .position(|event| event["event"] == "skill.updated")
+        .expect("applied event position");
+    assert!(plan_index < first_write, "the plan precedes every write");
 }
 
 #[test]

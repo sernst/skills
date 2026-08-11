@@ -51,6 +51,11 @@ The comments in this section are machine-checked against production emit sites.
 - `config.shown`: active config, storage roots, persistence, and backups.
 <!-- event: diagnostic -->
 - `diagnostic`: warning message, sometimes with an unmatched `pattern`.
+<!-- event: plan -->
+- `plan`: revision `0` of a reviewable change plan, emitted before any prompt.
+<!-- event: plan.updated -->
+- `plan.updated`: a later revision of the same `plan_id`, narrowed by decisions
+  already resolved.
 <!-- event: skill.copied -->
 - `skill.copied`: copy plan or committed copy.
 <!-- event: skill.import-planned -->
@@ -326,6 +331,33 @@ command, such as `remove`, `update`, `import`, `configs.reset`, or
 Other source, target, and configuration lifecycle commands finish with their
 specific event and do not emit `summary`. Do not require `summary` as a generic
 success condition.
+
+<!-- payload: plan fields: authorization,command,decisions,destinations,dry_run,entries,plan_id,revision,selection,summary -->
+`plan` and `plan.updated` share one payload. `plan_id` correlates every revision
+of the same decision; `revision` starts at `0` and increments once per
+re-render. Unlike the human rendering, this payload is never significance-gated:
+`selection.targets.names` always lists every selected target, so a target that
+was selected but had no work is distinguishable from one that was never
+selected. `destinations` lists every destination some entry or decision
+alternative references.
+
+`authorization.kind` is `binary` for a yes/no confirmation and `progressive`
+when the plan carries decision dimensions. A progressive plan also reports
+`sequence` (dimension ids in prompt order), `resolved` (dimension id to chosen
+option id), `pending`, and, when a prompt follows this revision, `prompt` with
+the live `dimension`. Each entry lists `actions` it will perform and, when the
+plan exposes availability rather than decided writes, `available` destination
+ids.
+
+`decisions` is present whenever the plan carries dimensions and describes all of
+them, resolved and pending alike, so the payload matches the plan the user
+reviewed. Each decision reports `id`, `prompt`, `state` (`resolved` or
+`pending`), the chosen `resolved` option id once answered, and every `option`.
+An option carries `id`, `token`, `label`, `recommended`, its rendered `effect`
+clause, and a typed `consequence` holding the `operation` it performs, the
+`path` it identifies, the per-destination `actions` it would write (each with
+its own `diff`), and named aggregate `totals` for a blast radius too wide to
+enumerate.
 
 ## Completion and failure
 

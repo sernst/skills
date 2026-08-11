@@ -69,6 +69,141 @@ and backup metadata. `config.reset` and `config.restored` identify backup IDs
 and paths but never include backup bytes. Layout migration emits
 `config.migrated`; collision cleanup guidance remains a diagnostic warning.
 
+## The plan event
+
+A mutating command that renders a plan for review also emits one event per
+rendered revision, always before anything is written: `plan` for revision `0`
+and `plan.updated` for every narrowed re-render that follows. `update` emits it
+today; `load`, `remove`, `copy`, and `import` adopt it as they migrate.
+
+```json
+{
+  "plan_id": "update:writing-for-agents",
+  "revision": 0,
+  "command": "update",
+  "dry_run": false,
+  "authorization": { "kind": "binary", "mode": "prompt", "default": true },
+  "selection": {
+    "targets": {
+      "mode": "inferred",
+      "names": ["claude", "shared", "antigravity"]
+    },
+    "scope": { "mode": "inferred", "value": "global" }
+  },
+  "destinations": [
+    {
+      "id": "claude:global",
+      "kind": "deployment",
+      "label": "claude · global",
+      "target": "claude",
+      "scope": "global"
+    }
+  ],
+  "entries": [
+    {
+      "skill": "writing-for-agents",
+      "actions": [
+        {
+          "operation": "update",
+          "destination": "claude:global",
+          "existed": true,
+          "diff": {
+            "files_changed": 1,
+            "insertions": 1,
+            "files": [
+              { "path": "SKILL.md", "change": "modified", "insertions": 1 }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "summary": { "skills": 1, "actions": 2, "update": 2 }
+}
+```
+
+`plan_id` is stable across the revisions of one invocation and `revision` counts
+from `0`, so a progressively narrowed multi-prompt plan is reconstructable.
+
+`authorization.kind` is `binary` or `progressive`; `authorization.mode` is
+`prompt`, `yes`, `dry-run`, or `noninteractive`, and `default` is present only
+for a prompt that has one. A `progressive` plan additionally reports `sequence`
+(dimension ids in prompt order), `resolved` (dimension id to the chosen option
+id), `pending`, and, when a prompt follows this revision, `prompt` naming the
+live `dimension`:
+
+```json
+"authorization": {
+  "kind": "progressive",
+  "mode": "prompt",
+  "sequence": ["source_copy", "propagation"],
+  "resolved": { "source_copy": "shared:global" },
+  "pending": ["propagation"],
+  "prompt": { "dimension": "propagation" }
+}
+```
+
+A plan that carries dimensions also carries a `decisions` array describing all
+of them — resolved and pending alike — so the payload always describes the whole
+plan the user reviewed rather than only the question currently on screen. The
+alternatives are never gated out once answered, because automation must be able
+to tell which alternatives were declined:
+
+```json
+"decisions": [
+  {
+    "id": "source_copy",
+    "prompt": "Select source copy",
+    "state": "resolved",
+    "resolved": "shared:global",
+    "options": [
+      {
+        "id": "shared:global",
+        "token": "2",
+        "label": "shared · global",
+        "consequence": {
+          "operation": "import",
+          "path": "C:\\Users\\swern\\.agents\\skills\\importing-meeting-notes",
+          "actions": [
+            { "operation": "import", "destination": "personal:source", "existed": true, "diff": { "files_changed": 2, "insertions": 9, "deletions": 7, "files": [] } },
+            { "operation": "update", "destination": "claude:global", "existed": true, "diff": { "files_changed": 2, "insertions": 9, "deletions": 7, "files": [] } },
+            { "operation": "skip", "destination": "shared:global", "existed": true }
+          ],
+          "totals": { "deployments": 5 }
+        }
+      }
+    ]
+  }
+]
+```
+
+An option reports `id`, `token`, `label`, `recommended` when it is guidance, its
+rendered `effect` clause, and a typed `consequence`. The consequence holds the
+`operation` the option performs, the `path` it identifies, the per-destination
+`actions` it would write with their own diffs, and named aggregate `totals` for
+a blast radius too wide to enumerate per destination — which is how `remove`
+states each scope option's cost across every skill at once.
+
+Each `selection` dimension reports whether it was `explicit` or `inferred`.
+Unlike the rendered plan, `selection` is never significance gated:
+`targets.names` lists every selected target even when one of them turned out to
+have no work, so a target that was selected and idle stays distinguishable from
+one that was never selected. A `destination` is a target/scope deployment
+(`kind: "deployment"`), an arbitrary directory (`kind: "path"`, with `path`), or
+a canonical source (`kind: "source"`, with `source`); every destination some
+entry or decision alternative references is listed.
+
+An entry lists the `actions` it will perform and, for a plan that exposes where
+an item exists without yet deciding what to do about it, an `available` array of
+destination ids. Availability is evidence, not an operation, and never counts as
+an action.
+
+Significance gating is a property of human rendering and never reaches this
+stream. The payload omits only what is genuinely absent: a zero metric, an empty
+diff, an inapplicable field. `summary` always carries `skills` and `actions`,
+adds `available` when the plan carries availability, and adds one nonzero count
+per operation.
+
 ## Exit status and streams
 
 Normal completion, no work, and user cancellation return `0`. Operational,
