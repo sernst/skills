@@ -70,7 +70,7 @@ remain valid projects.
 | Add this repository's skills | `skill-manager source add sernst/skills/skills sernst-skills --label "sernst skills"` |
 | List sources | `skill-manager source list` |
 | Preview one global shared skill | `skill-manager load sernst-skills --filter managing-skills --shared --global --dry-run --no-input` |
-| Deploy it | `skill-manager load sernst-skills --filter managing-skills --shared --global --no-input` |
+| Deploy it | `skill-manager load sernst-skills --filter managing-skills --shared --global --yes --no-input` |
 | Inspect it in both scopes | `skill-manager status managing-skills --shared --no-input` |
 | Preview updates to existing copies | `skill-manager update sernst-skills --filter managing-skills --all --dry-run --no-input` |
 | Adopt an agent-modified copy back into its source | `skill-manager import managing-skills --claude --global --dry-run --no-input` |
@@ -107,23 +107,29 @@ deployed in eligible targets/scopes; it never creates a new deployment.
 | `--global`/`-g`, `--project`/`-p` | Select installation scope. |
 | `--dry-run` | Plan without deploying skills. |
 | `--refresh` | Force GitHub cache refresh. |
-| `--yes`/`-y` (`update` only) | Skip the plan confirmation; the plan still prints. |
+| `--yes`/`-y` | Skip the plan confirmation; the plan still prints. |
 
-Interactive `update` uses enabled targets without a preliminary question. Its
-plan omits unchanged skills and shows one row per changed skill with selected
-target columns whose cells say global, project, both, or no action. Divergent
-target deltas remain visible in compact details below the row. Summaries call
+Both `load` and `update` render one complete plan before a single `[Y/n]`
+confirmation; neither asks a preliminary question about target or scope first.
+`load`'s plan distinguishes new installs from overwrites of an existing
+deployment; deployments that are already byte-identical are hidden from the
+table and reported only as a footer count. `update`'s plan omits unchanged
+skills entirely and shows one row per changed skill with selected target
+columns whose cells say global, project, both, or no action. Divergent target
+deltas remain visible in compact details below the row. Summaries call
 implicit targets enabled and explicit targets selected. A no-op prints one
-concise line and asks nothing. Declining a changed plan cancels with exit `0` and
-no deployment. `--yes` and `--dry-run` print the same plan without prompting,
-and machine mode keeps its event-only contract.
+concise line and asks nothing. Declining a plan cancels with exit `0`, no
+writes, and a hint naming only the flags that were actually inferred. `--yes`
+and `--dry-run` print the same plan without prompting, and machine mode keeps
+its event-only contract.
 
 In interactive `load`, scope defaults to project when a selected target's
 leading directory already exists in CWD; otherwise global. Non-interactive
-`load`, including dry-run, requires an explicit scope outside the manager home;
-at home it safely uses global. Unscoped `update` infers all existing deployments,
-including both scopes. `load` in non-interactive mode must explicitly select
-targets; update uses enabled targets when none are specified.
+`load`, including dry-run, infers the same project-vs-global default silently
+when no scope is given; at home it safely uses global. Unscoped `update`
+infers all existing deployments, including both scopes. `load` in
+non-interactive mode infers enabled targets silently, exactly like `update`,
+when none are specified.
 
 ### `import`
 
@@ -171,11 +177,16 @@ Both only apply once a candidate exists, so an up-to-date source never prompts.
 ### `copy`
 
 ```text
-skill-manager copy SOURCE DESTINATION [--filter PATTERN ...] [--dry-run] [--refresh]
+skill-manager copy SOURCE DESTINATION [--filter PATTERN ...] [--dry-run] [--refresh] [--yes]
 ```
 
 Copies selected discovered skills to an arbitrary destination. `--filter` is
 repeatable and ORed. Copy does not use deployment target or scope selectors.
+It renders one complete plan before a `[Y/n]` confirmation, exactly like
+`load`. With exactly one matched skill the plan collapses to a single
+sentence instead of a table, since there is only one destination and one row.
+`--yes` and `--dry-run` behave as they do for `load`; declining cancels with
+exit `0` and no writes.
 
 ### `remove`
 

@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 
 use crate::cli::{
     Cli, Command, ConfigsAction, ConfigsArgs, ConfigsConfirmArgs, ConfigsRestoreArgs, CopyArgs,
-    ImportArgs, RemoveArgs, ResolveArgs, ScopeSelection, SourceAction, SourceAddArgs,
+    ImportArgs, LoadArgs, RemoveArgs, ResolveArgs, ScopeSelection, SourceAction, SourceAddArgs,
     SourceAlternateArgs, SourceArgs, SourceLocateArgs, SourceModeArg, SourceRemoveArgs,
     SourceSelection, SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction,
     TargetArgs, TargetNameArgs, TargetPathArgs, TargetSelection, UpdateArgs,
@@ -93,7 +93,7 @@ pub fn apply_recipe(cli: &mut Cli) -> Result<()> {
 
 fn overlay_command(command: &mut Command, object: &Map<String, Value>, base: &Path) -> Result<()> {
     match command {
-        Command::Load(args) => overlay_sync(args, object, base),
+        Command::Load(args) => overlay_load(args, object, base),
         Command::Update(args) => overlay_update(args, object, base),
         Command::Import(args) => overlay_import(args, object),
         Command::Copy(args) => overlay_copy(args, object, base),
@@ -110,7 +110,7 @@ fn overlay_command(command: &mut Command, object: &Map<String, Value>, base: &Pa
     Ok(())
 }
 
-fn overlay_sync(args: &mut SyncArgs, object: &Map<String, Value>, _base: &Path) -> Result<()> {
+fn overlay_load(args: &mut LoadArgs, object: &Map<String, Value>, _base: &Path) -> Result<()> {
     reject_unknown(
         object,
         &[
@@ -134,9 +134,11 @@ fn overlay_sync(args: &mut SyncArgs, object: &Map<String, Value>, _base: &Path) 
             "refresh",
             "global",
             "project",
+            "yes",
         ],
     )?;
-    overlay_sync_fields(args, object)
+    overlay_sync_fields(&mut args.sync, object)?;
+    overlay_bool(&mut args.yes, object.get("yes"))
 }
 
 fn overlay_update(args: &mut UpdateArgs, object: &Map<String, Value>, _base: &Path) -> Result<()> {
@@ -221,11 +223,13 @@ fn overlay_copy(args: &mut CopyArgs, object: &Map<String, Value>, base: &Path) -
             "filters",
             "dry_run",
             "refresh",
+            "yes",
         ],
     )?;
     overlay_strings(&mut args.filters, object, &["filters", "filter"])?;
     overlay_bool(&mut args.dry_run, object.get("dry_run"))?;
     overlay_bool(&mut args.refresh, object.get("refresh"))?;
+    overlay_bool(&mut args.yes, object.get("yes"))?;
     if args.source.is_empty() {
         args.source = first_string(object, &["source"])?.unwrap_or_default();
     }
@@ -759,7 +763,7 @@ fn canonical_command(value: &str) -> Result<&'static str> {
 
 fn default_command(name: &str) -> Result<Command> {
     match name {
-        "load" => Ok(Command::Load(SyncArgs::default())),
+        "load" => Ok(Command::Load(LoadArgs::default())),
         "update" => Ok(Command::Update(UpdateArgs::default())),
         "import" => Ok(Command::Import(ImportArgs::default())),
         "remove" => Ok(Command::Remove(RemoveArgs::default())),
@@ -864,6 +868,7 @@ fn build_required_command(name: &str) -> Result<Command> {
             filters: Vec::new(),
             dry_run: false,
             refresh: false,
+            yes: false,
         })),
         "source.update" => Ok(Command::Source(SourceArgs {
             action: SourceAction::Update(SourceUpdateArgs {
@@ -1147,13 +1152,13 @@ mod tests {
         let Some(Command::Load(args)) = cli.command else {
             unreachable!("load command");
         };
-        assert_eq!(args.sources.len(), 2);
-        assert_eq!(args.filters, ["a*"]);
-        assert!(args.source_selection.cd);
-        assert!(args.targets.claude);
-        assert_eq!(args.targets.target_names, ["disabled"]);
-        assert!(args.dry_run && args.refresh && cli.no_input);
-        assert!(args.scope.project && !args.scope.global);
+        assert_eq!(args.sync.sources.len(), 2);
+        assert_eq!(args.sync.filters, ["a*"]);
+        assert!(args.sync.source_selection.cd);
+        assert!(args.sync.targets.claude);
+        assert_eq!(args.sync.targets.target_names, ["disabled"]);
+        assert!(args.sync.dry_run && args.sync.refresh && cli.no_input);
+        assert!(args.sync.scope.project && !args.sync.scope.global);
 
         let cli = inline_recipe(&json!({
             "command": "remove",
@@ -1377,8 +1382,8 @@ mod tests {
         let Some(Command::Load(args)) = cli.command else {
             unreachable!("load command");
         };
-        assert!(args.scope.global);
-        assert!(!args.scope.project);
+        assert!(args.sync.scope.global);
+        assert!(!args.sync.scope.project);
 
         let mut invalid_type = Cli::try_parse_from([
             "skill-manager",

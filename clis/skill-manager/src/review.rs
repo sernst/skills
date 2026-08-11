@@ -161,6 +161,29 @@ pub struct PlanRow {
     pub availability: Vec<String>,
 }
 
+impl PlanRow {
+    /// Whether this row carries no information a human reviewer needs to see.
+    ///
+    /// A row is dormant when every planned action is a no-op
+    /// [`PlanAction::Skip`] and it lists no bare availability either — the
+    /// exact shape `load` gives an already-identical deployment so it can
+    /// still be counted precisely (`existed`, a stable destination id, an
+    /// empty diff) in the machine event, while never earning a table row, a
+    /// column, or a progress line a human did not need. Significance gating
+    /// hides dormant rows from rendering; it never removes them from
+    /// [`ChangePlan::rows`] itself, so the structured `plan` event — which
+    /// walks `rows` directly — stays complete.
+    #[must_use]
+    pub fn is_dormant(&self) -> bool {
+        self.availability.is_empty()
+            && !self.actions.is_empty()
+            && self
+                .actions
+                .iter()
+                .all(|action| action.action == PlanAction::Skip)
+    }
+}
+
 /// One nested consequence line inside a preview block or option field.
 #[derive(Clone, Debug, Default)]
 pub struct PreviewEntry {
@@ -333,6 +356,21 @@ pub struct ChangePlan {
     pub decisions: Vec<Decision>,
     /// Whether a prompt follows this revision, which is what earns a cancel line.
     pub prompting: bool,
+    /// Whether the structured `summary` buckets nonzero action counts by
+    /// `new`/`overwrite` (from [`PlannedAction::existed`]) instead of by the
+    /// rendered action word.
+    ///
+    /// `load` and `copy` render two different cell words for a "new" write
+    /// (`load`/`copy`) but share `update`'s word for an overwrite, because the
+    /// cell vocabulary is about *what a destination looked like before*, not
+    /// which command is running. The summary should report the plan's own
+    /// footer categories (`new`/`overwrite`) rather than an ambiguous cell
+    /// word that would collide with the unrelated `update` command's summary
+    /// key. `update`, `import`, and `remove` keep one operation meaning per
+    /// action word, so they leave this `false` and bucket by the action word
+    /// as before. A [`PlanAction::Skip`] entry always buckets as `skip`
+    /// regardless of this flag — it is neither a new write nor an overwrite.
+    pub distinguishes_overwrites: bool,
 }
 
 impl ChangePlan {
@@ -349,10 +387,25 @@ impl ChangePlan {
         let mut actions = 0_usize;
         let mut availability = 0_usize;
         for row in &self.rows {
-            let action_ids = row.actions.iter().map(|action| action.destination.as_str());
-            let availability_ids = row.availability.iter().map(String::as_str);
+            // Totals stay complete over every row so the structured event and
+            // `is_empty` reflect the whole plan; only the rendering-facing
+            // column/scope set below is restricted to what a human actually
+            // sees, because a dormant row's destination must not keep an
+            // otherwise-all-none column alive in the table.
             actions += row.actions.len();
             availability += row.availability.len();
+            if row.is_dormant() {
+                continue;
+            }
+            // A `Skip` action is a no-op: it must not keep an otherwise
+            // all-none column alive, or `uniform_scope` uniform just because
+            // one row happened to also touch it with real work elsewhere.
+            let action_ids = row
+                .actions
+                .iter()
+                .filter(|action| action.action != PlanAction::Skip)
+                .map(|action| action.destination.as_str());
+            let availability_ids = row.availability.iter().map(String::as_str);
             for id in action_ids.chain(availability_ids) {
                 let Some(destination) = by_id.get(id) else {
                     continue;
@@ -449,12 +502,32 @@ impl PlanView<'_> {
         self.uniform_scope.is_none()
     }
 
-    /// Rows whose destinations disagree about their change description.
+    /// Rows a human reviewer needs to see, in plan order.
+    ///
+    /// A dormant row (every action a no-op skip, no bare availability) is
+    /// evidence for the machine event only — [`plan_event_data`] still walks
+    /// [`ChangePlan::rows`] directly and reports it precisely — but it earns
+    /// no table row, no column, and no progress line here.
     #[must_use]
-    pub fn detail_rows(&self) -> Vec<&PlanRow> {
+    pub fn visible_rows(&self) -> Vec<&PlanRow> {
         self.plan
             .rows
             .iter()
+            .filter(|row| !row.is_dormant())
+            .collect()
+    }
+
+    /// Rows whose destinations disagree about their change description.
+    ///
+    /// A [`PlanAction::Skip`] carries no description and is never itself a
+    /// divergence — a no-op destination sitting alongside a real change must
+    /// not force detail-row expansion, or every dormant destination that
+    /// happens to share a row with a genuine action would spuriously earn a
+    /// "N destination-specific changes" grouping.
+    #[must_use]
+    pub fn detail_rows(&self) -> Vec<&PlanRow> {
+        self.visible_rows()
+            .into_iter()
             .filter(|row| Self::descriptions(row).len() > 1)
             .collect()
     }
@@ -462,6 +535,7 @@ impl PlanView<'_> {
     fn descriptions(row: &PlanRow) -> BTreeSet<&str> {
         row.actions
             .iter()
+            .filter(|action| action.action != PlanAction::Skip)
             .map(|action| action.description.as_str())
             .collect()
     }
@@ -579,7 +653,7 @@ pub fn render_plan(view: &PlanView<'_>, style: RenderStyle) -> Vec<String> {
                 .collect(),
         );
     }
-    if !plan.rows.is_empty() {
+    if !view.visible_rows().is_empty() {
         if let Some(body_heading) = &plan.body_heading {
             chunks.push(vec![heading(body_heading, style.color)]);
         }
@@ -611,11 +685,12 @@ pub fn render_plan(view: &PlanView<'_>, style: RenderStyle) -> Vec<String> {
 /// A table needs at least two rows or at least two significant destinations;
 /// one item at one destination is a sentence.
 fn render_body(view: &PlanView<'_>, style: RenderStyle) -> Vec<String> {
-    let plan = view.plan;
-    if plan.rows.len() == 1 && view.actions == 1 && view.availability == 0 {
-        return plan
-            .rows
-            .iter()
+    let rows = view.visible_rows();
+    let visible_actions = rows.iter().map(|row| row.actions.len()).sum::<usize>();
+    let visible_availability = rows.iter().map(|row| row.availability.len()).sum::<usize>();
+    if rows.len() == 1 && visible_actions == 1 && visible_availability == 0 {
+        return rows
+            .into_iter()
             .flat_map(|row| render_sentence(view, row, style))
             .collect();
     }
@@ -650,18 +725,17 @@ fn render_sentence(view: &PlanView<'_>, row: &PlanRow, style: RenderStyle) -> Ve
 
 fn render_table(view: &PlanView<'_>, style: RenderStyle) -> Vec<String> {
     let plan = view.plan;
-    let provenance = plan
-        .rows
+    let visible = view.visible_rows();
+    let provenance = visible
         .iter()
         .filter_map(|row| row.provenance.clone())
         .collect::<BTreeSet<_>>();
     let show_provenance = provenance.len() > 1;
     let show_metric =
-        plan.metric_header.is_some() && plan.rows.iter().any(|row| row.metric.is_some());
-    let changes = plan
-        .rows
+        plan.metric_header.is_some() && visible.iter().any(|row| row.metric.is_some());
+    let changes = visible
         .iter()
-        .map(PlanView::change_cell)
+        .map(|row| PlanView::change_cell(row))
         .collect::<Vec<_>>();
     let show_change = changes.iter().any(|change| !change.is_empty());
 
@@ -679,8 +753,8 @@ fn render_table(view: &PlanView<'_>, style: RenderStyle) -> Vec<String> {
     }
     headers.extend(view.columns.iter().cloned());
 
-    let mut rows = Vec::with_capacity(plan.rows.len());
-    for (row, change) in plan.rows.iter().zip(changes) {
+    let mut rows = Vec::with_capacity(visible.len());
+    for (row, change) in visible.iter().zip(changes) {
         let mut measured = vec![row.identity.clone()];
         let mut rendered = vec![row.identity.clone()];
         if show_provenance {
@@ -750,7 +824,9 @@ fn render_details(view: &PlanView<'_>) -> Vec<String> {
             .filter_map(|destination| {
                 row.actions
                     .iter()
-                    .find(|action| action.destination == destination.id)
+                    .find(|action| {
+                        action.destination == destination.id && action.action != PlanAction::Skip
+                    })
                     .map(|action| {
                         let label = if view.show_locations() {
                             destination.label.clone()
@@ -1288,7 +1364,13 @@ fn plan_totals(view: &PlanView<'_>) -> Value {
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     for row in &view.plan.rows {
         for action in &row.actions {
-            *counts.entry(action.action.as_str()).or_default() += 1;
+            let bucket = if view.plan.distinguishes_overwrites && action.action != PlanAction::Skip
+            {
+                if action.existed { "overwrite" } else { "new" }
+            } else {
+                action.action.as_str()
+            };
+            *counts.entry(bucket).or_default() += 1;
         }
     }
     for (name, count) in counts {
@@ -1462,7 +1544,7 @@ pub fn heading(text: &str, color: bool) -> String {
     }
 }
 
-fn colored(text: &str, code: Option<u8>, color: bool) -> String {
+pub(crate) fn colored(text: &str, code: Option<u8>, color: bool) -> String {
     match (color, code) {
         (true, Some(code)) => format!("\u{1b}[{code}m{text}\u{1b}[0m"),
         _ => text.to_owned(),
@@ -1526,6 +1608,7 @@ mod tests {
             blocks: Vec::new(),
             decisions: Vec::new(),
             prompting: false,
+            distinguishes_overwrites: false,
         }
     }
 
@@ -1830,6 +1913,7 @@ mod tests {
             blocks: Vec::new(),
             decisions: vec![decision],
             prompting,
+            distinguishes_overwrites: false,
         }
     }
 
@@ -2344,6 +2428,7 @@ mod tests {
             blocks,
             decisions,
             prompting: true,
+            distinguishes_overwrites: false,
         }
     }
 

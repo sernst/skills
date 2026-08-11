@@ -28,13 +28,13 @@ use crate::domain::{
 use crate::error::{Result, SkillManagerError};
 use crate::event::{Level, Reporter};
 use crate::plan::{
-    DiffStat, GroupedUpdateEntry, PlanAction, diff_directories, file_change_lines,
+    DiffStat, GroupedUpdateEntry, PlanAction, creation_line, diff_directories, file_change_lines,
     grouped_update_table, totals_line,
 };
 use crate::prompt::Prompt;
 use crate::review::{
     ChangePlan, Destination, DestinationKind, PlanAuthorization, PlanRow, PlanSelection,
-    PlannedAction, RenderStyle, ResultEntry, ResultMarker, destination_label, location_of,
+    PlannedAction, RenderStyle, ResultEntry, ResultMarker, colored, destination_label, location_of,
     location_text, plan_event_data, render_plan, result_footer,
 };
 use crate::skills::{
@@ -109,6 +109,27 @@ struct UpdateRun<'r> {
     confirmed: bool,
 }
 
+/// Everything `load` needs after discovery to review, authorize, and apply.
+///
+/// Mirrors [`UpdateRun`] exactly, minus `requested`: `load` differs in that
+/// every step shares one inferred-or-explicit scope decided up front, rather
+/// than a per-step scope search across already-deployed targets, and it has
+/// no per-named-skill "not deployed anywhere" message (installing is always
+/// actionable, so an empty step list only ever means no targets exist).
+struct LoadRun<'r> {
+    args: &'r SyncArgs,
+    steps: Vec<SyncStep>,
+    target_names: Vec<String>,
+    /// The single scope every step shares, decided before any step exists.
+    scope: Scope,
+    /// Folded skill names in the single order both review and apply follow.
+    review_order: Vec<String>,
+    glob_patterns: Vec<String>,
+    has_targets: bool,
+    positional_matched: bool,
+    confirmed: bool,
+}
+
 /// Outcome converted to the executable exit code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunOutcome {
@@ -175,7 +196,9 @@ where
         let mut config = loaded.config;
         match command {
             Command::Load(args) => {
-                self.run_sync(&config, &args, false, true)?;
+                if !self.run_sync(&config, &args.sync, false, args.yes)? {
+                    return Ok(RunOutcome::Cancelled);
+                }
             }
             Command::Update(args) => {
                 if !self.run_sync(&config, &args.sync, true, args.yes)? {
@@ -188,7 +211,9 @@ where
                 }
             }
             Command::Copy(args) => {
-                self.run_copy(&config, &args)?;
+                if !self.run_copy(&config, &args)? {
+                    return Ok(RunOutcome::Cancelled);
+                }
             }
             Command::Remove(args) => {
                 if !self.run_remove(&config, &args)? {
@@ -219,7 +244,7 @@ where
     /// Reject a project scope that would alias the global manager home.
     fn validate_project_scope(&self, command: &Command) -> Result<()> {
         let selection = match command {
-            Command::Load(args) => Some(&args.scope),
+            Command::Load(args) => Some(&args.sync.scope),
             Command::Update(args) => Some(&args.sync.scope),
             Command::Import(args) => Some(&args.scope),
             Command::Remove(args) => Some(&args.scope),
@@ -1225,14 +1250,13 @@ where
         // Emit collisions exactly once, from the final discovery result.
         self.emit_collisions(&discovery.collisions)?;
 
-        let target_templates =
-            self.select_target_templates(config, &args.targets, !update_only, args.dry_run)?;
+        let target_templates = self.select_target_templates(config, &args.targets)?;
         let scope_context = scope_context(&self.home)?;
         let project_root = &scope_context.project_root;
         let load_scope = if update_only {
             None
         } else {
-            Some(self.load_scope(config, &target_templates, &args.scope, project_root)?)
+            Some(self.load_scope(&target_templates, &args.scope, project_root))
         };
 
         let candidate_names = discovery
@@ -1317,23 +1341,24 @@ where
             }
         }
 
-        if update_only {
-            let target_names = target_templates
+        let target_names = target_templates
+            .iter()
+            .map(|target| target.target.name.clone())
+            .collect::<Vec<_>>();
+        // Review order and apply order are derived from one sequence so they
+        // cannot drift: the CLI must never act in an order other than the one
+        // it showed.
+        let review_order = review_sequence(&steps, &requested);
+        let mut steps = steps;
+        let rank = |step: &SyncStep| {
+            review_order
                 .iter()
-                .map(|target| target.target.name.clone())
-                .collect::<Vec<_>>();
-            // Review order and apply order are derived from one sequence so
-            // they cannot drift: the CLI must never act in an order other than
-            // the one it showed.
-            let review_order = review_sequence(&steps, &requested);
-            let mut steps = steps;
-            let rank = |step: &SyncStep| {
-                review_order
-                    .iter()
-                    .position(|key| *key == fold(&step.candidate.name))
-                    .unwrap_or(usize::MAX)
-            };
-            steps.sort_by_key(rank);
+                .position(|key| *key == fold(&step.candidate.name))
+                .unwrap_or(usize::MAX)
+        };
+        steps.sort_by_key(rank);
+        let has_targets = !target_templates.is_empty();
+        if update_only {
             return self.run_update(&UpdateRun {
                 args,
                 steps,
@@ -1341,73 +1366,23 @@ where
                 requested,
                 review_order,
                 glob_patterns,
-                has_targets: !target_templates.is_empty(),
+                has_targets,
                 positional_matched,
                 confirmed,
             });
         }
-
-        let mut changed = 0_usize;
-        let mut skipped = 0_usize;
-        for step in &steps {
-            if step.same {
-                skipped += 1;
-                self.reporter.event(
-                    "skill.skipped",
-                    Level::Info,
-                    skill_action_data(
-                        &step.candidate,
-                        &step.target,
-                        Some(step.scope),
-                        &step.destination,
-                        args.dry_run,
-                        "skipped",
-                    ),
-                )?;
-                continue;
-            }
-            if !args.dry_run {
-                deploy_skill(
-                    &step.candidate.path,
-                    &step.target.path,
-                    self.repository.cache_root(),
-                    self.hook,
-                )?;
-            }
-            changed += 1;
-            self.reporter.human(&format!(
-                "Loaded {} -> {} ({}){}",
-                step.candidate.name,
-                step.target.name,
-                step.scope.as_str(),
-                if args.dry_run { " (dry-run)" } else { "" }
-            ))?;
-            let action = if step.existed {
-                "overwritten"
-            } else {
-                "loaded"
-            };
-            self.reporter.event(
-                "skill.loaded",
-                Level::Info,
-                skill_action_data(
-                    &step.candidate,
-                    &step.target,
-                    Some(step.scope),
-                    &step.destination,
-                    args.dry_run,
-                    action,
-                ),
-            )?;
-        }
-        if !positional_matched {
-            return Err(SkillManagerError::NotFound {
-                kind: "skill matching positional pattern",
-                reference: glob_patterns.join(", "),
-            });
-        }
-        self.report_sync_summary("load", changed, skipped, args.dry_run)?;
-        Ok(true)
+        let scope = load_scope.unwrap_or(Scope::Global);
+        self.run_load(&LoadRun {
+            args,
+            steps,
+            target_names,
+            scope,
+            review_order,
+            glob_patterns,
+            has_targets,
+            positional_matched,
+            confirmed,
+        })
     }
 
     /// Emit the load/update summary event from one shared, auditable site.
@@ -1595,6 +1570,291 @@ where
             )?;
         }
         Ok(())
+    }
+
+    /// Review, authorize, and apply the load plan.
+    ///
+    /// Mirrors [`Self::run_update`] exactly: the complete plan renders before
+    /// anything is asked, new installs are distinguished from overwrites,
+    /// already-identical deployments are hidden from the table and counted
+    /// only in the footer, and cancelling names only the decisions that were
+    /// inferred.
+    #[allow(clippy::too_many_lines)]
+    fn run_load(&mut self, run: &LoadRun<'_>) -> Result<bool> {
+        if !run.positional_matched {
+            return Err(SkillManagerError::NotFound {
+                kind: "skill matching positional pattern",
+                reference: run.glob_patterns.join(", "),
+            });
+        }
+        let implicit_targets = !run.args.targets.is_explicit();
+        let actionable = run
+            .steps
+            .iter()
+            .filter(|step| !step.same)
+            .collect::<Vec<_>>();
+        let identical = run.steps.iter().filter(|step| step.same).count();
+        let style = self.render_style();
+        if actionable.is_empty() {
+            self.report_load_no_work(run, implicit_targets)?;
+        } else {
+            let all_steps = run.steps.iter().collect::<Vec<_>>();
+            let plan = load_change_plan(
+                &all_steps,
+                &run.target_names,
+                run.args,
+                run.scope,
+                &run.review_order,
+                style,
+                !run.args.dry_run && !run.confirmed && !self.no_input,
+            )?;
+            let view = plan.view();
+            let label = destination_label(
+                view.columns().len(),
+                run.target_names.len(),
+                !implicit_targets,
+                "target",
+            );
+            let selection = PlanSelection {
+                targets: run.target_names.clone(),
+                targets_explicit: !implicit_targets,
+                scope: Some(run.scope),
+                scope_explicit: run.args.scope.is_explicit(),
+            };
+            let revision = 0;
+            let data = plan_event_data(
+                &view,
+                revision,
+                run.args.dry_run,
+                self.load_authorization(run),
+                &selection,
+            );
+            let event = if revision == 0 {
+                "plan"
+            } else {
+                "plan.updated"
+            };
+            self.reporter.event(event, Level::Info, data)?;
+            for line in render_plan(&view, style) {
+                self.reporter.human(&line)?;
+            }
+            self.reporter
+                .human(&load_plan_footer(&actionable, identical, &label, style))?;
+            if run.args.dry_run {
+                self.reporter.human("")?;
+                self.reporter.human("Dry run — no changes were made.")?;
+            } else if self.authorize_load(run, &label)? {
+                self.reporter.human("")?;
+            } else {
+                self.report_load_cancelled(run, implicit_targets)?;
+                return Ok(false);
+            }
+        }
+
+        let mut loaded = 0_usize;
+        let mut overwritten = 0_usize;
+        let mut skipped = 0_usize;
+        self.apply_load_steps(run, &mut loaded, &mut overwritten, &mut skipped)?;
+        let changed = loaded + overwritten;
+        if changed > 0 && !run.args.dry_run {
+            self.reporter.human("")?;
+            let mut breakdown = Vec::new();
+            if loaded > 0 {
+                breakdown.push(format!("{loaded} loaded"));
+            }
+            if overwritten > 0 {
+                breakdown.push(format!("{overwritten} overwritten"));
+            }
+            let mut description =
+                format!("deployment{} changed", if changed == 1 { "" } else { "s" });
+            if !breakdown.is_empty() {
+                description = format!("{description} ({})", breakdown.join(", "));
+            }
+            let footer = result_footer(
+                &[
+                    ResultEntry {
+                        marker: ResultMarker::Completed,
+                        count: changed,
+                        description,
+                    },
+                    ResultEntry {
+                        marker: ResultMarker::Unchanged,
+                        count: skipped,
+                        description: "unchanged".to_owned(),
+                    },
+                ],
+                style,
+            );
+            self.reporter.human(&footer)?;
+        }
+        self.report_sync_summary("load", changed, skipped, run.args.dry_run)?;
+        Ok(true)
+    }
+
+    /// Apply every planned load step, reporting progress the plan already promised.
+    fn apply_load_steps(
+        &mut self,
+        run: &LoadRun<'_>,
+        loaded: &mut usize,
+        overwritten: &mut usize,
+        skipped: &mut usize,
+    ) -> Result<()> {
+        for step in &run.steps {
+            if step.same {
+                *skipped += 1;
+                self.reporter.event(
+                    "skill.skipped",
+                    Level::Info,
+                    skill_action_data(
+                        &step.candidate,
+                        &step.target,
+                        Some(step.scope),
+                        &step.destination,
+                        run.args.dry_run,
+                        "skipped",
+                    ),
+                )?;
+                continue;
+            }
+            if !run.args.dry_run {
+                deploy_skill(
+                    &step.candidate.path,
+                    &step.target.path,
+                    self.repository.cache_root(),
+                    self.hook,
+                )?;
+                // load's scope is decided once for the whole run, so the
+                // progress line never needs a per-step scope suffix.
+                let verb = if step.existed { "Overwrote" } else { "Loaded" };
+                self.reporter.human(&format!(
+                    "{verb} {} -> {}",
+                    step.candidate.name, step.target.name
+                ))?;
+            }
+            let action = if step.existed {
+                *overwritten += 1;
+                "overwritten"
+            } else {
+                *loaded += 1;
+                "loaded"
+            };
+            self.reporter.event(
+                "skill.loaded",
+                Level::Info,
+                skill_action_data(
+                    &step.candidate,
+                    &step.target,
+                    Some(step.scope),
+                    &step.destination,
+                    run.args.dry_run,
+                    action,
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Describe how this invocation authorizes its load plan.
+    fn load_authorization(&self, run: &LoadRun<'_>) -> PlanAuthorization {
+        let prompted = !run.args.dry_run && !run.confirmed && !self.no_input;
+        let mode = if run.args.dry_run {
+            "dry-run"
+        } else if run.confirmed {
+            "yes"
+        } else if self.no_input {
+            "noninteractive"
+        } else {
+            "prompt"
+        };
+        PlanAuthorization {
+            kind: "binary",
+            mode,
+            default: prompted.then_some(true),
+        }
+    }
+
+    /// Obtain consent for the rendered load plan.
+    fn authorize_load(&mut self, run: &LoadRun<'_>, label: &str) -> Result<bool> {
+        if run.confirmed {
+            return Ok(true);
+        }
+        if self.no_input {
+            // Machine mode keeps its established event-only contract; an
+            // interactive-shaped stream still has to say yes explicitly.
+            if self.reporter.is_json() {
+                return Ok(true);
+            }
+            return Err(SkillManagerError::InteractionRequired(
+                "applying this plan noninteractively requires --yes.".into(),
+            ));
+        }
+        Ok(Authorizer::new(self.prompt)
+            .confirm(&format!("Apply this load plan to {label}?"), false)?
+            .is_approved())
+    }
+
+    /// Explain a declined load plan and how to change the next one.
+    ///
+    /// Flag teaching happens only here, on cancel — the rendered plan itself
+    /// stays clean of any hint text.
+    fn report_load_cancelled(&mut self, run: &LoadRun<'_>, implicit_targets: bool) -> Result<()> {
+        self.report_cancelled("load")?;
+        let inferred_scope = !run.args.scope.is_explicit();
+        let hint = match (implicit_targets, inferred_scope) {
+            (true, true) => Some(format!(
+                "Hint: targets and scope were inferred. Re-run with {}, and --global or --project, to change this plan.",
+                target_flag_hint(&run.target_names)
+            )),
+            (true, false) => Some(format!(
+                "Hint: targets were inferred. Re-run with {} to change this plan.",
+                target_flag_hint(&run.target_names)
+            )),
+            (false, true) => Some(
+                "Hint: scope was inferred. Re-run with --global or --project to change this plan."
+                    .to_owned(),
+            ),
+            (false, false) => None,
+        };
+        match hint {
+            Some(line) => self.reporter.human(&line),
+            None => Ok(()),
+        }
+    }
+
+    /// State precisely why a load plan has nothing to do.
+    fn report_load_no_work(&mut self, run: &LoadRun<'_>, implicit_targets: bool) -> Result<()> {
+        let qualifier = if implicit_targets {
+            "enabled"
+        } else {
+            "selected"
+        };
+        if run.steps.is_empty() {
+            let message = if run.has_targets {
+                "No installed skills matched this load.".to_owned()
+            } else {
+                format!("No {qualifier} targets are available for load.")
+            };
+            return self.reporter.human(&message);
+        }
+        let skills = run
+            .steps
+            .iter()
+            .map(|step| step.candidate.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let label = target_selection_label(run.target_names.len(), implicit_targets);
+        let message = if skills.len() == 1 {
+            format!(
+                "{} is already identical across {label}.",
+                skills
+                    .iter()
+                    .next()
+                    .copied()
+                    .unwrap_or("The selected skill")
+            )
+        } else {
+            format!("All requested skills are already identical across {label}.")
+        };
+        self.reporter.human(&message)
     }
 
     /// Rendering vocabulary for this invocation's output stream.
@@ -1804,7 +2064,16 @@ where
         Ok(false)
     }
 
-    fn run_copy(&mut self, config: &Config, args: &CopyArgs) -> Result<()> {
+    /// Review, authorize, and apply the copy plan.
+    ///
+    /// `copy` has one arbitrary path destination, so its plan is the shared
+    /// model's degenerate-sentence case for a single matched skill and its
+    /// ordinary table for more than one; no scope, no target selection, and no
+    /// identical-hiding (unlike `load`, an overwrite is always shown because
+    /// there is no existing-deployment concept to compare against ahead of
+    /// the diff itself).
+    #[allow(clippy::too_many_lines)]
+    fn run_copy(&mut self, config: &Config, args: &CopyArgs) -> Result<bool> {
         let entry = configured_source_or_reference(config, &args.source, None)?;
         let resolved = materialize_source(
             self.repository,
@@ -1815,36 +2084,93 @@ where
         )?;
         let discovery = discover_skills(&[resolved], &args.filters, &config.exclude)?;
         let destination = absolute_path(args.destination.clone())?;
+
+        if discovery.winners.is_empty() {
+            let message = if args.filters.is_empty() {
+                format!("No skills found in {}.", args.source)
+            } else {
+                format!(
+                    "No skills from {} matched {}.",
+                    args.source,
+                    copy_filter_clause(&args.filters)
+                )
+            };
+            self.reporter.human(&message)?;
+            self.emit_copy_summary(0, args.dry_run)?;
+            return Ok(true);
+        }
+
+        // The same ordered collection builds the plan and drives the apply
+        // loop below, so plan order and apply order cannot drift apart.
+        let candidates = discovery.winners.values().collect::<Vec<_>>();
+        let style = self.render_style();
+        let prompting = !args.dry_run && !args.yes && !self.no_input;
+        let plan = copy_change_plan(&candidates, &destination, prompting)?;
+        let view = plan.view();
+        let selection = PlanSelection {
+            targets: Vec::new(),
+            targets_explicit: true,
+            scope: None,
+            scope_explicit: true,
+        };
+        let revision = 0;
+        let data = plan_event_data(
+            &view,
+            revision,
+            args.dry_run,
+            self.copy_authorization(args),
+            &selection,
+        );
+        self.reporter.event("plan", Level::Info, data)?;
+        for line in render_plan(&view, style) {
+            self.reporter.human(&line)?;
+        }
+        self.reporter.human(&copy_plan_footer(&plan.rows, style))?;
+
+        if args.dry_run {
+            self.reporter.human("")?;
+            self.reporter.human("Dry run — no changes were made.")?;
+            self.emit_copy_summary(candidates.len(), args.dry_run)?;
+            return Ok(true);
+        }
+        if !self.authorize_copy(args, candidates.len(), &destination)? {
+            // Source, destination, and filtering are always explicit for
+            // `copy`, so nothing was inferred and there is no hint to teach.
+            self.report_cancelled("copy")?;
+            return Ok(false);
+        }
+        self.reporter.human("")?;
+
         let target = Target {
             name: "copy".into(),
             label: "Copy destination".into(),
-            path: destination,
+            path: destination.clone(),
             enabled: true,
             builtin: false,
             legacy_override: false,
         };
-        let mut copied = 0_usize;
-        for candidate in discovery.winners.values() {
+        let mut new_count = 0_usize;
+        let mut overwritten = 0_usize;
+        for candidate in &candidates {
             let output = target.path.join(&candidate.name);
-            let output_existed = output.is_dir();
-            if !args.dry_run {
-                deploy_skill(
-                    &candidate.path,
-                    &target.path,
-                    self.repository.cache_root(),
-                    self.hook,
-                )?;
-            }
-            copied += 1;
+            let existed = output.is_dir();
+            deploy_skill(
+                &candidate.path,
+                &target.path,
+                self.repository.cache_root(),
+                self.hook,
+            )?;
+            let verb = if existed { "Overwrote" } else { "Copied" };
             self.reporter.human(&format!(
-                "Copied {} -> {}{}",
+                "{verb} {} -> {}",
                 candidate.name,
-                output.display(),
-                if args.dry_run { " (dry-run)" } else { "" }
+                output.display()
             ))?;
-            let action = if output_existed {
+            let action = if existed {
+                overwritten += 1;
                 "overwritten"
             } else {
+                new_count += 1;
                 "copied"
             };
             self.reporter.event(
@@ -1853,11 +2179,86 @@ where
                 skill_action_data(candidate, &target, None, &output, args.dry_run, action),
             )?;
         }
+        let changed = new_count + overwritten;
+        self.reporter.human("")?;
+        let mut breakdown = Vec::new();
+        if new_count > 0 {
+            breakdown.push(format!("{new_count} new"));
+        }
+        if overwritten > 0 {
+            breakdown.push(format!("{overwritten} overwritten"));
+        }
+        let mut description = format!("skill{} copied", if changed == 1 { "" } else { "s" });
+        if !breakdown.is_empty() {
+            description = format!("{description} ({})", breakdown.join(", "));
+        }
+        let footer = result_footer(
+            &[ResultEntry {
+                marker: ResultMarker::Completed,
+                count: changed,
+                description,
+            }],
+            style,
+        );
+        self.reporter.human(&footer)?;
+        self.emit_copy_summary(changed, args.dry_run)?;
+        Ok(true)
+    }
+
+    /// Emit the shared `copy` `summary` payload shape from every exit path.
+    fn emit_copy_summary(&mut self, copied: usize, dry_run: bool) -> Result<()> {
         self.reporter.event(
             "summary",
             Level::Info,
-            json!({ "action": "copy", "copied": copied, "dry_run": args.dry_run }),
+            json!({ "action": "copy", "copied": copied, "dry_run": dry_run }),
         )
+    }
+
+    /// Describe how this invocation authorizes its copy plan.
+    fn copy_authorization(&self, args: &CopyArgs) -> PlanAuthorization {
+        let prompted = !args.dry_run && !args.yes && !self.no_input;
+        let mode = if args.dry_run {
+            "dry-run"
+        } else if args.yes {
+            "yes"
+        } else if self.no_input {
+            "noninteractive"
+        } else {
+            "prompt"
+        };
+        PlanAuthorization {
+            kind: "binary",
+            mode,
+            default: prompted.then_some(true),
+        }
+    }
+
+    /// Obtain consent for the rendered copy plan.
+    fn authorize_copy(
+        &mut self,
+        args: &CopyArgs,
+        count: usize,
+        destination: &Path,
+    ) -> Result<bool> {
+        if args.yes {
+            return Ok(true);
+        }
+        if self.no_input {
+            if self.reporter.is_json() {
+                return Ok(true);
+            }
+            return Err(SkillManagerError::InteractionRequired(
+                "applying this plan noninteractively requires --yes.".into(),
+            ));
+        }
+        let prompt = if count == 1 {
+            format!("Copy this skill to {}?", destination.display())
+        } else {
+            format!("Copy these {count} skills to {}?", destination.display())
+        };
+        Ok(Authorizer::new(self.prompt)
+            .confirm(&prompt, false)?
+            .is_approved())
     }
 
     // Import resolves one source, detects divergent deployments, plans, confirms,
@@ -1891,8 +2292,7 @@ where
         // Detection compares deployments with the materialized source, so it runs
         // before the destination is resolved. Nothing to import must never ask
         // where an import would have been written.
-        let target_templates =
-            self.select_target_templates(config, &args.targets, false, args.dry_run)?;
+        let target_templates = self.select_target_templates(config, &args.targets)?;
         let scope_context = scope_context(&self.home)?;
         let project_root = &scope_context.project_root;
         let inspected_scopes = available_scopes(&args.scope, scope_context.project_available);
@@ -2156,8 +2556,7 @@ where
         imported: &ImportCandidate,
         destination: &Path,
     ) -> Result<()> {
-        let templates =
-            self.select_target_templates(config, &TargetSelection::default(), false, false)?;
+        let templates = self.select_target_templates(config, &TargetSelection::default())?;
         let target_names = templates
             .iter()
             .map(|target| target.target.name.clone())
@@ -2253,8 +2652,7 @@ where
     // partial-commit operation and are therefore deliberately colocated.
     #[allow(clippy::too_many_lines)]
     fn run_remove(&mut self, config: &Config, args: &RemoveArgs) -> Result<bool> {
-        let target_templates =
-            self.select_target_templates(config, &args.targets, false, args.dry_run)?;
+        let target_templates = self.select_target_templates(config, &args.targets)?;
         let scope_context = scope_context(&self.home)?;
         let project_root = &scope_context.project_root;
         let inspected_scopes = available_scopes(&args.scope, scope_context.project_available);
@@ -2469,7 +2867,7 @@ where
         self.reporter.human("")?;
         let discovery = discover_skills(&sources, &[], &config.exclude)?;
         self.emit_collisions(&discovery.collisions)?;
-        let target_templates = self.select_target_templates(config, &args.targets, false, false)?;
+        let target_templates = self.select_target_templates(config, &args.targets)?;
         let scope_context = scope_context(&self.home)?;
         let project_root = &scope_context.project_root;
         let inspected_scopes = available_scopes(&args.scope, scope_context.project_available);
@@ -2858,8 +3256,6 @@ where
         &mut self,
         config: &Config,
         selection: &TargetSelection,
-        prompt_for_implicit: bool,
-        dry_run: bool,
     ) -> Result<Vec<ScopedTarget>> {
         let project_root = current_project_root()?;
         let all = resolved_targets_for_scope(config, &self.home, &project_root, Scope::Global);
@@ -2905,40 +3301,20 @@ where
             return Ok(selected);
         }
         selected.extend(all.values().filter(|target| target.target.enabled).cloned());
-        if prompt_for_implicit && !dry_run {
-            if self.no_input {
-                return Err(SkillManagerError::InteractionRequired(
-                    "target selection is required in noninteractive mode; pass --all or --target"
-                        .into(),
-                ));
-            }
-            if !self.prompt.confirm(
-                &format!("Use all {} enabled target(s)?", selected.len()),
-                true,
-            )? {
-                return Err(SkillManagerError::Cancelled);
-            }
-        }
         Ok(selected)
     }
 
     fn load_scope(
-        &mut self,
-        _config: &Config,
+        &self,
         targets: &[ScopedTarget],
         selection: &ScopeSelection,
         project_root: &Path,
-    ) -> Result<Scope> {
+    ) -> Scope {
         if let Some(scope) = explicit_scope(selection) {
-            return Ok(scope);
+            return scope;
         }
         if !project_scope_available(&self.home, project_root) {
-            return Ok(Scope::Global);
-        }
-        if self.no_input {
-            return Err(SkillManagerError::InteractionRequired(
-                "load scope is required in noninteractive mode; pass --global or --project".into(),
-            ));
+            return Scope::Global;
         }
         let project_default = targets.iter().any(|target| {
             target
@@ -2947,14 +3323,11 @@ where
                 .next()
                 .is_some_and(|component| project_root.join(component.as_os_str()).is_dir())
         });
-        let project = self
-            .prompt
-            .confirm("Install skills at project scope?", project_default)?;
-        Ok(if project {
+        if project_default {
             Scope::Project
         } else {
             Scope::Global
-        })
+        }
     }
 
     fn emit_unmatched_patterns(&mut self, patterns: &[String]) -> Result<()> {
@@ -3138,7 +3511,7 @@ where
 
 fn command_dry_run(command: &Command) -> bool {
     match command {
-        Command::Load(args) => args.dry_run,
+        Command::Load(args) => args.sync.dry_run,
         Command::Update(args) => args.sync.dry_run,
         Command::Import(args) => args.dry_run,
         Command::Copy(args) => args.dry_run,
@@ -3364,11 +3737,295 @@ fn update_change_plan(
         blocks: Vec::new(),
         decisions: Vec::new(),
         prompting,
+        distinguishes_overwrites: false,
     })
+}
+
+/// Build the load plan: new installs and overwrites side by side. Every
+/// requested step is present as a machine-visible entry — including an
+/// already-identical deployment, kept as a [`PlanAction::Skip`] action so the
+/// structured `plan` event stays complete — but a row whose every action is
+/// such a skip is dormant: [`PlanView::visible_rows`] hides it from the
+/// table, from column significance, and from progress lines, and it is
+/// counted only in the footer.
+fn load_change_plan(
+    steps: &[&SyncStep],
+    target_names: &[String],
+    args: &SyncArgs,
+    scope: Scope,
+    review_order: &[String],
+    style: RenderStyle,
+    prompting: bool,
+) -> Result<ChangePlan> {
+    let mut destinations = Vec::new();
+    for name in target_names {
+        for candidate_scope in [Scope::Global, Scope::Project] {
+            destinations.push(Destination {
+                id: destination_id(name, candidate_scope),
+                column: name.clone(),
+                label: format!("{name} · {}", candidate_scope.as_str()),
+                kind: DestinationKind::Deployment {
+                    target: name.clone(),
+                    scope: candidate_scope,
+                },
+                path: None,
+            });
+        }
+    }
+    // Every step (whether actionable or already identical) knows its own
+    // resolved target root, so the destination list can report `path` for
+    // every id a step actually touches without re-resolving anything. This
+    // is the target's root directory, not the skill-specific deployment
+    // path within it: a `Destination` is one write location shared by every
+    // row, not a per-skill subpath.
+    for step in steps {
+        let id = destination_id(&step.target.name, step.scope);
+        if let Some(destination) = destinations.iter_mut().find(|d| d.id == id) {
+            destination.path = Some(step.target.path.clone());
+        }
+    }
+
+    let mut grouped = BTreeMap::<String, Vec<&SyncStep>>::new();
+    for step in steps {
+        grouped
+            .entry(fold(&step.candidate.name))
+            .or_default()
+            .push(step);
+    }
+    let order = review_order
+        .iter()
+        .filter(|key| grouped.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut rows = Vec::with_capacity(order.len());
+    let mut identities = Vec::with_capacity(order.len());
+    for key in &order {
+        let Some(steps) = grouped.get(key) else {
+            continue;
+        };
+        let mut actions = Vec::with_capacity(steps.len());
+        for step in steps {
+            let stat = diff_directories(&step.destination, &step.candidate.path)?;
+            let (action, description) = if step.same {
+                (PlanAction::Skip, String::new())
+            } else if step.existed {
+                (PlanAction::Update, totals_line(&stat))
+            } else {
+                (PlanAction::Load, creation_line("deployment", &stat))
+            };
+            actions.push(PlannedAction {
+                destination: destination_id(&step.target.name, step.scope),
+                action,
+                existed: step.existed,
+                description,
+                stat,
+            });
+        }
+        let identity = steps
+            .first()
+            .map(|step| step.candidate.name.clone())
+            .unwrap_or_default();
+        let provenance = steps
+            .first()
+            .map(|step| source_display_name(&step.candidate.source.entry).to_owned());
+        identities.push(identity.clone());
+        rows.push(PlanRow {
+            identity,
+            provenance,
+            actions,
+            ..PlanRow::default()
+        });
+    }
+
+    let mut metadata = Vec::new();
+    if !args.scope.is_explicit()
+        && let Some(location) = review_location(scope)
+    {
+        metadata.push((
+            "Scope".to_owned(),
+            format!("{} (inferred)", location_text(location, style.symbols)),
+        ));
+    }
+
+    Ok(ChangePlan {
+        command: "load".to_owned(),
+        plan_id: format!("load:{}", identities.join(",")),
+        heading: "Load plan".to_owned(),
+        metadata,
+        destinations,
+        body_heading: None,
+        metric_header: None,
+        detail_heading: "Destination-specific changes".to_owned(),
+        connector: Some("->".to_owned()),
+        rows,
+        blocks: Vec::new(),
+        decisions: Vec::new(),
+        prompting,
+        distinguishes_overwrites: true,
+    })
+}
+
+/// The load plan footer: total actionable changes, then nonzero-only new,
+/// overwrite, and already-identical clauses.
+///
+/// The leading `+`/`↑`/`✓` glyphs are a TTY-only convenience like every other
+/// compact symbol in this plan; a redirected stream drops them rather than
+/// substituting a second, redundant word (the count and category noun already
+/// read as plain English on their own).
+fn load_plan_footer(
+    actionable: &[&SyncStep],
+    identical: usize,
+    label: &str,
+    style: RenderStyle,
+) -> String {
+    let new_count = actionable.iter().filter(|step| !step.existed).count();
+    let overwrite_count = actionable.iter().filter(|step| step.existed).count();
+    let clause = |symbol: &str, count: usize, noun: &str, code: Option<u8>| {
+        let text = if style.symbols {
+            format!("{symbol} {count} {noun}")
+        } else {
+            format!("{count} {noun}")
+        };
+        colored(&text, code, style.color)
+    };
+    let mut clauses = Vec::new();
+    if new_count > 0 {
+        clauses.push(clause("+", new_count, "new", PlanAction::Load.color_code()));
+    }
+    if overwrite_count > 0 {
+        clauses.push(clause(
+            "↑",
+            overwrite_count,
+            "overwrite",
+            PlanAction::Update.color_code(),
+        ));
+    }
+    if identical > 0 {
+        clauses.push(clause(
+            "✓",
+            identical,
+            "already identical",
+            PlanAction::Skip.color_code(),
+        ));
+    }
+    format!(
+        "{} across {label}: {}",
+        counted_noun(actionable.len(), "change"),
+        clauses.join(", ")
+    )
 }
 
 fn destination_id(target: &str, scope: Scope) -> String {
     format!("{}:{}", fold(target), scope.as_str())
+}
+
+/// Build the copy plan: one arbitrary path destination shared by every row.
+///
+/// Every row references the same single destination id, so the shared
+/// [`render_body`](crate::review) machinery collapses a single matched skill
+/// to the degenerate sentence and renders two or more as a table whose only
+/// destination column is literally named `action` — the destination path
+/// itself is stated once in the metadata line instead of being repeated.
+fn copy_change_plan(
+    candidates: &[&SkillCandidate],
+    destination: &Path,
+    prompting: bool,
+) -> Result<ChangePlan> {
+    let destination_id = "action".to_owned();
+    let destinations = vec![Destination {
+        id: destination_id.clone(),
+        column: "action".to_owned(),
+        label: "action".to_owned(),
+        kind: DestinationKind::Path,
+        path: Some(destination.to_path_buf()),
+    }];
+
+    let mut rows = Vec::with_capacity(candidates.len());
+    let mut identities = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let output = destination.join(&candidate.name);
+        let existed = output.is_dir();
+        let stat = diff_directories(&output, &candidate.path)?;
+        let (action, description) = if existed {
+            (PlanAction::Update, totals_line(&stat))
+        } else {
+            (PlanAction::Copy, creation_line("copy", &stat))
+        };
+        identities.push(candidate.name.clone());
+        rows.push(PlanRow {
+            identity: candidate.name.clone(),
+            actions: vec![PlannedAction {
+                destination: destination_id.clone(),
+                action,
+                existed,
+                description,
+                stat,
+            }],
+            ..PlanRow::default()
+        });
+    }
+
+    Ok(ChangePlan {
+        command: "copy".to_owned(),
+        plan_id: format!("copy:{}", identities.join(",")),
+        heading: "Copy plan".to_owned(),
+        metadata: vec![("Destination".to_owned(), destination.display().to_string())],
+        destinations,
+        body_heading: None,
+        metric_header: None,
+        detail_heading: "Destination-specific changes".to_owned(),
+        connector: None,
+        rows,
+        blocks: Vec::new(),
+        decisions: Vec::new(),
+        prompting,
+        distinguishes_overwrites: true,
+    })
+}
+
+/// The copy plan footer: total changes to the one destination, then
+/// nonzero-only new and overwrite clauses. Unlike `load`, copy has no
+/// already-identical clause: there is no existing-deployment concept to
+/// compare against ahead of the diff, so an unchanged copy is out of scope.
+fn copy_plan_footer(rows: &[PlanRow], style: RenderStyle) -> String {
+    let existed = |row: &PlanRow| row.actions.first().is_some_and(|action| action.existed);
+    let new_count = rows.iter().filter(|row| !existed(row)).count();
+    let overwrite_count = rows.iter().filter(|row| existed(row)).count();
+    let clause = |symbol: &str, count: usize, noun: &str, code: Option<u8>| {
+        let text = if style.symbols {
+            format!("{symbol} {count} {noun}")
+        } else {
+            format!("{count} {noun}")
+        };
+        colored(&text, code, style.color)
+    };
+    let mut clauses = Vec::new();
+    if new_count > 0 {
+        clauses.push(clause("+", new_count, "new", PlanAction::Copy.color_code()));
+    }
+    if overwrite_count > 0 {
+        clauses.push(clause(
+            "↑",
+            overwrite_count,
+            "overwrite",
+            PlanAction::Update.color_code(),
+        ));
+    }
+    format!(
+        "{} to 1 destination: {}",
+        counted_noun(rows.len(), "change"),
+        clauses.join(", ")
+    )
+}
+
+/// Render `--filter` clauses the way the "no match" message quotes them back.
+fn copy_filter_clause(filters: &[String]) -> String {
+    filters
+        .iter()
+        .map(|pattern| format!("--filter \"{pattern}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn review_location(scope: Scope) -> Option<SkillLocation> {
@@ -3996,13 +4653,75 @@ fn status_matches(
 }
 
 fn absolute_path(path: PathBuf) -> Result<PathBuf> {
-    if path.is_absolute() {
-        return Ok(path.canonicalize().unwrap_or(path));
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map_err(|error| SkillManagerError::io(".", error))?
+            .join(path)
+    };
+    Ok(canonicalize_existing_ancestor(&absolute))
+}
+
+/// Canonicalize the longest existing ancestor of `path` component by
+/// component, and rejoin the unresolved tail literally, rather than
+/// lexically collapsing `..` ourselves.
+///
+/// `Path::canonicalize` requires the whole path to exist, which fails for
+/// the common `copy` destination case of a directory being created for the
+/// first time. Naively falling back to lexical `..` collapse is unsound once
+/// a symlinked ancestor is involved: `link/../destination` is not
+/// necessarily `link`'s sibling once `link` resolves elsewhere, so
+/// collapsing it ourselves before the symlink is resolved can silently
+/// redirect a write to the wrong directory.
+///
+/// It is not enough to canonicalize a whole prefix that still contains a
+/// trailing `..`: on Windows, the Win32 path APIs collapse `..` lexically as
+/// part of turning a path into its NT form, before a reparse point later in
+/// that same string is followed, so `canonicalize("link/..")` can still
+/// return the symlink's own parent rather than its target's parent. Instead,
+/// each component is resolved in turn — a `Normal` component is joined and
+/// canonicalized (following any symlink at that step) as long as it exists,
+/// and a `..` is popped from the already-resolved path rather than folded
+/// into the string being canonicalized — so `..` is always applied after any
+/// symlink at that position has been followed. Once a component does not
+/// exist, resolution stops and the remaining tail — which by definition
+/// contains no symlinks, because nothing there exists yet — is appended
+/// unresolved.
+fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return portable_path(&canonical);
     }
-    let absolute = std::env::current_dir()
-        .map_err(|error| SkillManagerError::io(".", error))?
-        .join(path);
-    Ok(absolute.canonicalize().unwrap_or(absolute))
+    let mut resolved = PathBuf::new();
+    let mut resolving = true;
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                resolved.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir if resolving => {
+                resolved.pop();
+            }
+            std::path::Component::Normal(name) if resolving => {
+                let candidate = resolved.join(name);
+                if let Ok(canonical) = candidate.canonicalize() {
+                    resolved = canonical;
+                } else {
+                    resolving = false;
+                    resolved.push(name);
+                }
+            }
+            // Once an ancestor is missing, nothing further in the path can
+            // exist on disk, so there is no symlink left to resolve: append
+            // the remaining components literally.
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            std::path::Component::Normal(name) => resolved.push(name),
+        }
+    }
+    portable_path(&resolved)
 }
 
 fn title_case(value: &str) -> String {
@@ -4043,11 +4762,14 @@ mod tests {
     };
     use crate::cache::GitHubTransport;
     use crate::cli::{
-        Command, CopyArgs, ImportArgs, RemoveArgs, SourceAction, SourceAddArgs, SourceArgs,
-        SourceModeArg, SourceRemoveArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction,
-        TargetArgs, TargetNameArgs, TargetPathArgs, UpdateArgs,
+        Command, CopyArgs, ImportArgs, LoadArgs, RemoveArgs, SourceAction, SourceAddArgs,
+        SourceArgs, SourceModeArg, SourceRemoveArgs, SourceUpdateArgs, StatusArgs, SyncArgs,
+        TargetAction, TargetArgs, TargetNameArgs, TargetPathArgs, UpdateArgs,
     };
-    use crate::config::{Config, FileConfigRepository, resolved_targets, source_from_reference};
+    use crate::config::{
+        Config, FileConfigRepository, portable_canonicalize, resolved_targets,
+        source_from_reference,
+    };
     use crate::domain::{ResolvedSource, Scope, SkillCandidate, SkillDiscovery, TargetEntry};
     use crate::error::{Result, SkillManagerError};
     use crate::event::{Level, Reporter};
@@ -4137,9 +4859,15 @@ mod tests {
             dry_run: true,
             ..SyncArgs::default()
         };
-        assert!(command_dry_run(&Command::Load(sync.clone())));
-        assert!(command_dry_run(&Command::Update(UpdateArgs {
+        assert!(command_dry_run(&Command::Load(LoadArgs {
             sync,
+            yes: false,
+        })));
+        assert!(command_dry_run(&Command::Update(UpdateArgs {
+            sync: SyncArgs {
+                dry_run: true,
+                ..SyncArgs::default()
+            },
             yes: false,
         })));
         assert!(command_dry_run(&Command::Import(ImportArgs {
@@ -4153,6 +4881,7 @@ mod tests {
             filters: Vec::new(),
             dry_run: true,
             refresh: false,
+            yes: false,
         })));
         let remove = RemoveArgs {
             dry_run: true,
@@ -4299,9 +5028,14 @@ mod tests {
         assert_eq!(
             absolute_path(root.path().to_path_buf())
                 .unwrap_or_else(|error| unreachable!("{error}")),
-            root.path()
-                .canonicalize()
+            portable_canonicalize(root.path())
+        );
+        assert!(
+            !absolute_path(root.path().to_path_buf())
                 .unwrap_or_else(|error| unreachable!("{error}"))
+                .to_string_lossy()
+                .contains(r"\\?\"),
+            "absolute_path must not leak Windows verbatim path spellings"
         );
         assert!(
             absolute_path(PathBuf::from("relative"))
@@ -4310,6 +5044,64 @@ mod tests {
         );
         assert_eq!(title_case("one-two_three"), "One Two Three");
         assert_eq!(title_case("--"), "");
+    }
+
+    #[test]
+    fn absolute_path_resolves_a_nonexistent_destination_whose_parent_does_not_exist() {
+        let sandbox = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let parent = sandbox.path().join("nested").join("home");
+        std::fs::create_dir_all(&parent).unwrap_or_else(|error| unreachable!("{error}"));
+        let destination = parent.join("brand-new-child");
+        let resolved =
+            absolute_path(destination.clone()).unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            resolved,
+            portable_canonicalize(&parent).join("brand-new-child")
+        );
+        assert!(
+            !resolved.to_string_lossy().contains(r"\\?\"),
+            "absolute_path must not leak Windows verbatim path spellings for missing destinations"
+        );
+    }
+
+    #[test]
+    fn absolute_path_resolves_a_missing_destination_through_a_symlinked_ancestor_correctly() {
+        let sandbox = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let real_root = sandbox.path().join("real-root");
+        let inner = real_root.join("inner");
+        std::fs::create_dir_all(&inner).unwrap_or_else(|error| unreachable!("{error}"));
+        let alias = sandbox.path().join("alias");
+
+        #[cfg(unix)]
+        let linked = {
+            std::os::unix::fs::symlink(&inner, &alias)
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            true
+        };
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&inner, &alias).is_ok();
+
+        if !linked {
+            // Creating a directory symlink without elevated privileges is not
+            // possible in every CI environment; skip rather than fail.
+            return;
+        }
+
+        // `alias` resolves to `real-root/inner`, so `alias/../destination`
+        // must resolve to `real-root/destination`, not to a lexical strip of
+        // `alias`'s own parent (`sandbox/destination`).
+        let requested = alias.join("..").join("destination");
+        let resolved = absolute_path(requested).unwrap_or_else(|error| unreachable!("{error}"));
+        let expected = portable_canonicalize(&real_root).join("destination");
+        assert_eq!(
+            resolved, expected,
+            "a symlinked ancestor must be resolved before applying '..', not lexically stripped"
+        );
+        assert_ne!(
+            resolved,
+            portable_canonicalize(sandbox.path()).join("destination"),
+            "must not silently redirect the write to the symlink's own parent directory"
+        );
     }
 
     #[test]

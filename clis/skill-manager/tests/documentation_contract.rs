@@ -99,7 +99,7 @@ fn canonical_recipe_commands(source: &str) -> BTreeSet<String> {
 fn source_recipe_fields(source: &str) -> BTreeMap<String, BTreeSet<String>> {
     let mut recipes = BTreeMap::new();
     for (name, function) in [
-        ("load", "overlay_sync"),
+        ("load", "overlay_load"),
         ("update", "overlay_update"),
         ("import", "overlay_import"),
         ("copy", "overlay_copy"),
@@ -575,7 +575,7 @@ fn config_and_summary_payload_references_match_production_emit_sites() {
         "\"present\": outcome.restored.metadata.present",
         "\"sources\": config.sources.len()",
         "\"action\": action,",
-        "self.report_sync_summary(\"load\", changed, skipped, args.dry_run)",
+        "self.report_sync_summary(\"load\", changed, skipped, run.args.dry_run)",
         "self.report_sync_summary(\"update\", changed, skipped, run.args.dry_run)",
         "\"action\": \"copy\", \"copied\": copied",
         "\"action\": \"remove\", \"removed\": 0",
@@ -835,7 +835,6 @@ fn machine_requirements_and_all_target_semantics_match_production() {
     let root = repository_root();
     let app = read(&root.join("clis/skill-manager/src/app.rs"));
     for production_contract in [
-        "target selection is required in noninteractive mode; pass --all or --target",
         "selection.all_targets && target.target.enabled",
         "source name is required in noninteractive mode; pass NAME or --name",
         "target '{requested}' is disabled; use --target {requested} to override",
@@ -850,7 +849,7 @@ fn machine_requirements_and_all_target_semantics_match_production() {
     let cheatsheet = read(&root.join("cheatsheet.skill-manager.md"));
     let skill = read(&root.join("skills/managing-skills/SKILL.md"));
     for required in [
-        "A committed non-interactive call must also explicitly select at\nleast one target",
+        "Without explicit scope or target selection,\n`load` infers project-vs-global scope and enabled targets silently",
         "Machine/non-interactive use\nrequires an explicit nonblank `name`",
         "`all_targets:true` selects enabled\n  configured targets only",
         "A disabled target requires explicit selection",
@@ -861,8 +860,8 @@ fn machine_requirements_and_all_target_semantics_match_production() {
         );
     }
     for required in [
-        "A committed `load` must\nexplicitly select at least one target",
-        "`update` uses enabled targets when none\nare selected",
+        "`load` and `update` render\ntheir whole plan and then auto-authorize the apply step",
+        "Both use enabled targets when none are\nselected, and `load` also infers project-vs-global scope silently",
         "`all_targets:true` selects\nenabled configured targets only",
         "A machine `source.add` must include a\nnonblank `name`",
     ] {
@@ -872,7 +871,7 @@ fn machine_requirements_and_all_target_semantics_match_production() {
         );
     }
     for required in [
-        "`load` in non-interactive mode must explicitly select\ntargets; update uses enabled targets",
+        "`load` in\nnon-interactive mode infers enabled targets silently, exactly like `update`",
         "Machine/non-interactive `source add` requires an explicit nonblank",
         "`--all` never opts into a disabled\ntarget",
     ] {

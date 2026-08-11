@@ -41,10 +41,12 @@ fn recipe_overlay_covers_transfer_command_shapes() {
     let Some(Command::Load(args)) = load.command else {
         unreachable!("load command")
     };
-    assert_eq!(args.sources, ["one", "two"]);
-    assert_eq!(args.filters, ["a*"]);
-    assert_eq!(args.targets.target_names, ["claude", "shared"]);
-    assert!(args.source_selection.cd && args.dry_run && args.refresh && load.no_input);
+    assert_eq!(args.sync.sources, ["one", "two"]);
+    assert_eq!(args.sync.filters, ["a*"]);
+    assert_eq!(args.sync.targets.target_names, ["claude", "shared"]);
+    assert!(
+        args.sync.source_selection.cd && args.sync.dry_run && args.sync.refresh && load.no_input
+    );
 
     let update = recipe(&serde_json::json!({
         "command": "update",
@@ -110,8 +112,8 @@ fn recipe_overlay_covers_sync_aliases_and_import_command() {
     let Some(Command::Load(args)) = installed.command else {
         unreachable!("install must canonicalize to load")
     };
-    assert_eq!(args.sources, ["primary"]);
-    assert!(args.targets.claude && args.scope.global);
+    assert_eq!(args.sync.sources, ["primary"]);
+    assert!(args.sync.targets.claude && args.sync.scope.global);
 
     let mut argv_alias = Cli::try_parse_from([
         "skill-manager",
@@ -174,11 +176,11 @@ fn recipe_overlay_covers_query_command_shapes_and_explicit_false() {
     let Some(Command::Load(args)) = explicit_false.command else {
         unreachable!("load command")
     };
-    assert!(!args.targets.claude);
-    assert!(!args.targets.all_targets);
-    assert!(!args.source_selection.cd);
-    assert!(!args.dry_run);
-    assert!(!args.refresh);
+    assert!(!args.sync.targets.claude);
+    assert!(!args.sync.targets.all_targets);
+    assert!(!args.sync.source_selection.cd);
+    assert!(!args.sync.dry_run);
+    assert!(!args.sync.refresh);
     assert!(!explicit_false.no_input);
 
     let status = recipe(&serde_json::json!({

@@ -1760,7 +1760,10 @@ fn human_prompts_cover_text_confirmation_cancellation_and_invalid_answers() {
         .write_stdin("n\n")
         .assert()
         .success()
-        .stderr(predicate::str::contains("Use all 3 enabled target(s)?"));
+        .stderr(predicate::str::contains(
+            "Apply this load plan to 3 enabled targets? [Y/n]",
+        ))
+        .stdout(predicate::str::contains("Cancelled."));
     assert!(!home.path().join(".claude/skills/alpha").exists());
     assert!(!home.path().join(".agents/skills/alpha").exists());
     assert!(
@@ -1774,13 +1777,13 @@ fn human_prompts_cover_text_confirmation_cancellation_and_invalid_answers() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "target selection is required in noninteractive mode",
+            "applying this plan noninteractively requires --yes.",
         ));
     cli(home.path())
         .args(["load", "--filter", "alpha", "--no-input", "--dry-run"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("claude (global) (dry-run)"));
+        .stdout(predicate::str::contains("Dry run — no changes were made."));
 
     cli(home.path())
         .args(["load", "--filter", "alpha"])
@@ -2277,7 +2280,7 @@ fn project_scope_overrides_global_and_update_remove_infer_existing_scope() {
 }
 
 #[test]
-fn load_scope_prompt_uses_exact_cwd_vendor_directory_as_its_default() {
+fn load_scope_inference_uses_exact_cwd_vendor_directory_as_its_default() {
     let home = sandbox();
     let source = home.path().join("source");
     let project = home.path().join("project");
@@ -2296,6 +2299,9 @@ fn load_scope_prompt_uses_exact_cwd_vendor_directory_as_its_default() {
         .assert()
         .success();
 
+    // load's scope is now inferred silently (never asked as its own
+    // question); the single plan confirmation is all that remains
+    // interactive, so a bare "\n" answer accepts its `[Y/n]` default.
     let mut project_load = cli(home.path());
     project_load.current_dir(&project);
     project_load
@@ -2303,9 +2309,7 @@ fn load_scope_prompt_uses_exact_cwd_vendor_directory_as_its_default() {
         .write_stdin("\n")
         .assert()
         .success()
-        .stderr(predicate::str::contains(
-            "Install skills at project scope? [Y/n]",
-        ));
+        .stdout(predicate::str::contains("shared: new deployment"));
     assert!(project.join(".agents/skills/alpha/SKILL.md").is_file());
 
     let mut global_load = cli(home.path());
@@ -2315,9 +2319,7 @@ fn load_scope_prompt_uses_exact_cwd_vendor_directory_as_its_default() {
         .write_stdin("\n")
         .assert()
         .success()
-        .stderr(predicate::str::contains(
-            "Install skills at project scope? [y/N]",
-        ));
+        .stdout(predicate::str::contains("shared: new deployment"));
     assert!(home.path().join(".agents/skills/alpha/SKILL.md").is_file());
     assert!(!other_project.join(".agents/skills/alpha").exists());
 }
@@ -4416,6 +4418,1079 @@ fn update_emits_a_structured_plan_event_before_applying() {
     assert!(plan_index < first_write, "the plan precedes every write");
 }
 
+/// Two skills discovered from one source, nothing deployed yet.
+///
+/// `load`'s plan-then-confirm tests start from a genuinely empty install so
+/// every deployment in the plan is new, unless a test explicitly pre-installs
+/// something to exercise the overwrite/identical paths.
+fn load_review_fixture() -> (TempDir, PathBuf) {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "writing-for-agents", "# Writing\n");
+    create_skill(&source, "drafting-commit-message", "# Drafting\n");
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            source.to_str().expect("utf8 source"),
+            "primary",
+        ])
+        .assert()
+        .success();
+    (home, source)
+}
+
+/// The approved invocation, whose positional order the plan must preserve.
+const LOAD_REVIEW_ARGS: [&str; 3] = ["load", "writing-for-agents", "drafting-commit-message"];
+
+/// Both skills are brand new everywhere, so target and scope are both
+/// inferred (three enabled targets, global scope from an empty home).
+const LOAD_REVIEW_PLAN: &str = "\
+Load plan
+
+Scope  global (inferred)
+
+skill                    change                         claude  shared  antigravity
+-----------------------  -----------------------------  ------  ------  -----------
+writing-for-agents       new deployment, 1 file, +1/-0  load    load    load
+drafting-commit-message  new deployment, 1 file, +1/-0  load    load    load
+
+6 changes across 3 enabled targets: 6 new
+";
+
+/// The whole plan is rendered before the single confirmation, and declining
+/// it says exactly which decisions were inferred.
+#[test]
+fn load_renders_its_whole_plan_before_one_confirmation_and_cancels_with_a_flag_hint() {
+    let (home, _source) = load_review_fixture();
+
+    let declined = cli(home.path())
+        .args(LOAD_REVIEW_ARGS)
+        .write_stdin("n\n")
+        .output()
+        .expect("run declined load");
+    assert!(declined.status.success(), "cancelling is not a failure");
+    assert_eq!(
+        stdout_of(declined.clone()),
+        format!(
+            "{LOAD_REVIEW_PLAN}Cancelled.\n\
+Hint: targets and scope were inferred. Re-run with --claude, --shared, --antigravity, --all, or --target NAME, and --global or --project, to change this plan.\n"
+        )
+    );
+    assert_eq!(
+        stderr_of(&declined),
+        "Apply this load plan to 3 enabled targets? [Y/n] "
+    );
+    assert!(
+        !home
+            .path()
+            .join(".claude/skills/writing-for-agents")
+            .exists(),
+        "declining a load plan writes nothing"
+    );
+}
+
+/// When target and scope are both stated explicitly, nothing was inferred,
+/// so cancelling teaches nothing — the hint line is entirely absent.
+#[test]
+fn load_cancel_omits_the_hint_when_target_and_scope_are_explicit() {
+    let (home, _source) = load_review_fixture();
+
+    let declined = cli(home.path())
+        .args([
+            "load",
+            "writing-for-agents",
+            "drafting-commit-message",
+            "--claude",
+            "--shared",
+            "--global",
+        ])
+        .write_stdin("n\n")
+        .output()
+        .expect("run declined explicit load");
+    assert!(declined.status.success());
+    assert_eq!(
+        stdout_of(declined.clone()),
+        "\
+Load plan
+
+skill                    change                         claude  shared
+-----------------------  -----------------------------  ------  ------
+writing-for-agents       new deployment, 1 file, +1/-0  load    load
+drafting-commit-message  new deployment, 1 file, +1/-0  load    load
+
+4 changes across 2 selected targets: 4 new
+Cancelled.\n"
+    );
+    assert_eq!(
+        stderr_of(&declined),
+        "Apply this load plan to 2 selected targets? [Y/n] "
+    );
+}
+
+/// A dry run reviews the plan and concludes once instead of echoing every item.
+#[test]
+fn load_dry_run_renders_the_plan_and_concludes_once() {
+    let (home, _source) = load_review_fixture();
+
+    let output = cli(home.path())
+        .args([LOAD_REVIEW_ARGS.as_slice(), ["--dry-run"].as_slice()].concat())
+        .output()
+        .expect("run dry-run load");
+    assert!(output.status.success());
+    let stdout = stdout_of(output);
+    assert_eq!(
+        stdout,
+        format!("{LOAD_REVIEW_PLAN}\nDry run — no changes were made.\n")
+    );
+    assert!(
+        !stdout.contains("(dry-run)"),
+        "a dry run concludes once instead of echoing every item:\n{stdout}"
+    );
+    assert!(
+        !home.path().join(".claude/skills").exists(),
+        "dry run writes nothing"
+    );
+}
+
+/// `--yes` still renders the plan, then applies it with a styled summary footer.
+#[test]
+fn load_yes_renders_the_plan_then_applies_with_a_summary_footer() {
+    let (home, _source) = load_review_fixture();
+
+    let output = cli(home.path())
+        .args([LOAD_REVIEW_ARGS.as_slice(), ["--yes"].as_slice()].concat())
+        .output()
+        .expect("run preconfirmed load");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output.clone()),
+        format!(
+            "{LOAD_REVIEW_PLAN}\n\
+Loaded writing-for-agents -> claude\n\
+Loaded writing-for-agents -> shared\n\
+Loaded writing-for-agents -> antigravity\n\
+Loaded drafting-commit-message -> claude\n\
+Loaded drafting-commit-message -> shared\n\
+Loaded drafting-commit-message -> antigravity\n\
+\n\
+completed: 6 deployments changed (6 loaded)\n"
+        )
+    );
+    assert!(!stderr_of(&output).contains("Apply this load plan"));
+    assert_eq!(
+        fs::read_to_string(
+            home.path()
+                .join(".claude/skills/writing-for-agents/SKILL.md")
+        )
+        .expect("loaded skill exists"),
+        "# Writing\n"
+    );
+}
+
+/// A noninteractive human-facing run must authorize its plan explicitly.
+#[test]
+fn load_requires_explicit_authorization_without_input() {
+    let (home, _source) = load_review_fixture();
+
+    let output = cli(home.path())
+        .args(
+            [
+                LOAD_REVIEW_ARGS.as_slice(),
+                ["--claude", "--shared", "--global", "--no-input"].as_slice(),
+            ]
+            .concat(),
+        )
+        .output()
+        .expect("run noninteractive load without --yes");
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("applying this plan noninteractively requires --yes."),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!home.path().join(".claude/skills").exists());
+}
+
+/// The plan distinguishes new installs from overwrites, breaking a
+/// multi-destination skill's row out into a per-destination explanation.
+#[test]
+fn load_distinguishes_new_installs_from_overwrites() {
+    let (home, source) = load_review_fixture();
+    cli(home.path())
+        .args([
+            "--json",
+            "load",
+            "writing-for-agents",
+            "--claude",
+            "--global",
+        ])
+        .assert()
+        .success();
+    change_skill(&source, "writing-for-agents", "# Writing\nmore\n");
+
+    let stdout = stdout_of(
+        cli(home.path())
+            .args(["load", "--claude", "--shared", "--global", "--dry-run"])
+            .output()
+            .expect("run new-vs-overwrite load"),
+    );
+    assert_eq!(
+        stdout,
+        "\
+Load plan
+
+skill                    change                          claude  shared
+-----------------------  ------------------------------  ------  ------
+drafting-commit-message  new deployment, 1 file, +1/-0   load    load
+writing-for-agents       2 destination-specific changes  update  load
+
+Destination-specific changes
+  writing-for-agents
+    claude  1 file changed, +1/-0
+    shared  new deployment, 1 file, +2/-0
+
+4 changes across 2 selected targets: 3 new, 1 overwrite
+
+Dry run — no changes were made.\n"
+    );
+}
+
+/// Once every requested skill is byte-identical everywhere selected, load
+/// says so in a single sentence instead of rendering an empty table.
+#[test]
+fn load_hides_identical_deployments_and_reports_a_footer_count() {
+    let (home, source) = load_review_fixture();
+    cli(home.path())
+        .args([
+            "--json",
+            "load",
+            "writing-for-agents",
+            "--claude",
+            "--global",
+        ])
+        .assert()
+        .success();
+    change_skill(&source, "writing-for-agents", "# Writing\nmore\n");
+    cli(home.path())
+        .args(["load", "--claude", "--shared", "--global", "--yes"])
+        .assert()
+        .success();
+
+    let stdout = stdout_of(
+        cli(home.path())
+            .args(["load", "--claude", "--shared", "--global"])
+            .output()
+            .expect("run fully-identical load"),
+    );
+    assert_eq!(
+        stdout,
+        "All requested skills are already identical across 2 selected targets.\n"
+    );
+}
+
+/// A destination column is dropped only when every one of its cells is the
+/// none value; the dropped destination's identical deployments still count
+/// toward the footer.
+#[test]
+fn load_drops_a_target_column_whose_every_cell_is_the_none_value() {
+    let (home, _source) = load_review_fixture();
+    cli(home.path())
+        .args([
+            "--json",
+            "load",
+            "writing-for-agents",
+            "drafting-commit-message",
+            "--claude",
+            "--global",
+        ])
+        .assert()
+        .success();
+
+    let stdout = stdout_of(
+        cli(home.path())
+            .args(["load", "--claude", "--shared", "--global", "--dry-run"])
+            .output()
+            .expect("run column-drop load"),
+    );
+    assert_eq!(
+        stdout,
+        "\
+Load plan
+
+skill                    change                         shared
+-----------------------  -----------------------------  ------
+drafting-commit-message  new deployment, 1 file, +1/-0  load
+writing-for-agents       new deployment, 1 file, +1/-0  load
+
+2 changes across 1 target: 2 new, 2 already identical
+
+Dry run — no changes were made.\n"
+    );
+    assert!(
+        !stdout.contains("claude"),
+        "an all-none column must be dropped entirely, not merely hidden in spirit:\n{stdout}"
+    );
+}
+
+/// A syntactically valid pattern matching nothing keeps the existing
+/// `NotFound` contract: nonzero exit, and no plan is ever rendered.
+#[test]
+fn load_names_an_unmatched_glob_pattern_as_not_found() {
+    let (home, _source) = load_review_fixture();
+
+    let output = cli(home.path())
+        .args(["load", "zzz-nomatch-*", "--claude", "--global", "--yes"])
+        .output()
+        .expect("run unmatched glob load");
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr_of(&output),
+        "Warning: skill pattern matched nothing: zzz-nomatch-*\n\
+Error: skill matching positional pattern not found: zzz-nomatch-*\n"
+    );
+    assert!(
+        stdout_of(output).is_empty(),
+        "no plan is rendered for a NotFound pattern"
+    );
+}
+
+/// Plan order must equal apply order; reversing the requested names reverses
+/// both the rendered rows and the applied progress lines identically.
+#[test]
+fn load_reviews_and_applies_skills_in_the_order_they_were_requested() {
+    let (home, _source) = load_review_fixture();
+
+    let stdout = stdout_of(
+        cli(home.path())
+            .args([
+                "load",
+                "drafting-commit-message",
+                "writing-for-agents",
+                "--claude",
+                "--shared",
+                "--global",
+                "--yes",
+            ])
+            .output()
+            .expect("run reversed load"),
+    );
+    let rows = stdout
+        .lines()
+        .filter(|line| line.contains("new deployment"))
+        .map(|line| line.split_whitespace().next().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        ["drafting-commit-message", "writing-for-agents"],
+        "the plan preserves the requested order:\n{stdout}"
+    );
+    let applied = stdout
+        .lines()
+        .filter(|line| line.starts_with("Loaded "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        applied,
+        [
+            "Loaded drafting-commit-message -> claude",
+            "Loaded drafting-commit-message -> shared",
+            "Loaded writing-for-agents -> claude",
+            "Loaded writing-for-agents -> shared",
+        ],
+        "apply must honour the order the plan promised:\n{stdout}"
+    );
+}
+
+/// A terminal user reviews the same plan in the symbol vocabulary, in color.
+#[test]
+fn load_renders_the_interactive_symbol_and_color_plan_for_a_terminal_user() {
+    let (home, _source) = load_review_fixture();
+
+    let stdout = stdout_of(
+        cli(home.path())
+            .env_remove("NO_COLOR")
+            .env("SKILL_MANAGER_FORCE_INTERACTIVE", "1")
+            .args(
+                [
+                    LOAD_REVIEW_ARGS.as_slice(),
+                    ["--claude", "--shared", "--color", "always", "--dry-run"].as_slice(),
+                ]
+                .concat(),
+            )
+            .output()
+            .expect("run interactive dry-run load"),
+    );
+    assert_eq!(
+        stdout,
+        "\u{1b}[1;36mLoad plan\u{1b}[0m\n\
+\n\
+Scope  🌐 global (inferred)\n\
+\n\
+skill                    change                         claude  shared\n\
+-----------------------  -----------------------------  ------  ------\n\
+writing-for-agents       new deployment, 1 file, +1/-0  \u{1b}[32m+\u{1b}[0m       \u{1b}[32m+\u{1b}[0m\n\
+drafting-commit-message  new deployment, 1 file, +1/-0  \u{1b}[32m+\u{1b}[0m       \u{1b}[32m+\u{1b}[0m\n\
+\n\
+4 changes across 2 selected targets: \u{1b}[32m+ 4 new\u{1b}[0m\n\
+\n\
+Dry run — no changes were made.\n"
+    );
+}
+
+/// The NDJSON stream carries a single `plan` event at revision 0, ahead of
+/// every write, with the resolved (never gated) selection and destinations.
+#[test]
+fn load_emits_a_structured_plan_event_before_applying() {
+    let (home, _source) = load_review_fixture();
+
+    let events = json_events(
+        cli(home.path())
+            .args([
+                "--json",
+                "load",
+                "writing-for-agents",
+                "--claude",
+                "--shared",
+            ])
+            .output()
+            .expect("run machine load"),
+    );
+    let plans = events_of(&events, "plan");
+    assert_eq!(plans.len(), 1, "one revision was reviewed");
+    let data = plans[0]["data"].clone();
+    assert_eq!(data["plan_id"], "load:writing-for-agents");
+    assert_eq!(data["revision"], 0);
+    assert_eq!(data["command"], "load");
+    assert_eq!(data["dry_run"], false);
+    assert_eq!(data["authorization"]["kind"], "binary");
+    assert_eq!(data["authorization"]["mode"], "noninteractive");
+    assert_eq!(data["selection"]["targets"]["mode"], "explicit");
+    assert_eq!(
+        data["selection"]["targets"]["names"],
+        serde_json::json!(["claude", "shared"])
+    );
+    assert_eq!(
+        data["selection"]["scope"],
+        serde_json::json!({ "mode": "inferred", "value": "global" }),
+        "the machine stream reports the resolved selection, never gated columns"
+    );
+    let home_root = home.path().to_str().expect("utf8 home").to_owned();
+    assert_eq!(
+        data["destinations"],
+        serde_json::json!([
+            {
+                "id": "claude:global",
+                "kind": "deployment",
+                "label": "claude · global",
+                "target": "claude",
+                "scope": "global",
+                "path": format!("{home_root}\\.claude\\skills")
+            },
+            {
+                "id": "shared:global",
+                "kind": "deployment",
+                "label": "shared · global",
+                "target": "shared",
+                "scope": "global",
+                "path": format!("{home_root}\\.agents\\skills")
+            }
+        ])
+    );
+    assert_eq!(data["entries"][0]["skill"], "writing-for-agents");
+    assert_eq!(data["entries"][0]["source"], "Primary");
+    assert_eq!(data["entries"][0]["actions"][0]["operation"], "load");
+    assert_eq!(
+        data["entries"][0]["actions"][0]["destination"],
+        "claude:global"
+    );
+    assert_eq!(data["entries"][0]["actions"][0]["existed"], false);
+    assert_eq!(
+        data["summary"],
+        serde_json::json!({ "skills": 1, "actions": 2, "new": 2 }),
+        "load's summary buckets by the plan's own new/overwrite categories, \
+         not the generic load/update action word"
+    );
+    let plan_index = events
+        .iter()
+        .position(|event| event["event"] == "plan")
+        .expect("plan event position");
+    let first_write = events
+        .iter()
+        .position(|event| event["event"] == "skill.loaded")
+        .expect("applied event position");
+    assert!(plan_index < first_write, "the plan precedes every write");
+}
+
+/// A row hidden from the human table for being fully identical everywhere
+/// must still appear, complete, in the machine `entries`/`summary`: gating
+/// is a property of rendering only, never of the structured stream.
+#[test]
+fn load_keeps_a_fully_hidden_identical_row_complete_in_the_json_stream() {
+    let (home, _source) = load_review_fixture();
+    cli(home.path())
+        .args([
+            "--json",
+            "load",
+            "writing-for-agents",
+            "--claude",
+            "--shared",
+            "--global",
+        ])
+        .assert()
+        .success();
+
+    // The same row is entirely absent from the human-facing table; only its
+    // footer count survives ("2 already identical"). Use --dry-run so this
+    // observation and the machine check below share identical prior state.
+    let stdout = stdout_of(
+        cli(home.path())
+            .args([
+                "load",
+                "writing-for-agents",
+                "drafting-commit-message",
+                "--claude",
+                "--shared",
+                "--global",
+                "--dry-run",
+            ])
+            .output()
+            .expect("run mixed identical-and-new human load"),
+    );
+    assert_eq!(
+        stdout,
+        "\
+Load plan
+
+skill                    change                         claude  shared
+-----------------------  -----------------------------  ------  ------
+drafting-commit-message  new deployment, 1 file, +1/-0  load    load
+
+2 changes across 2 selected targets: 2 new, 2 already identical
+
+Dry run — no changes were made.\n"
+    );
+    assert!(
+        !stdout.contains("writing-for-agents"),
+        "the fully-identical row never earns a table row, only a footer count:\n{stdout}"
+    );
+
+    let events = json_events(
+        cli(home.path())
+            .args([
+                "--json",
+                "load",
+                "writing-for-agents",
+                "drafting-commit-message",
+                "--claude",
+                "--shared",
+                "--global",
+                "--dry-run",
+            ])
+            .output()
+            .expect("run mixed identical-and-new load"),
+    );
+    let plans = events_of(&events, "plan");
+    let data = plans[0]["data"].clone();
+    assert_eq!(
+        data["summary"],
+        serde_json::json!({ "skills": 2, "actions": 4, "new": 2, "skip": 2 }),
+        "the hidden identical row's skip actions still count in the machine summary:\n{data}"
+    );
+    let entries = data["entries"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        entries.len(),
+        2,
+        "both skills are complete entries:\n{data}"
+    );
+    let hidden = entries
+        .iter()
+        .find(|entry| entry["skill"] == "writing-for-agents")
+        .cloned()
+        .unwrap_or_else(|| unreachable!("writing-for-agents entry is present"));
+    assert_eq!(
+        hidden["actions"],
+        serde_json::json!([
+            { "operation": "skip", "destination": "claude:global", "existed": true },
+            { "operation": "skip", "destination": "shared:global", "existed": true }
+        ]),
+        "the fully-identical row is a complete machine entry despite being human-hidden"
+    );
+}
+
+/// Two skills discovered from one source, ready to copy to an arbitrary path.
+fn copy_review_fixture() -> (TempDir, PathBuf) {
+    let home = sandbox();
+    let source = home.path().join("source");
+    create_skill(&source, "writing-for-agents", "# Writing\n");
+    create_skill(&source, "drafting-commit-message", "# Drafting\n");
+    (home, source)
+}
+
+/// The whole plan renders before the single confirmation, and copy has
+/// nothing to teach on cancel: source, destination, and filters are always
+/// stated explicitly, so nothing was inferred.
+#[test]
+fn copy_renders_its_whole_plan_before_one_confirmation_and_cancels() {
+    let (home, source) = copy_review_fixture();
+    let dest = home.path().join("vendor").join("skills");
+
+    let declined = cli(home.path())
+        .args([
+            "copy",
+            source.to_str().expect("utf8 source"),
+            dest.to_str().expect("utf8 dest"),
+        ])
+        .write_stdin("n\n")
+        .output()
+        .expect("run declined copy");
+    assert!(declined.status.success());
+    assert_eq!(
+        stdout_of(declined.clone()),
+        format!(
+            "\
+Copy plan
+
+Destination  {dest_display}
+
+skill                    change                   action
+-----------------------  -----------------------  ------
+drafting-commit-message  new copy, 1 file, +1/-0  copy
+writing-for-agents       new copy, 1 file, +1/-0  copy
+
+2 changes to 1 destination: 2 new
+Cancelled.\n",
+            dest_display = dest.display()
+        )
+    );
+    assert_eq!(
+        stderr_of(&declined),
+        format!("Copy these 2 skills to {}? [Y/n] ", dest.display())
+    );
+    assert!(!dest.exists(), "declining a copy plan writes nothing");
+}
+
+/// A dry run reviews the plan and concludes once instead of echoing every item.
+#[test]
+fn copy_dry_run_renders_the_plan_and_concludes_once() {
+    let (home, source) = copy_review_fixture();
+    let dest = home.path().join("vendor").join("skills");
+
+    let stdout = stdout_of(
+        cli(home.path())
+            .args([
+                "copy",
+                source.to_str().expect("utf8 source"),
+                dest.to_str().expect("utf8 dest"),
+                "--dry-run",
+            ])
+            .output()
+            .expect("run dry-run copy"),
+    );
+    assert_eq!(
+        stdout,
+        format!(
+            "\
+Copy plan
+
+Destination  {dest_display}
+
+skill                    change                   action
+-----------------------  -----------------------  ------
+drafting-commit-message  new copy, 1 file, +1/-0  copy
+writing-for-agents       new copy, 1 file, +1/-0  copy
+
+2 changes to 1 destination: 2 new
+
+Dry run — no changes were made.\n",
+            dest_display = dest.display()
+        )
+    );
+    assert!(!dest.exists());
+}
+
+/// `--yes` still renders the plan, then applies it with a styled summary footer.
+#[test]
+fn copy_yes_renders_the_plan_then_applies_with_a_summary_footer() {
+    let (home, source) = copy_review_fixture();
+    let dest = home.path().join("vendor").join("skills");
+
+    let output = cli(home.path())
+        .args([
+            "copy",
+            source.to_str().expect("utf8 source"),
+            dest.to_str().expect("utf8 dest"),
+            "--yes",
+        ])
+        .output()
+        .expect("run preconfirmed copy");
+    assert!(output.status.success());
+    assert_eq!(
+        stdout_of(output.clone()),
+        format!(
+            "\
+Copy plan
+
+Destination  {dest_display}
+
+skill                    change                   action
+-----------------------  -----------------------  ------
+drafting-commit-message  new copy, 1 file, +1/-0  copy
+writing-for-agents       new copy, 1 file, +1/-0  copy
+
+2 changes to 1 destination: 2 new
+
+Copied drafting-commit-message -> {dest_display}\\drafting-commit-message\n\
+Copied writing-for-agents -> {dest_display}\\writing-for-agents\n\
+\n\
+completed: 2 skills copied (2 new)\n",
+            dest_display = dest.display()
+        )
+    );
+    assert!(!stderr_of(&output).contains("Copy these"));
+    assert_eq!(
+        fs::read_to_string(dest.join("writing-for-agents/SKILL.md")).expect("copied skill exists"),
+        "# Writing\n"
+    );
+}
+
+/// A single matched skill collapses the table into the spec's degenerate
+/// sentence rather than a one-row table.
+#[test]
+fn copy_renders_as_a_degenerate_sentence_for_a_single_matched_skill() {
+    let (home, source) = copy_review_fixture();
+    let dest = home.path().join("vendor").join("skills");
+
+    let stdout = stdout_of(
+        cli(home.path())
+            .args([
+                "copy",
+                source.to_str().expect("utf8 source"),
+                dest.to_str().expect("utf8 dest"),
+                "--filter",
+                "writing-for-agents",
+                "--dry-run",
+            ])
+            .output()
+            .expect("run single-skill copy"),
+    );
+    assert_eq!(
+        stdout,
+        format!(
+            "\
+Copy plan
+
+Destination  {dest_display}
+
+copy writing-for-agents: new copy, 1 file, +1/-0
+
+1 change to 1 destination: 1 new
+
+Dry run — no changes were made.\n",
+            dest_display = dest.display()
+        )
+    );
+}
+
+/// Unlike `load`, `copy` never hides byte-identical content: re-copying to
+/// the same destination still reports every skill as an overwrite.
+#[test]
+fn copy_has_no_identical_hiding_and_reports_overwrites_even_when_content_matches() {
+    let (home, source) = copy_review_fixture();
+    let dest = home.path().join("vendor").join("skills");
+    cli(home.path())
+        .args([
+            "copy",
+            source.to_str().expect("utf8 source"),
+            dest.to_str().expect("utf8 dest"),
+            "--yes",
+        ])
+        .assert()
+        .success();
+
+    let stdout = stdout_of(
+        cli(home.path())
+            .args([
+                "copy",
+                source.to_str().expect("utf8 source"),
+                dest.to_str().expect("utf8 dest"),
+                "--yes",
+            ])
+            .output()
+            .expect("run re-copy"),
+    );
+    assert_eq!(
+        stdout,
+        format!(
+            "\
+Copy plan
+
+Destination  {dest_display}
+
+skill                    change           action
+-----------------------  ---------------  ------
+drafting-commit-message  no file changes  update
+writing-for-agents       no file changes  update
+
+2 changes to 1 destination: 2 overwrite
+
+Overwrote drafting-commit-message -> {dest_display}\\drafting-commit-message\n\
+Overwrote writing-for-agents -> {dest_display}\\writing-for-agents\n\
+\n\
+completed: 2 skills copied (2 overwritten)\n",
+            dest_display = dest.display()
+        ),
+        "copy reports the unchanged content as an overwrite rather than hiding the row"
+    );
+    assert!(
+        !stdout.contains(VERBATIM_PREFIX),
+        "human paths must not use verbatim spellings:\n{stdout}"
+    );
+}
+
+/// With a filter given, an empty match names the filter; without one, it
+/// names the empty source.
+#[test]
+fn copy_reports_no_skills_matched_the_filter_or_found_in_the_source() {
+    let (home, source) = copy_review_fixture();
+    let dest = home.path().join("vendor").join("skills");
+
+    let filtered = stdout_of(
+        cli(home.path())
+            .args([
+                "copy",
+                source.to_str().expect("utf8 source"),
+                dest.to_str().expect("utf8 dest"),
+                "--filter",
+                "nonexistent",
+                "--yes",
+            ])
+            .output()
+            .expect("run filtered-empty copy"),
+    );
+    assert_eq!(
+        filtered,
+        format!(
+            "No skills from {} matched --filter \"nonexistent\".\n",
+            source.display()
+        )
+    );
+
+    let empty_source = home.path().join("empty-source");
+    fs::create_dir_all(&empty_source).expect("create empty source");
+    let empty = stdout_of(
+        cli(home.path())
+            .args([
+                "copy",
+                empty_source.to_str().expect("utf8 empty source"),
+                dest.to_str().expect("utf8 dest"),
+                "--yes",
+            ])
+            .output()
+            .expect("run empty-source copy"),
+    );
+    assert_eq!(
+        empty,
+        format!("No skills found in {}.\n", empty_source.display())
+    );
+}
+
+/// A noninteractive human-facing run must authorize its plan explicitly.
+#[test]
+fn copy_requires_explicit_authorization_without_input() {
+    let (home, source) = copy_review_fixture();
+    let dest = home.path().join("vendor").join("skills");
+
+    let output = cli(home.path())
+        .args([
+            "copy",
+            source.to_str().expect("utf8 source"),
+            dest.to_str().expect("utf8 dest"),
+            "--no-input",
+        ])
+        .output()
+        .expect("run noninteractive copy without --yes");
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr_of(&output),
+        "Error: applying this plan noninteractively requires --yes.\n"
+    );
+    assert!(!dest.exists());
+}
+
+/// Plan order equals apply order for `copy` too, following discovery order
+/// since copy has no positional skill-name selector.
+#[test]
+fn copy_reviews_and_applies_skills_in_discovery_order() {
+    let (home, source) = copy_review_fixture();
+    let dest = home.path().join("vendor").join("skills");
+
+    let stdout = stdout_of(
+        cli(home.path())
+            .args([
+                "copy",
+                source.to_str().expect("utf8 source"),
+                dest.to_str().expect("utf8 dest"),
+                "--yes",
+            ])
+            .output()
+            .expect("run ordered copy"),
+    );
+    let rows = stdout
+        .lines()
+        .filter(|line| line.contains("new copy"))
+        .map(|line| line.split_whitespace().next().unwrap_or_default())
+        .collect::<Vec<_>>();
+    let applied = stdout
+        .lines()
+        .filter(|line| line.starts_with("Copied "))
+        .map(|line| {
+            line.strip_prefix("Copied ")
+                .and_then(|rest| rest.split(" -> ").next())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows, applied,
+        "plan order must equal apply order:\n{stdout}"
+    );
+}
+
+/// A terminal user reviews the same degenerate-sentence plan in the symbol
+/// vocabulary, in color.
+#[test]
+fn copy_renders_the_interactive_symbol_and_color_plan_for_a_terminal_user() {
+    let (home, source) = copy_review_fixture();
+    let dest = home.path().join("vendor").join("skills");
+
+    let stdout = stdout_of(
+        cli(home.path())
+            .env_remove("NO_COLOR")
+            .env("SKILL_MANAGER_FORCE_INTERACTIVE", "1")
+            .args([
+                "copy",
+                source.to_str().expect("utf8 source"),
+                dest.to_str().expect("utf8 dest"),
+                "--filter",
+                "writing-for-agents",
+                "--color",
+                "always",
+                "--dry-run",
+            ])
+            .output()
+            .expect("run interactive dry-run copy"),
+    );
+    assert_eq!(
+        stdout,
+        format!(
+            "\u{1b}[1;36mCopy plan\u{1b}[0m\n\
+\n\
+Destination  {dest_display}\n\
+\n\
+\u{1b}[32m+\u{1b}[0m writing-for-agents: new copy, 1 file, +1/-0\n\
+\n\
+1 change to 1 destination: \u{1b}[32m+ 1 new\u{1b}[0m\n\
+\n\
+Dry run — no changes were made.\n",
+            dest_display = dest.display()
+        )
+    );
+}
+
+/// The NDJSON stream carries a single `plan` event at revision 0, ahead of
+/// every write.
+#[test]
+fn copy_emits_a_structured_plan_event_before_applying() {
+    let (home, source) = copy_review_fixture();
+    let dest = home.path().join("vendor").join("skills");
+
+    let events = json_events(
+        cli(home.path())
+            .args([
+                "--json",
+                "copy",
+                source.to_str().expect("utf8 source"),
+                dest.to_str().expect("utf8 dest"),
+                "--filter",
+                "writing-for-agents",
+            ])
+            .output()
+            .expect("run machine copy"),
+    );
+    let plans = events_of(&events, "plan");
+    assert_eq!(plans.len(), 1, "one revision was reviewed");
+    let data = plans[0]["data"].clone();
+    assert_eq!(data["plan_id"], "copy:writing-for-agents");
+    assert_eq!(data["revision"], 0);
+    assert_eq!(data["command"], "copy");
+    assert_eq!(data["dry_run"], false);
+    assert_eq!(data["authorization"]["kind"], "binary");
+    assert_eq!(data["authorization"]["mode"], "noninteractive");
+    assert_eq!(
+        data["destinations"],
+        serde_json::json!([
+            {
+                "id": "action",
+                "kind": "path",
+                "label": "action",
+                "path": dest.display().to_string()
+            }
+        ])
+    );
+    assert_eq!(data["entries"][0]["skill"], "writing-for-agents");
+    assert_eq!(data["entries"][0]["actions"][0]["operation"], "copy");
+    assert_eq!(data["entries"][0]["actions"][0]["destination"], "action");
+    assert_eq!(data["entries"][0]["actions"][0]["existed"], false);
+    assert_eq!(
+        data["summary"],
+        serde_json::json!({ "skills": 1, "actions": 1, "new": 1 }),
+        "copy's summary buckets by the plan's own new/overwrite categories, \
+         not the generic copy/update action word"
+    );
+    let plan_index = events
+        .iter()
+        .position(|event| event["event"] == "plan")
+        .expect("plan event position");
+    let first_write = events
+        .iter()
+        .position(|event| event["event"] == "skill.copied")
+        .expect("applied event position");
+    assert!(plan_index < first_write, "the plan precedes every write");
+}
+
+/// `copy --dry-run` still emits the machine `summary` event last, matching
+/// the pre-existing NDJSON contract that a summary always concludes the
+/// stream, even when nothing was written.
+#[test]
+fn copy_dry_run_still_emits_a_trailing_summary_event() {
+    let (home, source) = copy_review_fixture();
+    let dest = home.path().join("vendor").join("skills");
+
+    let events = json_events(
+        cli(home.path())
+            .args([
+                "--json",
+                "copy",
+                source.to_str().expect("utf8 source"),
+                dest.to_str().expect("utf8 dest"),
+                "--dry-run",
+            ])
+            .output()
+            .expect("run machine dry-run copy"),
+    );
+    assert_eq!(
+        events.last().map(|event| &event["event"]),
+        Some(&Value::from("summary"))
+    );
+    let summary = events_of(&events, "summary");
+    assert_eq!(summary.len(), 1, "exactly one summary event is emitted");
+    assert_eq!(
+        summary[0]["data"],
+        serde_json::json!({ "action": "copy", "copied": 2, "dry_run": true })
+    );
+    assert!(!dest.exists(), "a dry run never writes the destination");
+}
+
 #[test]
 fn machine_and_recipe_updates_implicitly_use_only_enabled_installed_targets() {
     let home = sandbox();
@@ -4768,7 +5843,14 @@ fn ambiguous_bare_word_prefers_the_skill_and_warns() {
     fs::create_dir_all(home.path().join("dup-name")).expect("create ambiguous cwd directory");
 
     cli(home.path())
-        .args(["load", "dup-name", "--claude", "--global", "--no-input"])
+        .args([
+            "load",
+            "dup-name",
+            "--claude",
+            "--global",
+            "--no-input",
+            "--yes",
+        ])
         .assert()
         .success()
         .stderr(predicate::str::contains(
@@ -4815,7 +5897,14 @@ fn bare_directory_name_that_is_not_a_skill_still_resolves_as_a_source() {
     create_skill(&plain_dir, "widget", "# Widget");
 
     cli(home.path())
-        .args(["load", "plain-dir", "--claude", "--global", "--no-input"])
+        .args([
+            "load",
+            "plain-dir",
+            "--claude",
+            "--global",
+            "--no-input",
+            "--yes",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("Loaded widget"));
@@ -4843,7 +5932,14 @@ fn bare_configured_source_name_and_label_still_resolve_as_sources() {
         .success();
 
     cli(home.path())
-        .args(["load", "primary", "--claude", "--global", "--no-input"])
+        .args([
+            "load",
+            "primary",
+            "--claude",
+            "--global",
+            "--no-input",
+            "--yes",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("Loaded gizmo"));
@@ -4856,6 +5952,7 @@ fn bare_configured_source_name_and_label_still_resolve_as_sources() {
             "--shared",
             "--global",
             "--no-input",
+            "--yes",
         ])
         .assert()
         .success()
@@ -4942,6 +6039,7 @@ fn bare_dir_operand_and_a_skill_name_discovered_only_inside_it_both_resolve() {
             "--claude",
             "--global",
             "--no-input",
+            "--yes",
         ])
         .assert()
         .success()
@@ -5219,7 +6317,14 @@ fn glob_patterns_are_unaffected_by_literal_skill_name_resolution() {
         .success();
 
     cli(home.path())
-        .args(["load", "knowing-*", "--claude", "--global", "--no-input"])
+        .args([
+            "load",
+            "knowing-*",
+            "--claude",
+            "--global",
+            "--no-input",
+            "--yes",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("Loaded knowing-camber-me"))
@@ -5309,6 +6414,7 @@ fn literal_skill_name_with_an_unmatched_glob_still_succeeds_and_only_deploys_the
             "--shared",
             "--global",
             "--no-input",
+            "--yes",
         ])
         .assert()
         .success()

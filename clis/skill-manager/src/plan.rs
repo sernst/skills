@@ -242,6 +242,12 @@ pub enum PlanAction {
     Update,
     /// Create a deployment that does not exist yet.
     Load,
+    /// Create a copy at an arbitrary destination that does not exist yet.
+    ///
+    /// Shares `Load`'s `+` symbol and green color (the plan-action legend
+    /// makes no distinction between the two creations), but keeps its own
+    /// non-TTY word so redirected `copy` output says `copy`, not `load`.
+    Copy,
     /// Delete an existing deployment.
     Remove,
     /// Leave identical content untouched.
@@ -256,6 +262,7 @@ impl PlanAction {
             Self::Import => "import",
             Self::Update => "update",
             Self::Load => "load",
+            Self::Copy => "copy",
             Self::Remove => "remove",
             Self::Skip => "skip",
         }
@@ -267,7 +274,7 @@ impl PlanAction {
         match self {
             Self::Import => "←",
             Self::Update => "↑",
-            Self::Load => "+",
+            Self::Load | Self::Copy => "+",
             Self::Remove => "−",
             Self::Skip => "✓",
         }
@@ -282,7 +289,7 @@ impl PlanAction {
     const fn color(self) -> Option<u8> {
         match self {
             Self::Import | Self::Update => Some(33),
-            Self::Load => Some(32),
+            Self::Load | Self::Copy => Some(32),
             Self::Remove => Some(31),
             Self::Skip => None,
         }
@@ -527,12 +534,8 @@ fn change_cell(entry: &PlanEntry) -> String {
     match entry.action {
         PlanAction::Skip => "up to date".into(),
         PlanAction::Remove => "remove deployment".into(),
-        PlanAction::Load => format!(
-            "new deployment, {}, +{}/-{}",
-            pluralized(entry.stat.files_changed(), "file"),
-            entry.stat.insertions(),
-            entry.stat.deletions()
-        ),
+        PlanAction::Load => creation_line("deployment", &entry.stat),
+        PlanAction::Copy => creation_line("copy", &entry.stat),
         PlanAction::Import | PlanAction::Update => totals_line(&entry.stat),
     }
 }

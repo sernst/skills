@@ -53,19 +53,21 @@ plural field.
 
 ## Discovery and deployment recipes
 
-<!-- recipe-command: load fields: all,all_targets,antigravity,cd,cd_only,claude,command,dry_run,filter,filters,global,no_cd,no_input,project,refresh,shared,source,sources,target,targets -->
+<!-- recipe-command: load fields: all,all_targets,antigravity,cd,cd_only,claude,command,dry_run,filter,filters,global,no_cd,no_input,project,refresh,shared,source,sources,target,targets,yes -->
 ### `load` (`install`)
 
 Deploy discovered skills, replacing existing deployments. The recipe alias
 `install` canonicalizes to `load`; emit `"command":"load"`.
 
 Fields: `command:"load"`; `sources`/`source` (`string|string[]`);
-`filters`/`filter`; source, target, and scope selection; `dry_run` and `refresh`
-(`bool`); `no_input`. A non-interactive call must choose `global:true` or
-`project:true` outside the manager home. At home, only global is available.
-A committed non-interactive call must also explicitly select at
-least one target using a built-in target boolean, `all_targets:true`, or
-`targets`; a dry run may implicitly preview enabled targets.
+`filters`/`filter`; source, target, and scope selection; `dry_run`, `refresh`,
+and `yes` (`bool`); `no_input`. Without explicit scope or target selection,
+`load` infers project-vs-global scope and enabled targets silently, in both
+committed and dry runs, matching `update`. `load` renders its whole plan
+before applying. Every recipe carrier is already non-interactive and
+auto-authorizes the apply step once the plan has rendered, so `yes` is
+accepted but not required to commit; it exists for parity with the CLI flag
+and for readability in saved recipes.
 
 ```json
 {"command":"load","sources":["sernst-skills"],"filters":["managing-skills"],"shared":true,"global":true,"dry_run":true}
@@ -74,13 +76,13 @@ least one target using a built-in target boolean, `all_targets:true`, or
 <!-- recipe-command: update fields: all,all_targets,antigravity,cd,cd_only,claude,command,dry_run,filter,filters,global,no_cd,no_input,project,refresh,shared,source,sources,target,targets,yes -->
 ### `update`
 
-Refresh only existing deployments. Fields match `load` plus `yes` (`bool`).
+Refresh only existing deployments. Fields match `load`.
 The recipe alias `up` canonicalizes to `update`; emit `"command":"update"`.
 When targets are omitted, update uses enabled targets in both committed and dry
 runs. Without an explicit scope it infers each existing deployment; specify a
-scope to restrict it. The human
-pre-confirmation plan and its `yes` bypass are interactive-only; recipe
-carriers are already non-interactive and never prompt.
+scope to restrict it. Both `load` and `update` render their whole plan before
+applying; every recipe carrier is already non-interactive and auto-authorizes
+the apply step, so `yes` is accepted but not required to commit.
 
 ```json
 {"command":"update","sources":["managing-*"],"all_targets":true,"dry_run":true}
@@ -107,12 +109,14 @@ the source.
 {"command":"import","skill":"managing-skills","claude":true,"global":true,"dry_run":true}
 ```
 
-<!-- recipe-command: copy fields: command,destination,dry_run,filter,filters,no_input,refresh,source -->
+<!-- recipe-command: copy fields: command,destination,dry_run,filter,filters,no_input,refresh,source,yes -->
 ### `copy`
 
 Copy discovered skills to an arbitrary destination. Required: `source`
 (`string`) and `destination` (`string`). Optional: `filters`/`filter`,
-`dry_run`, `refresh`, `no_input`.
+`dry_run`, `refresh`, `yes`, `no_input`. `copy` renders its whole plan before
+applying; every recipe carrier is already non-interactive and auto-authorizes
+the apply step, so `yes` is accepted but not required to commit.
 
 ```json
 {"command":"copy","source":"sernst-skills","destination":"./vendor/skills","filters":["managing-*"],"dry_run":true}

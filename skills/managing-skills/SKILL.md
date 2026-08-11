@@ -39,9 +39,12 @@ temporary UTF-8 JSON file and use `skill-manager --input FILE`. Delete only that
 known temporary file afterward. Use inline `--json=OBJECT` only when quoting is
 demonstrably safe.
 
-Treat every recipe invocation as non-interactive. A committed `load` must
-explicitly select at least one target; `update` uses enabled targets when none
-are selected. A committed `import`
+Treat every recipe invocation as non-interactive. `load` and `update` render
+their whole plan and then auto-authorize the apply step in every non-interactive
+carrier (`--json`, `--json-input`, `--input`); `yes:true` is accepted but not
+required to commit either one. Both use enabled targets when none are
+selected, and `load` also infers project-vs-global scope silently when none is
+given. A committed `import`
 requires `yes:true`, must name exactly one skill, and must narrow target and
 scope selection whenever more than one deployment differs from its source;
 a GitHub-backed source cannot be imported non-interactively at all. `all_targets:true` selects

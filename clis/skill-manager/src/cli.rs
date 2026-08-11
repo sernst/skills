@@ -62,7 +62,7 @@ pub enum ColorChoice {
 pub enum Command {
     /// Deploy source skills, replacing existing deployments.
     #[command(visible_alias = "install")]
-    Load(SyncArgs),
+    Load(LoadArgs),
     /// Refresh only skills already deployed. Alias: up.
     #[command(visible_alias = "up")]
     Update(UpdateArgs),
@@ -195,10 +195,24 @@ pub struct SyncArgs {
     pub refresh: bool,
 }
 
+/// Arguments for `load`.
+///
+/// `load` shows a change plan before deploying anything, so it accepts one
+/// confirmation flag mirroring `update`'s.
+#[derive(Clone, Debug, Default, Args)]
+pub struct LoadArgs {
+    /// Discovery, target, and scope selection shared with `update`.
+    #[command(flatten)]
+    pub sync: SyncArgs,
+    /// Skip the load confirmation; the plan is still displayed.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+}
+
 /// Arguments for `update`.
 ///
 /// `update` shows a change plan before deploying anything, so it accepts one
-/// confirmation flag that `load` deliberately does not.
+/// confirmation flag mirroring `load`'s.
 #[derive(Clone, Debug, Default, Args)]
 pub struct UpdateArgs {
     /// Discovery, target, and scope selection shared with `load`.
@@ -245,6 +259,9 @@ pub struct CopyArgs {
     /// Force remote cache refresh.
     #[arg(long)]
     pub refresh: bool,
+    /// Skip the copy confirmation; the plan is still displayed.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 /// Arguments for `remove`.
@@ -567,7 +584,7 @@ mod tests {
             let cli = Cli::try_parse_from(["skill-manager", command, flag])
                 .unwrap_or_else(|error| unreachable!("{error}"));
             let selection = match cli.command {
-                Some(Command::Load(args)) => args.scope,
+                Some(Command::Load(args)) => args.sync.scope,
                 Some(Command::Update(args)) => args.sync.scope,
                 Some(Command::Remove(args)) => args.scope,
                 Some(Command::Status(args)) => args.scope,

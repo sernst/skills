@@ -20,12 +20,12 @@ recipe values are still type-checked.
 
 `--json`, recipes, and `--no-input` cannot answer prompts. Scope-dependent
 commands must therefore specify `global: true` or `project: true` where
-required; they are mutually exclusive. `load` always needs one in
-non-interactive mode, while an ambiguous dual-scope `remove` needs one. A
-recipe uses canonical `configs`, `configs.reset`, or `configs.restore` for
-configuration operations. `configs.reset` and `configs.restore` need
-`yes: true` in non-interactive mode; `configs.restore` optionally accepts the
-strict `backup` field.
+required; they are mutually exclusive. `load` infers its scope silently, the
+same way an interactive run would, rather than requiring one; an ambiguous
+dual-scope `remove` still needs one. A recipe uses canonical `configs`,
+`configs.reset`, or `configs.restore` for configuration operations.
+`configs.reset` and `configs.restore` need `yes: true` in non-interactive
+mode; `configs.restore` optionally accepts the strict `backup` field.
 
 ## Event stream
 
@@ -73,8 +73,8 @@ and paths but never include backup bytes. Layout migration emits
 
 A mutating command that renders a plan for review also emits one event per
 rendered revision, always before anything is written: `plan` for revision `0`
-and `plan.updated` for every narrowed re-render that follows. `update` emits it
-today; `load`, `remove`, `copy`, and `import` adopt it as they migrate.
+and `plan.updated` for every narrowed re-render that follows. `update`, `load`,
+and `copy` emit it today; `remove` and `import` adopt it as they migrate.
 
 ```json
 {
@@ -197,6 +197,26 @@ An entry lists the `actions` it will perform and, for a plan that exposes where
 an item exists without yet deciding what to do about it, an `available` array of
 destination ids. Availability is evidence, not an operation, and never counts as
 an action.
+
+A `deployment` destination carries `path` when the command decides target
+roots itself rather than accepting an arbitrary one — `load` populates it;
+`update` does not, to keep its established payload unchanged. An entry carries
+`source` naming the resolved source label an item came from whenever the
+command tracks that provenance (`load` does; `update` does not, for the same
+reason). Fields that a command has never emitted are simply absent rather than
+`null`, so consumers can treat presence itself as meaningful.
+
+Significance gating never hides a semantic action from `entries`, even when
+rendering hides the same row from the human table because every action on it
+is a no-op: a fully identical `load` row still appears as a complete entry
+whose actions are all `"operation": "skip"`. `summary` reflects the same
+completeness. Its per-operation counts use the vocabulary each command's plan
+distinguishes: `update`'s `summary` buckets by the literal action word
+(`"update"`); `load` and `copy` instead bucket by whether a deployment already
+`existed` (`"new"` for one that did not, `"overwrite"` for one that did), with
+`"skip"` always counted separately for identical, no-op actions regardless of
+that distinction. Automation should key off these command-specific categories
+rather than assuming one fixed set across every command.
 
 Significance gating is a property of human rendering and never reaches this
 stream. The payload omits only what is genuinely absent: a zero metric, an empty

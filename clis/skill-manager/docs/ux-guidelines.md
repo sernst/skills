@@ -553,13 +553,13 @@ output, regardless of terminal width.
 > document; if every command below reaches "migrated," delete this section
 > entirely rather than leaving a stale all-done note.
 
-Snapshot date: 2026-08-11.
+Snapshot date: 2026-08-25.
 
 - **Migrated** (uses `ChangePlan`/`Authorizer` in
-  `src/review.rs`/`src/authorize.rs`): `update`.
+  `src/review.rs`/`src/authorize.rs`): `update`, `load`, `copy`.
 - **Not yet migrated** (still uses older, command-specific prompting such as
   direct `self.prompt.confirm`/`self.prompt.choose` calls that predate the
-  plan-first invariant): `load`, `copy`, `remove`, `import`.
+  plan-first invariant): `remove`, `import`.
 
 This gap is tracked, expected follow-up work, not a rule exception. When
 touching any not-yet-migrated command, migrate its authorization onto the

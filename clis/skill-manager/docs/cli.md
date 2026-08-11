@@ -9,10 +9,10 @@ and honors `NO_COLOR`; `always` colors even redirected output; `never` is plain.
 
 | Command | Purpose |
 | --- | --- |
-| `load [SOURCE_OR_SKILL_OR_PATTERN...]` | Discover and deploy skills, replacing existing copies; alias: `install`. |
+| `load [SOURCE_OR_SKILL_OR_PATTERN...]` | Discover and deploy skills, replacing existing copies, after one plan confirmation; alias: `install`. |
 | `update [SOURCE_OR_SKILL_OR_PATTERN...]` | Update skills already deployed in the selected or inferred scope, after one plan confirmation; alias: `up`. |
 | `import SKILL` | Adopt one deployed, possibly agent-modified copy as the new source content. |
-| `copy SOURCE DEST` | Copy discovered skills to an arbitrary destination. |
+| `copy SOURCE DEST` | Copy discovered skills to an arbitrary destination, after one plan confirmation. |
 | `remove [SKILL_OR_PATTERN...]` | Remove selected or auto-detected deployments. |
 | `status [FILTER...]` | Show source-relative deployment state; aliases: `ls`, `list`. |
 | `resolve [SKILL_OR_PATTERN...]` | Persist a collision preference. |
@@ -47,64 +47,103 @@ A directory below home remains a normal project.
 
 | Command | Scope without an explicit flag |
 | --- | --- |
-| `load` | Prompts once for a scope. The default is project when an enabled selected target's leading directory exists in CWD (such as `.claude`, `.agents`, or `.gemini`); otherwise global. |
+| `load` | Infers project-vs-global scope silently: project when an enabled selected target's leading directory exists in CWD (such as `.claude`, `.agents`, or `.gemini`); otherwise global. The inferred scope is shown in the plan and, if the plan is later cancelled, named in the cancel hint. |
 | `update` | Infers every existing skill/target deployment, including both scopes when both exist; `-g` or `-p` restricts the eligible deployments. |
 | `import` | Scans both scopes for changed deployments. When more than one differs from the source, it prompts for the copy to import; `-g` or `-p` restricts the scan. |
 | `remove` | Removes an unambiguous existing scope. When any selected skill exists in both scopes, it prompts once for project, global, or both; an explicit flag restricts it. |
 | `status` | Inspects both scopes by default; `-g` or `-p` narrows the report. |
 
 `--json`, recipe input (`--json=…`, `--json-input`, or `--input`), and
-`--no-input` are non-interactive. Outside the manager home, `load` needs an
-explicit scope in these modes, including for `--dry-run`; an ambiguous `remove`
-also needs one. At home, the only available scope is global. The command
-fails with an interaction-required error rather than guessing. `--yes` bypasses
-the destructive removal confirmation only—it never chooses a scope.
+`--no-input` are non-interactive. In these modes, `load` infers its scope and
+target selection the same way an interactive run would rather than requiring
+either to be stated explicitly. Applying the rendered plan is authorized
+differently depending on which non-interactive mode is active: `--json` and
+every recipe carrier auto-authorize `load`, `update`, and `copy` once the plan
+has rendered, so `--yes`/`yes:true` is accepted but not required for those
+three commands; plain `--no-input` (with no JSON carrier) still requires an
+explicit `--yes` to apply. `remove` and `import` never auto-authorize in any
+non-interactive mode—they always require an explicit `--yes`/`yes:true` to
+commit, because both are destructive. An ambiguous `remove` still needs an
+explicit scope flag in these modes and fails with an interaction-required
+error rather than guessing. At home, the only available scope is global.
+`--yes` bypasses `remove`'s destructive confirmation only—it never chooses a
+scope.
 
 All discovery commands accept repeatable `--filter PATTERN`, `--refresh`, and
 `--dry-run` where applicable. Configured sources are the default. `--cd` adds
 CWD for `status`; `--cd-only` uses only CWD; `--no-cd` retains the compatibility
 spelling for configured-source-only behavior.
 
-## Change plans for update and import
+## Change plans for load, update, copy, and import
 
-Interactive `update` immediately uses all enabled targets unless selectors
-narrow them. It always renders a complete plan before it asks anything.
+Interactive `load` and `update` immediately use all enabled targets unless
+selectors narrow them; `load` also infers its scope (see above). Both, along
+with `copy`, always render a complete plan before asking anything—no command
+in this family ever asks a pre-emptive question before showing what it will
+do.
 
-The plan omits unchanged skills and groups each changed skill into one row with
-a column per destination target. Rows appear in the order the skills were named
-on the command line, so review order matches request order, and apply follows
-the same order the plan promised. Every render is significance gated: a target
-column whose every cell would be the none value is dropped, an inferred scope
-shared by every planned deployment is hoisted to a single `Scope` line instead
-of being repeated per cell, an explicitly stated scope is not restated at all,
-and zero counts are omitted rather than printed. When one skill has exactly one
-planned deployment the table degrades to a single sentence. When deployments
-have different file/line totals, compact destination-specific details preserve
-every delta below the grouped row. Interactive output uses the symbol
-vocabulary (`↑`, `↕ both`, `🌐 global`, `📁 project`, `—`, `✓`); a redirected
-stream uses the equivalent words.
+`update`'s plan omits unchanged skills. `load`'s plan distinguishes new
+installs from overwrites: a deployment that does not yet exist is `load`, one
+that exists with different content is `update`, and a destination already
+byte-identical to the source is hidden from the table entirely and counted
+only in the footer's `already identical` clause. `copy` has no such concept—it
+has no prior "existing deployment" to compare against ahead of the diff—so a
+byte-identical destination still appears as an ordinary overwrite row with
+`no file changes`.
+
+The plan groups each row—one row per changed skill for `update`/`load`, one
+row per copied skill for `copy`—with a column per destination target (for
+`load`/`update`) or, for `copy`, one destination shown once in the metadata
+above the table, since every row shares that same single arbitrary path.
+Rows appear in the order the skills were named on the command line (or, for
+`copy`, in discovery order, since `copy` takes no positional skill filter), so
+review order matches request order, and apply follows the same order the plan
+promised. Every render is significance gated: a target column whose every cell
+would be the none value is dropped, an inferred scope shared by every planned
+deployment is hoisted to a single `Scope` line instead of being repeated per
+cell, an explicitly stated scope is not restated at all, and zero counts are
+omitted rather than printed. When one skill has exactly one planned
+deployment, the table degrades to a single sentence—this is also `copy`'s
+usual rendering, since it deploys to exactly one destination. When
+deployments have different file/line totals, compact destination-specific
+details preserve every delta below the grouped row. Interactive output uses
+the symbol vocabulary (`↑`, `↕ both`, `🌐 global`, `📁 project`, `—`, `✓`,
+`+`); a redirected stream uses the equivalent words.
 
 The plan ends with a count summary naming its blast radius, such as `4 updates
-across 2 targets`. The qualifier (`enabled` or `selected`) survives only while
-every target does; once gating drops one, the phrase degrades to a bare count so
-it never overstates what will be written.
+across 2 targets` or `6 changes across 3 enabled targets: 6 new`. The
+qualifier (`enabled` or `selected`) survives only while every target does;
+once gating drops one, the phrase degrades to a bare count so it never
+overstates what will be written.
 
-One confirmation follows, defaulting to yes because an update is regenerable.
-Declining cancels with exit `0`, emits `command.cancelled`, deploys nothing, and
-prints a hint naming only the decisions the CLI inferred, so the next invocation
-is obvious. A no-op prints one precise result without a table or confirmation:
-either that the skill is up to date, or that it is not deployed to any target in
-the searched scope.
+One confirmation follows, defaulting to yes for `load` and `copy` (both are
+constructive/regenerable) as well as for `update`. Declining cancels with exit
+`0`, emits `command.cancelled`, deploys nothing, and prints a hint naming only
+the decisions the CLI inferred—target and/or scope for `load`, targets and
+deployed scopes for `update`—so the next invocation is obvious. `copy` never
+infers anything (source, destination, and filters are always stated
+explicitly), so declining its plan has no hint to print. A no-op prints one
+precise result without a table or confirmation: for `update`, that the skill
+is up to date or not deployed to any target in the searched scope; for
+`load`, that every requested skill is already identical across the selected or
+enabled targets; for `copy`, that no skills matched the filter or were found
+in the source.
 
-`--yes`/`-y` renders the same plan and then applies it. `--dry-run` renders the
-plan and stops with a single `Dry run — no changes were made.` conclusion rather
-than echoing every item. Applying prints one progress line per deployment—with
-the scope only when the plan has more than one—followed by a summary footer such
-as `✓: 4 deployments updated`, whose zero categories are omitted entirely.
-Under `--no-input`, inferred defaults still apply but `--yes` is required to
-authorize the write. `load` never adds this confirmation, and machine mode keeps
-its existing event-only contract while additionally emitting the structured
-`plan` event described in [json.md](json.md).
+`--yes`/`-y` (added to `load` and `copy` alongside `update`'s existing flag)
+renders the same plan and then applies it. `--dry-run` renders the plan and
+stops with a single `Dry run — no changes were made.` conclusion rather than
+echoing every item. Applying prints one progress line per deployment or
+copied skill—with the scope only when the plan has more than one, though
+`load`'s progress lines never carry a scope suffix, since `load` decides its
+scope once for the whole run—followed by a summary footer such as
+`completed: 4 deployments updated` or `completed: 6 deployments changed (6
+loaded)`, whose zero categories are omitted entirely. Under plain
+`--no-input` (no JSON carrier), inferred defaults still apply but `--yes` is
+required to authorize the write; `--json` and every recipe carrier
+auto-authorize instead, as described above. Machine mode keeps its existing
+event-only contract while additionally emitting the structured `plan` event,
+at revision `0`, described in [json.md](json.md), for all of `load`,
+`update`, and `copy`.
 
 `import SKILL` reverses `load`. It resolves exactly one skill—patterns are
 rejected—through the same first-source-wins discovery, then scans the selected
