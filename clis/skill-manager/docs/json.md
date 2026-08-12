@@ -253,6 +253,105 @@ diff, an inapplicable field. `summary` always carries `skills` and `actions`,
 adds `available` when the plan carries availability, and adds one nonzero count
 per operation.
 
+## `configs copy` events
+
+`configs copy` seeds directories, not skills, so its `plan` event uses its own
+`items`/`totals` vocabulary rather than the `entries`/`summary` shape above.
+Like its sibling commands, it accepts `--json-input`/`--input`/
+`--json=OBJECT` recipes with a `command` of `configs.copy` and fields `from`,
+`to`, `include_cache`, `dry_run`, and `yes`; `from`/`to` are required unless
+already supplied on the CLI.
+
+```json
+{
+  "plan_id": "configs.copy:/home/agent/.skill-manager->/home/agent/scratch",
+  "revision": 0,
+  "command": "configs.copy",
+  "dry_run": false,
+  "authorization": { "kind": "binary", "mode": "prompt", "default": true },
+  "from": "/home/agent",
+  "to": "/home/agent/scratch",
+  "target_source": "from-config",
+  "items": [
+    {
+      "item": "configuration",
+      "path": "/home/agent/scratch/.skill-manager",
+      "existed": false
+    },
+    {
+      "item": "claude",
+      "path": "/home/agent/scratch/.claude/skills",
+      "existed": true,
+      "diff": { "files_changed": 3, "insertions": 3 }
+    }
+  ],
+  "totals": { "items": 2, "new": 1, "overwrite": 1 }
+}
+```
+
+`target_source` is `from-config`, `active-config`, or `defaults`, naming which
+configuration decided the resolved target directories — see
+[`configs copy`](cli.md#configs-copy) for the precedence. `include_cache` is
+present and `true` only when `--include-cache` was supplied; its absence means
+the default exclusion applied. Each `items[]` entry's `diff`, when present,
+uses the same `files_changed`/`insertions`/`deletions` shape as elsewhere in
+this document but is never populated with a `deleted` file: this command never
+deletes anything already present at the destination, so a file existing only
+there is not part of the plan at all. `totals.items` counts every planned
+item; the nonzero-only `new`, `overwrite`, and `skipped` sub-counts classify
+them — an item is `new` when its destination did not yet exist, `overwrite`
+when it existed and its filtered content differs, `skipped` when it existed and
+already matches byte-for-byte (so a repeated identical copy is a no-op rather
+than a spurious overwrite), and `skipped_linked` when the configured source
+root is a symlink/junction that is reported but never descended (findings
+G/K). This is `copy`'s `new`/`overwrite` vocabulary extended with `skipped`
+and `skipped_linked`, never the `update`/`remove` vocabulary. A genuine no-op
+— every item `skipped` and nothing `skipped_linked` — renders the concise
+no-op result rather than a plan, so like its sibling commands it emits no
+`plan` event and only the terminal `summary` closes the stream. A run whose
+only work is a link-skip is *not* a no-op: it still renders its plan and the
+`skipped (linked source)` row so the omission is visible.
+
+Applying (not a `--dry-run`) emits one `configs.copy.item` event per item
+that is actually written; a `skipped` item is not re-copied and so emits no
+item event:
+
+```json
+{
+  "item": "claude",
+  "path": "/home/agent/scratch/.claude/skills",
+  "action": "merged",
+  "files_changed": 3
+}
+```
+
+`action` is `copied` when the destination did not exist before this
+invocation, `merged` when it did. Every exit path — dry run, applied, an
+identical no-op, and even an error — ends with the shared `summary` event
+described above, carrying `configs copy`'s own field shape:
+
+```json
+{
+  "action": "configs.copy",
+  "items": 2,
+  "new": 1,
+  "merged": 1,
+  "skipped": 0,
+  "skipped_linked": 0,
+  "dry_run": false
+}
+```
+
+Unlike the `entries`/`summary` commands above, `new`, `merged`, `skipped`, and
+`skipped_linked` are always present here (never omitted when zero) alongside
+`items`, `dry_run`, and the `action` discriminator that names which command
+produced this `summary` event — the same discriminator role `action` plays in
+`summary-copy` and `summary-load-update`. On a dry run or no-op the counts
+describe the full plan; on a successful apply they describe everything
+committed; on an error the summary is still emitted before `command.failed`
+and its counts reflect only what was committed before the failure — zero for a
+validation or preflight failure that never wrote anything.
+
 ## Exit status and streams
 
 Normal completion, no work, and user cancellation return `0`. Operational,

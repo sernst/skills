@@ -49,6 +49,8 @@ The comments in this section are machine-checked against production emit sites.
 - `config.restored`: restored backup and displaced-state backup metadata.
 <!-- event: config.shown -->
 - `config.shown`: active config, storage roots, persistence, and backups.
+<!-- event: configs.copy.item -->
+- `configs.copy.item`: one `configs copy` item applied to the destination.
 <!-- event: diagnostic -->
 - `diagnostic`: warning message, sometimes with an unmatched `pattern`.
 <!-- event: plan -->
@@ -303,6 +305,17 @@ current working directory. A `backup_path` or `displaced_backup_path` is the
 raw archived-byte path; its corresponding ID is the stable selector for
 restore operations.
 
+<!-- payload: configs-copy-item fields: action,files_changed,item,path -->
+`configs copy` applies each resolved directory in its plan and emits one
+`configs.copy.item` event per directory immediately after it is written:
+`item` is the plan row id (`configuration` or a target name such as
+`claude`), `path` is the destination directory, `action` is `copied` when the
+destination did not exist before this invocation or `merged` when it did, and
+`files_changed` counts the files that were added or overwritten. It is never
+emitted during a `--dry-run`, nor for a directory that already matched and was
+skipped (no write, so no event), nor for a configured source root that was a
+symlink/junction and therefore reported as skipped but never copied.
+
 `command.cancelled` is one `{"action":"..."}` object naming the declined
 command, such as `remove`, `update`, `import`, `configs.reset`, or
 `configs.restore`. `command.failed` is `{"message":"..."}`.
@@ -317,6 +330,7 @@ command, such as `remove`, `update`, `import`, `configs.reset`, or
 <!-- payload: summary-remove fields: action,dry_run,removed -->
 <!-- payload: summary-status fields: action,skills -->
 <!-- payload: summary-resolve fields: action,resolved -->
+<!-- payload: summary-configs-copy fields: action,dry_run,items,merged,new,skipped,skipped_linked -->
 `summary.data` has one of these exact shapes:
 
 - `source.list`: `{sources}`;
@@ -325,10 +339,23 @@ command, such as `remove`, `update`, `import`, `configs.reset`, or
 - `copy`: `{action,copied,dry_run}`;
 - `remove`: `{action,removed,dry_run}`;
 - `status`: `{action,skills}`;
-- `resolve`: `{action,resolved}`.
+- `resolve`: `{action,resolved}`;
+- `configs.copy`: `{action,items,new,merged,skipped,skipped_linked,dry_run}`,
+  always `"action": "configs.copy"` and always all seven fields,
+  `new`/`merged`/`skipped`/`skipped_linked` included even when `0` unlike
+  `configs.copy.item`'s per-row shape above. `new` counts freshly copied
+  directories, `merged` directories updated in place, `skipped` directories
+  left untouched because they already matched, and `skipped_linked` configured
+  source roots that were a symlink/junction and therefore reported but never
+  copied, so an identical repeat copy reports `new: 0, merged: 0` and only
+  `skipped`. On an error exit the `summary` is still emitted before
+  `command.failed`, counting only what was committed before the failure.
 
 Other source, target, and configuration lifecycle commands finish with their
-specific event and do not emit `summary`. Do not require `summary` as a generic
+specific event and do not emit `summary`; `configs copy` is the one
+configuration-lifecycle exception, since it is a seeding/merge operation
+whose final counts (directories new vs. merged) fit the shared `summary`
+vocabulary the same way `copy`'s do. Do not require `summary` as a generic
 success condition.
 
 <!-- payload: plan fields: authorization,command,decisions,destinations,dry_run,entries,plan_id,revision,selection,summary -->

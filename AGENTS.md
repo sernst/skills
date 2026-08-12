@@ -66,3 +66,38 @@ validating, smoke testing, or otherwise manually exercising it.** Always pass
 `--home <scratch-dir>` (it outranks `SKILL_MANAGER_HOME` and the OS home).
 A prior session skipped this and corrupted live configuration that had to be
 manually undone — treat it as a hard rule, not a suggestion.
+
+A bare scratch `--home` starts empty, which does not resemble a real
+configuration and is a poor smoke-testing environment. To seed a scratch
+directory from an existing one — including the real home, read-only — pair
+`configs copy` with `--home` pointed at the *same* scratch directory you are
+seeding, then keep using that `--home` for every command that follows.
+
+Pass `FROM` as an already-expanded absolute path, not a literal `~`. The CLI
+expands a leading `~` against the *active* `--home`, so a literal `~` here
+would resolve to the scratch home — the same path as `TO` — and the command
+would refuse the identical operands. Let the shell expand the real home
+instead (`$HOME` in PowerShell, `~` in POSIX shells before it reaches the CLI),
+and give `--home`/`TO` an absolute scratch path so every following command
+resolves the same home cleanly:
+
+```powershell
+PS> $smoke = Join-Path $env:TEMP 'skill-manager-smoke'
+PS> skill-manager --home $smoke configs copy $HOME $smoke --yes
+PS> skill-manager --home $smoke status
+```
+
+The destination naturally sits under your home (a `TEMP` or repo directory
+usually does), which is fully supported: `configs copy` seeds only `FROM`'s
+`.skill-manager` directory and its resolved target roots, so a destination
+anywhere under `FROM` — just not inside one of those copied roots — is fine.
+`configs copy` reads its `FROM` argument (here the real home) directly from
+disk and never opens it — or the active `--home` — through the configuration
+repository, so it never migrates, backs up, locks, or otherwise writes to
+either one. That holds even when `FROM` *is* the active home, and even under
+`--dry-run`, which changes nothing anywhere. Passing `--home $smoke` on the
+`configs copy` invocation itself, not only on the commands that follow, still
+matters: that flag governs which configuration the active-home fallback
+consults when `FROM` has no configuration of its own, and
+it is the home every following command uses, by the same `--home` >
+`SKILL_MANAGER_HOME` > OS home precedence as any other command.

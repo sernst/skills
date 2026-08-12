@@ -106,6 +106,7 @@ fn source_recipe_fields(source: &str) -> BTreeMap<String, BTreeSet<String>> {
         ("remove", "overlay_remove"),
         ("status", "overlay_status"),
         ("resolve", "overlay_resolve"),
+        ("configs.copy", "overlay_configs_copy"),
     ] {
         recipes.insert(
             name.to_owned(),
@@ -221,6 +222,7 @@ fn is_event_name(value: &str) -> bool {
             "collision.",
             "command.",
             "config.",
+            "configs.copy.",
             "plan.",
             "skill.",
             "source.",
@@ -525,7 +527,7 @@ fn config_and_summary_payload_references_match_production_emit_sites() {
     );
 
     let summaries = event_json_payloads(app, "summary");
-    assert_eq!(summaries.len(), 7, "production summary emit-site count");
+    assert_eq!(summaries.len(), 8, "production summary emit-site count");
     let summary_fields = summaries
         .iter()
         .map(|payload| object_fields(payload))
@@ -538,6 +540,7 @@ fn config_and_summary_payload_references_match_production_emit_sites() {
         ("summary-remove", 1),
         ("summary-status", 1),
         ("summary-resolve", 1),
+        ("summary-configs-copy", 1),
     ] {
         let expected = documented
             .get(marker)
@@ -583,6 +586,7 @@ fn config_and_summary_payload_references_match_production_emit_sites() {
         "self.report_remove_summary(removed, args.dry_run)",
         "\"action\": \"status\", \"skills\": status_rows.len()",
         "\"action\": \"resolve\", \"resolved\": resolved_count",
+        "\"action\": \"configs.copy\",",
     ] {
         assert!(
             app.contains(production_meaning),
@@ -677,6 +681,7 @@ fn every_production_event_has_a_source_derived_payload_family() {
         ("config.reset", "config-reset"),
         ("config.restored", "config-restored"),
         ("config.shown", "config-shown"),
+        ("configs.copy.item", "configs-copy-item"),
         ("diagnostic", "diagnostic-message"),
         ("plan", "plan"),
         ("plan.updated", "plan"),

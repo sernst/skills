@@ -4,23 +4,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::authorize::selection_range;
 use crate::authorize::{Authorization, Authorizer, SelectionOption};
 use crate::cache::{GitHubTransport, materialize_source};
 use crate::cli::{
-    Command, ConfigsAction, ConfigsArgs, CopyArgs, ImportArgs, RemoveArgs, ResolveArgs,
-    ScopeSelection, SourceAction, SourceAddArgs, SourceAlternateArgs, SourceLocateArgs,
-    SourceModeArg, SourceSelection, SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs,
-    TargetAction, TargetSelection,
+    Command, ConfigsAction, ConfigsArgs, ConfigsCopyArgs, CopyArgs, ImportArgs, RemoveArgs,
+    ResolveArgs, ScopeSelection, SourceAction, SourceAddArgs, SourceAlternateArgs,
+    SourceLocateArgs, SourceModeArg, SourceSelection, SourceSwapArgs, SourceUpdateArgs, StatusArgs,
+    SyncArgs, TargetAction, TargetSelection,
 };
 use crate::config::{
-    Config, ConfigBackup, ConfigRepository, FileConfigRepository, derive_salted_source_id,
-    find_source_index, fold, is_builtin_name, location_from_reference, location_identity,
-    location_reference, locations_equal, manager_home, normalize_target_template, paths_equal,
-    portable_canonicalize, portable_path, resolved_targets, resolved_targets_for_scope,
-    set_source_location, source_from_reference, source_location, source_reference,
+    CONFIG_SCHEMA_VERSION, Config, ConfigBackup, ConfigRepository, FileConfigRepository,
+    derive_salted_source_id, expand_home, find_source_index, fold, is_builtin_name,
+    location_from_reference, location_identity, location_reference, locations_equal, manager_home,
+    normalize_config_targets, normalize_target_template, paths_equal, portable_canonicalize,
+    portable_path, resolved_targets, resolved_targets_for_scope, set_source_location,
+    source_from_reference, source_location, source_reference,
 };
 use crate::domain::{
     ResolvedSource, Scope, ScopedTarget, SkillCandidate, SkillDiscovery, SourceEntry,
@@ -29,14 +30,16 @@ use crate::domain::{
 use crate::error::{Result, SkillManagerError};
 use crate::event::{Level, Reporter};
 use crate::plan::{
-    DiffStat, FileChange, FileDelta, PlanAction, creation_line, diff_directories, totals_line,
+    DiffStat, FileChange, FileDelta, PlanAction, creation_line, diff_directories,
+    diff_directory_maps, totals_line,
 };
 use crate::prompt::Prompt;
 use crate::review::{
     ChangePlan, Decision, DecisionOption, Destination, DestinationKind, OptionConsequence,
     OptionDetail, PlanAuthorization, PlanRow, PlanSelection, PlannedAction, PreviewBlock,
-    PreviewEntry, PreviewField, RenderStyle, ResultEntry, ResultMarker, colored, destination_label,
-    location_of, location_text, plan_event_data, plan_event_name, render_plan, result_footer,
+    PreviewEntry, PreviewField, RenderStyle, ResultEntry, ResultMarker, action_text, colored,
+    destination_label, heading, location_of, location_text, plan_event_data, plan_event_name,
+    render_plan, result_footer,
 };
 use crate::skills::{
     PatternExpansion, deployed_skills, detect_skill_dirs, directories_equal, directory_files,
@@ -373,6 +376,7 @@ where
                 )?;
                 Ok(RunOutcome::Success)
             }
+            Some(ConfigsAction::Copy(copy)) => self.run_configs_copy(copy),
         }
     }
 
@@ -402,6 +406,454 @@ where
             "command.cancelled",
             Level::Info,
             json!({ "action": action }),
+        )
+    }
+
+    /// Seed a destination manager home from an existing one: the manager
+    /// configuration plus every resolved target directory that actually
+    /// exists under `<FROM>`, merged into `<TO>` by path without ever
+    /// deleting content already present at the destination.
+    ///
+    /// This is deliberately not built on the shared [`ChangePlan`]/[`PlanRow`]
+    /// review model: that model's rendered identity column and JSON row key
+    /// are hardcoded to `skill` (see `review::render_table` and
+    /// `review::row_value`), which would mislabel rows that are directories
+    /// (`configuration`, `claude`, `shared`, ...) rather than skills. Reusing
+    /// it as-is would either misrepresent what this command does or require
+    /// changing that shared vocabulary for five already-shipped commands.
+    /// Instead this reuses only the low-level, genuinely generic primitives —
+    /// [`PlanAction`], [`colored`], the `status` column helpers,
+    /// [`diff_directory_maps`], [`creation_line`]/[`totals_line`], and
+    /// [`result_footer`] — the same way `configs`'s plain source table
+    /// already renders outside that model via `aligned_table`.
+    fn run_configs_copy(&mut self, args: &ConfigsCopyArgs) -> Result<RunOutcome> {
+        let mut progress = SeedProgress::default();
+        let result = self.configs_copy_inner(args, &mut progress);
+        // Defect 6: a terminal `summary` must close every exit path, including
+        // error exits. The success, dry-run, and no-op paths inside
+        // `configs_copy_inner` emit their own summary reflecting the full
+        // plan; an error returns before reaching that point, so finalize here
+        // with whatever was actually committed — zero for a pre-apply
+        // validation failure, partial for a mid-apply failure — so a consumer
+        // always sees a summary before `command.failed`.
+        if result.is_err() {
+            let _ = self.emit_configs_copy_summary(&progress, args.dry_run);
+        }
+        result
+    }
+
+    /// The full `configs copy` pipeline. Every filesystem decision is made
+    /// against `<FROM>`/`<TO>` directly; the active-home repository is never
+    /// migrated or locked, and it is only *read* (never written) when target
+    /// discovery falls through to it because `<FROM>` has no usable
+    /// configuration of its own.
+    #[allow(clippy::too_many_lines)]
+    fn configs_copy_inner(
+        &mut self,
+        args: &ConfigsCopyArgs,
+        progress: &mut SeedProgress,
+    ) -> Result<RunOutcome> {
+        // Resolve and validate both operands BEFORE touching any repository
+        // state (defects 1 and 2): a dry run must change nothing anywhere,
+        // and the canonical `configs copy ~ ./temp/...` shape routinely makes
+        // `<FROM>` alias the active home, so the active home must never gain
+        // migration markers or lock files as a side effect of this command.
+        let from = self.resolve_seed_directory(&args.from)?;
+        let to = self.resolve_seed_directory(&args.to)?;
+
+        if !from.is_dir() {
+            return Err(SkillManagerError::InvalidInput(format!(
+                "seed source {} does not exist or is not a directory",
+                from.display()
+            )));
+        }
+        if to.exists() && !to.is_dir() {
+            return Err(SkillManagerError::InvalidInput(format!(
+                "seed destination {} exists and is not a directory",
+                to.display()
+            )));
+        }
+
+        let (config, target_source) = self.discover_seed_config(&from)?;
+        let items = build_seed_items(&config, &from, &to, args.include_cache)?;
+        if items.is_empty() {
+            return Err(SkillManagerError::InvalidInput(format!(
+                "{} has no configuration and no existing target skill directories to copy",
+                from.display()
+            )));
+        }
+
+        // Reject only a genuine recursion or self-overwrite hazard (finding N),
+        // never mere nesting of `<TO>` somewhere under `<FROM>`. This command
+        // copies only `<FROM>/.skill-manager` plus each resolved target root —
+        // not all of `<FROM>` — so the canonical `configs copy ~ ./temp/...`
+        // shape, where `<TO>` sits under the home but outside every copied
+        // subtree, is a supported and common case. The hazard exists precisely
+        // when a copied source root and `<TO>` overlap, so the check runs after
+        // the item set is resolved but still before any preflight, plan render,
+        // or write, and it reads only already-resolved paths — no repository
+        // access, so the defect 1/2 no-mutation invariant is preserved.
+        reject_seed_recursion(&from, &to, &items)?;
+
+        // Preflight every destination path (and every ancestor within `<TO>`)
+        // before rendering the plan or writing anything (defects 3 and 4):
+        // reject destination symlinks/reparse points that could redirect a
+        // write outside `<TO>`, and reject file/directory conflicts so the
+        // plan can never promise a seed it would then only partially apply.
+        for item in &items {
+            // A link-skipped source is never read or written, so it has no
+            // destination preflight; walking its source in `reject_seed_conflicts`
+            // would follow the link and read outside `<FROM>` (findings A/G).
+            if item.source_is_link {
+                continue;
+            }
+            preflight_seed_destination(&to, item)?;
+        }
+
+        let mut rows = Vec::with_capacity(items.len());
+        for item in items {
+            // A configured item whose source root is a link/reparse point is
+            // never descended (findings G/K): carry it as an explicit
+            // link-skip row instead of reading it. Its destination `existed`
+            // flag is still informative for rendering, but nothing is written.
+            if item.source_is_link {
+                let existed = item.destination.is_dir();
+                rows.push(SeedRow {
+                    item,
+                    existed,
+                    action: SeedAction::LinkSkipped,
+                    stat: DiffStat::default(),
+                });
+                continue;
+            }
+            let before = merge_directory_files(&item.destination, item.excluded)?;
+            let after = merge_directory_files(&item.source, item.excluded)?;
+            let mut stat = diff_directory_maps(&before, &after)?;
+            stat.files.retain(|file| file.change != FileChange::Deleted);
+            let existed = item.destination.is_dir();
+            // A directory present in the source but missing at the destination is
+            // real work even when it contains no regular files (finding H):
+            // file-only diffing would classify such an item as a no-op and the
+            // merge would never recreate the folder, violating the "copies
+            // folders, deletes nothing" contract. `seed_source_entries` already
+            // enumerates directories for preflight, so reuse it here.
+            let missing_directory = seed_source_entries(&item.source, item.excluded)?
+                .into_iter()
+                .any(|(relative, is_dir)| {
+                    is_dir
+                        && !relative
+                            .split('/')
+                            .fold(item.destination.clone(), |path, part| path.join(part))
+                            .is_dir()
+                });
+            let action = if !existed {
+                SeedAction::Copied
+            } else if stat.is_empty() && !missing_directory {
+                SeedAction::Skipped
+            } else {
+                SeedAction::Merged
+            };
+            rows.push(SeedRow {
+                item,
+                existed,
+                action,
+                stat,
+            });
+        }
+
+        let style = self.render_style();
+
+        // How many rows would actually write, versus how many are deliberate
+        // link-skips (findings G/K). A link-skip is NOT a no-op: it must be
+        // surfaced, so a run whose only non-identical rows are link-skips must
+        // still render its plan and report the skip.
+        let writes = rows
+            .iter()
+            .filter(|row| matches!(row.action, SeedAction::Copied | SeedAction::Merged))
+            .count();
+        let link_skips = rows
+            .iter()
+            .filter(|row| row.action == SeedAction::LinkSkipped)
+            .count();
+
+        // Genuine no-op (finding E / defect 10): every planned item is already
+        // identical — nothing to write and nothing skipped for cause. Match the
+        // sibling commands' no-work rendering — no `plan` event, no plan table,
+        // no "0 changes" footer, and never a confirmation prompt — and state
+        // only the specific no-op result. This precedes the dry-run branch
+        // because a no-op changes nothing regardless of `--dry-run`. A
+        // link-skip is deliberately excluded here so it can never masquerade as
+        // a clean no-op.
+        if writes == 0 && link_skips == 0 {
+            progress.record_plan(&rows);
+            self.reporter.human(&format!(
+                "Nothing to copy: {} already matches {}.",
+                to.display(),
+                from.display()
+            ))?;
+            self.reporter.human(&result_footer(
+                &[ResultEntry {
+                    marker: ResultMarker::Unchanged,
+                    count: rows.len(),
+                    description: "already identical".to_owned(),
+                }],
+                style,
+            ))?;
+            self.emit_configs_copy_summary(progress, args.dry_run)?;
+            return Ok(RunOutcome::Success);
+        }
+
+        let authorization = self.configs_copy_authorization(args);
+        self.reporter.event(
+            "plan",
+            Level::Info,
+            configs_copy_plan_data(
+                &from,
+                &to,
+                target_source,
+                args.include_cache,
+                &rows,
+                0,
+                args.dry_run,
+                authorization,
+            ),
+        )?;
+        for line in render_configs_copy_plan(
+            &from,
+            &to,
+            &target_source.label(&self.home),
+            args.include_cache,
+            &rows,
+            style,
+        ) {
+            self.reporter.human(&line)?;
+        }
+        self.reporter
+            .human(&configs_copy_plan_footer(&rows, style))?;
+
+        if args.dry_run {
+            progress.record_plan(&rows);
+            self.reporter.human("")?;
+            self.reporter.human("Dry run — no changes were made.")?;
+            self.emit_configs_copy_summary(progress, args.dry_run)?;
+            return Ok(RunOutcome::Success);
+        }
+
+        // Authorization gates writes only. When the run has no writes (its only
+        // work is reporting link-skips), there is nothing to consent to, so it
+        // proceeds straight to the reporting pass without a prompt.
+        if writes > 0 && !self.authorize_configs_copy(args, &rows, &to)? {
+            self.report_cancelled("configs.copy")?;
+            return Ok(RunOutcome::Cancelled);
+        }
+        self.reporter.human("")?;
+
+        for row in &rows {
+            if row.action == SeedAction::Skipped {
+                progress.skipped += 1;
+                continue;
+            }
+            if row.action == SeedAction::LinkSkipped {
+                // Report the deliberate omission of a linked source root
+                // (findings G/K): no write, so no ancestor recheck and no
+                // `configs.copy.item` event, but it is visibly recorded.
+                progress.linked_skipped += 1;
+                self.reporter.human(&format!(
+                    "Skipped {} (linked source not copied): {}",
+                    row.item.label,
+                    row.item.source.display()
+                ))?;
+                continue;
+            }
+            // Re-run the link/ancestor rejection immediately before writing this
+            // item (finding C). Preflight already ran, but an attacker could
+            // swap a destination ancestor (for example `TO/.claude`) for a
+            // symlink or junction while the confirmation prompt was waiting.
+            // This shrinks the window to "checked immediately before the write";
+            // it is deliberately NOT a per-handle TOCTOU guarantee.
+            reject_linked_ancestors(&to, &row.item.destination)?;
+            reject_links_in_tree(&row.item.destination)?;
+            std::fs::create_dir_all(&row.item.destination)
+                .map_err(|error| SkillManagerError::io(&row.item.destination, error))?;
+            merge_copy_tree(&row.item.source, &row.item.destination, row.item.excluded)?;
+            let verb = if row.existed { "Merged" } else { "Copied" };
+            self.reporter.human(&format!(
+                "{verb} {} -> {}",
+                row.item.label,
+                row.item.destination.display()
+            ))?;
+            let action = if row.existed {
+                progress.merged += 1;
+                "merged"
+            } else {
+                progress.copied += 1;
+                "copied"
+            };
+            self.reporter.event(
+                "configs.copy.item",
+                Level::Info,
+                json!({
+                    "item": row.item.id,
+                    "path": row.item.destination,
+                    "action": action,
+                    "files_changed": row.stat.files_changed(),
+                }),
+            )?;
+        }
+        self.reporter.human("")?;
+        let changed = progress.copied + progress.merged;
+        let mut breakdown = Vec::new();
+        if progress.copied > 0 {
+            breakdown.push(format!("{} new", progress.copied));
+        }
+        if progress.merged > 0 {
+            breakdown.push(format!("{} merged", progress.merged));
+        }
+        let mut entries = Vec::new();
+        // Only claim a "seeded" result when something was actually written; a
+        // run whose only outcome is link-skips must not read as "0 seeded".
+        if changed > 0 {
+            let mut description =
+                format!("director{} seeded", if changed == 1 { "y" } else { "ies" });
+            if !breakdown.is_empty() {
+                description = format!("{description} ({})", breakdown.join(", "));
+            }
+            entries.push(ResultEntry {
+                marker: ResultMarker::Completed,
+                count: changed,
+                description,
+            });
+        }
+        if progress.skipped > 0 {
+            entries.push(ResultEntry {
+                marker: ResultMarker::Unchanged,
+                count: progress.skipped,
+                description: "already identical".to_owned(),
+            });
+        }
+        if progress.linked_skipped > 0 {
+            entries.push(ResultEntry {
+                marker: ResultMarker::Unchanged,
+                count: progress.linked_skipped,
+                description: "skipped (linked source)".to_owned(),
+            });
+        }
+        self.reporter.human(&result_footer(&entries, style))?;
+        self.emit_configs_copy_summary(progress, args.dry_run)?;
+        Ok(RunOutcome::Success)
+    }
+
+    /// Resolve a `configs copy` `<FROM>`/`<TO>` argument: `~` expansion
+    /// against the active `--home`, then ordinary CWD-relative resolution.
+    fn resolve_seed_directory(&self, raw: &str) -> Result<PathBuf> {
+        absolute_path(expand_home(raw, &self.home))
+    }
+
+    /// Discover which configuration decides `configs copy`'s target
+    /// directories.
+    ///
+    /// Precedence is `<FROM>`'s own schema-v2 configuration, then the active
+    /// `--home` configuration, then built-in defaults — but every tier is
+    /// read directly from disk, never through [`ConfigRepository::load`] or
+    /// [`ConfigRepository::migrate_layout`]. Those seams migrate layout, back
+    /// up displaced files, and take a persistent lock, all of which would
+    /// mutate their target. `<FROM>` is frequently the caller's real home (the
+    /// canonical `configs copy ~ ./temp/...` shape), and the active home is
+    /// exactly the state `--home` exists to protect, so neither may be written
+    /// merely to answer a target-discovery question (defects 1, 2, and 9).
+    ///
+    /// `<FROM>`'s own configuration is read strictly: a present-but-unreadable
+    /// or wrong-schema file is a hard error naming that file rather than a
+    /// silent fall-through that would omit its custom targets. The active home
+    /// is read leniently: it is only a fallback source of target definitions,
+    /// so an unreadable or non-current file simply yields built-in defaults.
+    fn discover_seed_config(&self, from: &Path) -> Result<(Config, SeedTargetSource)> {
+        if let Some(config) = read_seed_config(from)? {
+            return Ok((config, SeedTargetSource::FromConfig));
+        }
+        // When the active home aliases `<FROM>`, reading it again would just
+        // re-read the source we already found no strict config in, so skip
+        // straight to defaults instead of risking a redundant read.
+        if !paths_equal(&self.home, from)
+            && let Some(config) = read_seed_config(&self.home).unwrap_or(None)
+        {
+            return Ok((config, SeedTargetSource::ActiveHome));
+        }
+        Ok((Config::default(), SeedTargetSource::Defaults))
+    }
+
+    /// Describe how this invocation authorizes its seeding plan.
+    fn configs_copy_authorization(&self, args: &ConfigsCopyArgs) -> PlanAuthorization {
+        let prompted = !args.dry_run && !args.yes && !self.no_input;
+        let mode = if args.dry_run {
+            "dry-run"
+        } else if args.yes {
+            "yes"
+        } else if self.no_input {
+            "noninteractive"
+        } else {
+            "prompt"
+        };
+        PlanAuthorization {
+            kind: "binary",
+            mode,
+            default: prompted.then_some(true),
+        }
+    }
+
+    /// Obtain consent for the rendered seeding plan.
+    fn authorize_configs_copy(
+        &mut self,
+        args: &ConfigsCopyArgs,
+        rows: &[SeedRow],
+        to: &Path,
+    ) -> Result<bool> {
+        if args.yes {
+            return Ok(true);
+        }
+        if self.no_input {
+            if self.reporter.is_json() {
+                return Ok(true);
+            }
+            return Err(SkillManagerError::InteractionRequired(
+                "applying this plan noninteractively requires --yes.".into(),
+            ));
+        }
+        let prompt = if rows.len() == 1 {
+            format!("Seed {} into {}?", rows[0].item.label, to.display())
+        } else {
+            format!("Seed these {} items into {}?", rows.len(), to.display())
+        };
+        Ok(Authorizer::new(self.prompt)
+            .confirm(&prompt, false)?
+            .is_approved())
+    }
+
+    /// Emit the terminal `summary` event from every exit path (dry run,
+    /// applied, no-op, or error), reusing the same shared event name every
+    /// sibling command finishes with (see `report_sync_summary`/
+    /// `report_import_summary`/`emit_copy_summary`/`report_remove_summary`
+    /// above): `docs/json.md`'s event stream section states a summary is last
+    /// for every mutating command, and `events.md` documents `summary` as
+    /// carrying "command-specific final counts" rather than one fixed shape,
+    /// so `configs copy` gets its own `summary-configs-copy` payload family
+    /// alongside `summary-copy`, `summary-load-update`, and the rest instead
+    /// of a bespoke event name. On a dry run or no-op the counts describe the
+    /// full plan; on success they describe everything committed; on an error
+    /// they describe whatever was committed before the failure.
+    fn emit_configs_copy_summary(&mut self, progress: &SeedProgress, dry_run: bool) -> Result<()> {
+        self.reporter.event(
+            "summary",
+            Level::Info,
+            json!({
+                "action": "configs.copy",
+                "items": progress.finalized_items(),
+                "new": progress.copied,
+                "merged": progress.merged,
+                "skipped": progress.skipped,
+                "skipped_linked": progress.linked_skipped,
+                "dry_run": dry_run
+            }),
         )
     }
 
@@ -4689,6 +5141,1061 @@ fn copy_filter_clause(filters: &[String]) -> String {
         .join(", ")
 }
 
+/// One configuration directory or resolved target directory `configs copy`
+/// seeds from `<FROM>` into `<TO>`.
+struct SeedItem {
+    /// Stable machine identifier: `configuration`, or the target's own name.
+    id: String,
+    /// Human-facing row identity.
+    label: String,
+    /// Existing directory read from `<FROM>`.
+    source: PathBuf,
+    /// Directory merged into under `<TO>`.
+    destination: PathBuf,
+    /// Top-level child names skipped while walking `source`/`destination`;
+    /// only the `configuration` item ever excludes anything (its regenerable
+    /// cache/backup/lock subdirectories), never a target skill directory.
+    excluded: &'static [&'static str],
+    /// Whether `source` is a symlink or reparse point rather than a real
+    /// directory (findings G/K). Such a root is never descended or copied; it
+    /// is carried as an item only so the copy can report it as an EXPLICIT
+    /// link-skip instead of silently omitting a configured target.
+    source_is_link: bool,
+}
+
+/// One [`SeedItem`] reviewed against its destination before any write.
+struct SeedRow {
+    item: SeedItem,
+    /// Whether `item.destination` already existed before this invocation.
+    existed: bool,
+    /// How this item will be applied, decided from `existed` and whether the
+    /// filtered content already matches.
+    action: SeedAction,
+    /// Per-file changes this item's merge would apply, with destination-only
+    /// files already filtered out: nothing is ever deleted, so a file that
+    /// exists only at the destination is not part of the plan at all.
+    stat: DiffStat,
+}
+
+/// How one [`SeedRow`] is (or would be) applied.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SeedAction {
+    /// The destination did not exist; the whole tree is copied fresh.
+    Copied,
+    /// The destination existed and its content differs; it is merged.
+    Merged,
+    /// The destination existed and already matches; nothing is written.
+    Skipped,
+    /// The source root is a link/reparse point; deliberately not copied and
+    /// reported as an explicit link-skip (findings G/K). Distinct from
+    /// `Skipped`, which means "already identical" — a link-skip is NOT a no-op.
+    LinkSkipped,
+}
+
+/// Running tally of what `configs copy` has finalized, so the terminal
+/// `summary` is accurate on every exit path — including a mid-apply error,
+/// where only the items committed before the failure are counted.
+#[derive(Default)]
+struct SeedProgress {
+    /// Items newly copied (their destination did not exist).
+    copied: usize,
+    /// Items merged into an existing destination.
+    merged: usize,
+    /// Items left untouched because they already matched.
+    skipped: usize,
+    /// Configured items skipped because their source root is a link/reparse
+    /// point (findings G/K). Tracked separately from `skipped` so a link-skip
+    /// is never conflated with an "already identical" no-op.
+    linked_skipped: usize,
+}
+
+impl SeedProgress {
+    /// Total items finalized so far (committed writes plus recorded skips).
+    const fn finalized_items(&self) -> usize {
+        self.copied + self.merged + self.skipped + self.linked_skipped
+    }
+
+    /// Adopt a full plan's classification for a path that finalizes without a
+    /// per-item apply loop: a dry run (which commits nothing but reports what
+    /// it would do) or an all-identical no-op.
+    fn record_plan(&mut self, rows: &[SeedRow]) {
+        self.copied = rows
+            .iter()
+            .filter(|row| row.action == SeedAction::Copied)
+            .count();
+        self.merged = rows
+            .iter()
+            .filter(|row| row.action == SeedAction::Merged)
+            .count();
+        self.skipped = rows
+            .iter()
+            .filter(|row| row.action == SeedAction::Skipped)
+            .count();
+        self.linked_skipped = rows
+            .iter()
+            .filter(|row| row.action == SeedAction::LinkSkipped)
+            .count();
+    }
+}
+
+/// Build the ordered seed items for one `configs copy` invocation.
+///
+/// The configuration item is included only when its filtered content actually
+/// contains an entry (defect 8): an otherwise-empty `<FROM>/.skill-manager`
+/// must report "nothing to copy" rather than silently creating an empty
+/// destination directory. A resolved target is included only when its
+/// directory exists under `<FROM>` and — unless `--include-cache` is set — is
+/// not itself the manager's regenerable cache, backup, or lock storage
+/// (defect 7), so a target configured to point at `.skill-manager/cache` can
+/// never smuggle excluded content past the exclusion.
+fn build_seed_items(
+    config: &Config,
+    from: &Path,
+    to: &Path,
+    include_cache: bool,
+) -> Result<Vec<SeedItem>> {
+    let excluded: &'static [&'static str] = if include_cache {
+        &[]
+    } else {
+        &["cache", "backups", "locks"]
+    };
+    let reserved: Vec<PathBuf> = if include_cache {
+        Vec::new()
+    } else {
+        ["cache", "backups", "locks"]
+            .iter()
+            .map(|name| from.join(".skill-manager").join(name))
+            .collect()
+    };
+
+    let mut items = Vec::new();
+    let config_source_dir = from.join(".skill-manager");
+    match classify_source_root(&config_source_dir)? {
+        SourceRootKind::Directory => {
+            if !merge_directory_files(&config_source_dir, excluded)?.is_empty() {
+                items.push(SeedItem {
+                    id: "configuration".to_owned(),
+                    label: "configuration".to_owned(),
+                    source: config_source_dir,
+                    destination: to.join(".skill-manager"),
+                    excluded,
+                    source_is_link: false,
+                });
+            }
+        }
+        SourceRootKind::Link => {
+            // A linked `.skill-manager` root is never read or copied (findings
+            // J/G); carry it so the copy reports the skip visibly (finding K).
+            items.push(SeedItem {
+                id: "configuration".to_owned(),
+                label: "configuration".to_owned(),
+                source: config_source_dir,
+                destination: to.join(".skill-manager"),
+                excluded,
+                source_is_link: true,
+            });
+        }
+        SourceRootKind::Absent => {}
+    }
+    for scoped in resolved_targets_for_scope(config, from, from, Scope::Global).values() {
+        // Every resolved target must stay inside `<FROM>` (finding A). Source
+        // configs are normalized in `read_seed_config` and built-in/active-home
+        // templates are already safe, so this never fires for a well-formed
+        // config; it is a by-construction backstop that refuses — naming the
+        // offending target and its path — rather than ever reading outside
+        // `<FROM>` or, through the destination join, writing outside `<TO>`.
+        if !path_is_within(&scoped.target.path, from) {
+            return Err(SkillManagerError::InvalidInput(format!(
+                "target '{}' resolves outside the seed source: {}",
+                scoped.target.name,
+                scoped.target.path.display()
+            )));
+        }
+        match classify_source_root(&scoped.target.path)? {
+            SourceRootKind::Directory => {
+                if reserved
+                    .iter()
+                    .any(|reserved| path_is_within(&scoped.target.path, reserved))
+                {
+                    continue;
+                }
+                items.push(SeedItem {
+                    id: scoped.target.name.clone(),
+                    label: scoped.target.label.clone(),
+                    source: scoped.target.path.clone(),
+                    destination: to.join(&scoped.template),
+                    excluded: &[],
+                    source_is_link: false,
+                });
+            }
+            SourceRootKind::Link => {
+                // Never descend a linked target ROOT (finding G): `is_dir()`
+                // would follow it and `WalkDir` descends a linked root even
+                // with `follow_links(false)`, so it could smuggle outside
+                // content into `<TO>`. Carry it as an explicit link-skip so the
+                // configured target is not silently dropped (finding K).
+                items.push(SeedItem {
+                    id: scoped.target.name.clone(),
+                    label: scoped.target.label.clone(),
+                    source: scoped.target.path.clone(),
+                    destination: to.join(&scoped.template),
+                    excluded: &[],
+                    source_is_link: true,
+                });
+            }
+            SourceRootKind::Absent => {}
+        }
+    }
+    Ok(items)
+}
+
+/// Reject a destination that a merge into `<TO>` could not safely apply,
+/// before the plan is rendered or anything is written.
+///
+/// This mirrors the deployment transaction's own defense (see
+/// `transaction::recover_journal`, which refuses to act through a linked
+/// manager root): a symlink or reparse point anywhere under the destination —
+/// or at any of its ancestors within `<TO>` — could redirect a write outside
+/// `<TO>` and overwrite an unrelated file (defect 3), and a file where a
+/// directory must be created (or vice versa) would let the plan promise a
+/// seed it could then only partially apply (defect 4). Both are rejected here
+/// with an actionable error naming the offending path.
+fn preflight_seed_destination(to: &Path, item: &SeedItem) -> Result<()> {
+    reject_linked_ancestors(to, &item.destination)?;
+    reject_links_in_tree(&item.destination)?;
+    reject_seed_conflicts(item)?;
+    Ok(())
+}
+
+/// Reject any existing symlink/reparse point among `<TO>` itself and each
+/// intermediate directory between it and `destination`.
+fn reject_linked_ancestors(to: &Path, destination: &Path) -> Result<()> {
+    reject_link(to)?;
+    let Ok(relative) = destination.strip_prefix(to) else {
+        return Ok(());
+    };
+    let mut current = to.to_path_buf();
+    for component in relative.components() {
+        current = current.join(component);
+        if current == destination {
+            break;
+        }
+        reject_link(&current)?;
+    }
+    Ok(())
+}
+
+/// Reject any symlink/reparse point anywhere inside an existing destination
+/// tree, so a pre-planted link cannot survive to redirect a later write.
+fn reject_links_in_tree(root: &Path) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for item in walkdir::WalkDir::new(root)
+        .sort_by_file_name()
+        .follow_links(false)
+    {
+        let item = item.map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
+        reject_link(item.path())?;
+    }
+    Ok(())
+}
+
+/// Reject `path` when it exists and is a symlink or other reparse point.
+///
+/// On Windows a directory junction is a reparse point; whether a given Rust
+/// toolchain also flags it via `is_symlink()` varies by version, so it is
+/// detected via the reparse-point file attribute regardless. Otherwise a
+/// junction planted at a destination ancestor could redirect a write outside
+/// `<TO>` (finding C).
+fn reject_link(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || is_reparse_point(&metadata) => {
+            Err(SkillManagerError::InvalidInput(format!(
+                "seed destination path must not be a link: {}",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(SkillManagerError::io(path, error)),
+    }
+}
+
+/// Whether `metadata` describes a Windows reparse point (symlink, junction, or
+/// mount point). Always `false` off Windows, where `is_symlink()` already
+/// covers the link cases. On Windows this is a version-independent belt to the
+/// `is_symlink()` suspenders: it flags junctions even on toolchains whose
+/// `is_symlink()` does not.
+#[cfg(windows)]
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+const fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Whether `path` is a real directory that may be descended into as a copy
+/// source root — a genuine directory that is not itself a symlink or Windows
+/// reparse point (junction/mount point).
+///
+/// This matters because `Path::is_dir()` follows links, and `WalkDir` descends
+/// a linked ROOT even with `follow_links(false)`. Without this, a target root
+/// (or the `.skill-manager` root) that is a link pointing outside `<FROM>`
+/// would be walked, letting the copy read outside `<FROM>` and write its
+/// content into `<TO>` (finding G). The lexical within-`<FROM>` guard in
+/// [`build_seed_items`] does not catch it, because the link path is itself
+/// lexically inside `<FROM>`. A linked root is treated exactly like the
+/// symlinks that [`merge_directory_files`] already skips inside a tree: it is
+/// not a descendable directory, so the caller reports it as an explicit
+/// link-skip (documented in `docs/cli.md`, "A configured source ROOT that is a
+/// symlink or reparse point ... is never descended").
+fn is_descendable_dir(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            metadata.is_dir() && !metadata.file_type().is_symlink() && !is_reparse_point(&metadata)
+        }
+        Err(_) => false,
+    }
+}
+
+/// How a copy source ROOT under `<FROM>` presents on disk.
+enum SourceRootKind {
+    /// A genuine directory that may be descended and copied.
+    Directory,
+    /// A symlink or Windows reparse point (junction/mount point): never
+    /// descended (finding G), and surfaced as an explicit link-skip so the
+    /// omission is visible rather than silent (finding K).
+    Link,
+    /// Absent, or present as a plain file: not a copyable source directory.
+    Absent,
+}
+
+/// Classify a copy source root without ever following a link (findings G/K).
+fn classify_source_root(path: &Path) -> Result<SourceRootKind> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || is_reparse_point(&metadata) => {
+            Ok(SourceRootKind::Link)
+        }
+        Ok(metadata) if metadata.is_dir() => Ok(SourceRootKind::Directory),
+        Ok(_) => Ok(SourceRootKind::Absent),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SourceRootKind::Absent),
+        Err(error) => Err(SkillManagerError::io(path, error)),
+    }
+}
+
+/// Reject file/directory conflicts between an item's source tree and its
+/// destination in BOTH directions (defect 4, extended by finding B): the
+/// destination itself must be a directory or absent; every incoming path —
+/// whether a file or a directory — is checked against what already exists at
+/// the destination so that an incoming directory colliding with an existing
+/// file, and an incoming file colliding with an existing directory, are both
+/// caught here before the plan is rendered or a single byte is written. Any
+/// symlink met while walking the destination is rejected too.
+fn reject_seed_conflicts(item: &SeedItem) -> Result<()> {
+    if item.destination.exists() && !item.destination.is_dir() {
+        return Err(SkillManagerError::InvalidInput(format!(
+            "seed destination {} exists and is not a directory",
+            item.destination.display()
+        )));
+    }
+    for (relative, incoming_is_dir) in seed_source_entries(&item.source, item.excluded)? {
+        let parts: Vec<&str> = relative.split('/').collect();
+        let mut current = item.destination.clone();
+        for (index, part) in parts.iter().enumerate() {
+            current = current.join(part);
+            let is_last = index + 1 == parts.len();
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata)
+                    if metadata.file_type().is_symlink() || is_reparse_point(&metadata) =>
+                {
+                    return Err(SkillManagerError::InvalidInput(format!(
+                        "seed destination path must not be a link: {}",
+                        current.display()
+                    )));
+                }
+                Ok(metadata) if is_last && incoming_is_dir && !metadata.is_dir() => {
+                    return Err(SkillManagerError::InvalidInput(format!(
+                        "seed destination {} already exists as a file but the source is a directory",
+                        current.display()
+                    )));
+                }
+                Ok(metadata) if is_last && !incoming_is_dir && metadata.is_dir() => {
+                    return Err(SkillManagerError::InvalidInput(format!(
+                        "seed destination {} already exists as a directory but the source is a file",
+                        current.display()
+                    )));
+                }
+                Ok(metadata) if !is_last && !metadata.is_dir() => {
+                    return Err(SkillManagerError::InvalidInput(format!(
+                        "seed destination {} exists and is not a directory",
+                        current.display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(SkillManagerError::io(&current, error)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Map slash-separated relative paths to every regular file and directory of
+/// one tree (`true` marks a directory), pruning excluded top-level child names
+/// before walking into them, and skipping symlinks/special entries the same
+/// way [`merge_directory_files`] does. Directories are enumerated so that
+/// preflight sees an incoming empty directory that would collide with an
+/// existing destination file (finding B) rather than discovering it only when
+/// apply fails at `create_dir_all` after already writing other items.
+fn seed_source_entries(root: &Path, excluded_top_level: &[&str]) -> Result<BTreeMap<String, bool>> {
+    let mut entries = BTreeMap::new();
+    if !root.is_dir() {
+        return Ok(entries);
+    }
+    let excluded = excluded_top_level
+        .iter()
+        .map(|name| fold(name))
+        .collect::<BTreeSet<_>>();
+    let walker = walkdir::WalkDir::new(root)
+        .sort_by_file_name()
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() != 1 {
+                return true;
+            }
+            !excluded.contains(&fold(&entry.file_name().to_string_lossy()))
+        });
+    for item in walker {
+        let item = item.map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
+        let metadata = std::fs::symlink_metadata(item.path())
+            .map_err(|error| SkillManagerError::io(item.path(), error))?;
+        if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+            continue;
+        }
+        let relative = item.path().strip_prefix(root).map_err(|error| {
+            SkillManagerError::InvalidInput(format!("invalid seed path: {error}"))
+        })?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let relative = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        entries.insert(relative, metadata.is_dir());
+    }
+    Ok(entries)
+}
+
+/// Which configuration decided `configs copy`'s resolved target directories.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SeedTargetSource {
+    /// `<FROM>` has its own readable schema-v2 `.skill-manager/config.json`.
+    FromConfig,
+    /// `<FROM>` has no readable configuration; the active `--home`
+    /// configuration decided targets.
+    ActiveHome,
+    /// Neither had a persisted configuration; built-in defaults decided targets.
+    Defaults,
+}
+
+impl SeedTargetSource {
+    /// Human-facing description for the plan's metadata line.
+    fn label(self, home: &Path) -> String {
+        match self {
+            Self::FromConfig => "the source's own configuration".to_owned(),
+            Self::ActiveHome => format!("the active configuration at {}", home.display()),
+            Self::Defaults => "built-in defaults (no configuration found)".to_owned(),
+        }
+    }
+
+    /// Stable machine-facing token for the `plan` event.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FromConfig => "from-config",
+            Self::ActiveHome => "active-config",
+            Self::Defaults => "defaults",
+        }
+    }
+}
+
+/// Read a manager configuration directly from disk, never through
+/// [`FileConfigRepository`], which would migrate, back up, and lock a home
+/// that may be the caller's real one even under a dry run.
+///
+/// A missing `.skill-manager/config.json` returns `Ok(None)` so the caller
+/// can fall through to the next precedence tier. A file that is present but
+/// unreadable, not valid JSON, or not the current schema is an error naming
+/// that file rather than a silent fall-through: for `<FROM>` that surfaces a
+/// custom configuration the caller clearly intended to seed from, instead of
+/// quietly copying the bytes while resolving targets from somewhere else
+/// (defect 9). Layout is never migrated, so `<FROM>` is never mutated.
+///
+/// The configuration root and `config.json` are checked for links first
+/// (finding J): a linked `.skill-manager` or `config.json` is treated as "no
+/// usable configuration" and never read through, so an outside configuration
+/// can never steer the copy.
+fn read_seed_config(home: &Path) -> Result<Option<Config>> {
+    // Gate the configuration ROOT before any read (finding J): if
+    // `<home>/.skill-manager` is a symlink or reparse point, or `config.json`
+    // is itself a link, an outside configuration could otherwise be read and
+    // steer which target directories the copy pulls in. A link here is treated
+    // as "no usable configuration", falling through to the next precedence tier
+    // exactly as an absent config does, and is never read through.
+    let config_root = home.join(".skill-manager");
+    if !is_descendable_dir(&config_root) {
+        return Ok(None);
+    }
+    let path = config_root.join("config.json");
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || is_reparse_point(&metadata) => {
+            return Ok(None);
+        }
+        Ok(metadata) if !metadata.is_file() => return Ok(None),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(SkillManagerError::io(&path, error)),
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(SkillManagerError::io(&path, error)),
+    };
+    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        SkillManagerError::InvalidInput(format!(
+            "source configuration {} is not valid JSON: {error}",
+            path.display()
+        ))
+    })?;
+    let schema = value.get("schema_version").and_then(Value::as_u64);
+    if schema != Some(u64::from(CONFIG_SCHEMA_VERSION)) {
+        return Err(SkillManagerError::InvalidInput(format!(
+            "source configuration {} has unsupported schema_version {}; expected {CONFIG_SCHEMA_VERSION}",
+            path.display(),
+            schema.map_or_else(|| "none".to_owned(), |value| value.to_string())
+        )));
+    }
+    let mut config = serde_json::from_value::<Config>(value).map_err(|error| {
+        SkillManagerError::InvalidInput(format!(
+            "source configuration {} could not be parsed: {error}",
+            path.display()
+        ))
+    })?;
+    // Normalize target templates the same way the repository does on load, but
+    // without ever writing back (finding A): a source config whose target path
+    // contains `..` or is absolute could otherwise resolve a read outside
+    // `<FROM>` and, via the destination join, a write outside `<TO>`, and an
+    // un-normalized spelling like `.skill-manager/x/../cache` would slip past
+    // the reserved cache/backup/lock exclusion. Rejecting the config here makes
+    // both impossible by construction; the error names the offending source.
+    normalize_config_targets(&mut config).map_err(|error| {
+        SkillManagerError::InvalidInput(format!(
+            "source configuration {} has an invalid target path: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(config))
+}
+
+/// Whether `path` is `root` itself or lies anywhere beneath it.
+///
+/// Path components are compared case-insensitively on Windows, matching
+/// [`paths_equal`]'s handling of case-insensitive filesystem spellings, since
+/// a lexical `==`/`starts_with` would treat two spellings of the same
+/// directory as unrelated.
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    let mut path_components = path.components();
+    for root_component in root.components() {
+        match path_components.next() {
+            Some(component) if components_match(component, root_component) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Reject only a genuine recursion or self-overwrite hazard between the copied
+/// source roots and `<TO>` (finding N), replacing the old blanket "`<TO>` must
+/// not be nested under `<FROM>`" test that rejected the feature's headline
+/// `configs copy ~ ./temp/...` use case whenever the destination happened to
+/// live under the home.
+///
+/// Because the copy touches only `<FROM>/.skill-manager` and each resolved
+/// target root — not the whole of `<FROM>` — the only real hazards are:
+///
+/// - `<TO>` is the same directory as `<FROM>` (a self-copy);
+/// - `<TO>` lies inside a source root that will actually be copied (walking the
+///   root would descend into the destination being written);
+/// - a source root that will actually be copied lies inside `<TO>` (writing
+///   `<TO>` could overwrite the source mid-read).
+///
+/// Link-skipped roots are never read or written, so they carry no hazard and
+/// are excluded. Comparisons are lexical on component boundaries (so `C:\a\bc`
+/// is not treated as nested inside `C:\a\b`) and case-insensitive on Windows,
+/// via [`path_is_within`]; the identical-directory case uses [`paths_equal`] so
+/// equivalent symlinked spellings still compare equal. The error names the
+/// specific colliding source root rather than just reporting "nested".
+fn reject_seed_recursion(from: &Path, to: &Path, items: &[SeedItem]) -> Result<()> {
+    if paths_equal(from, to) {
+        return Err(SkillManagerError::InvalidInput(format!(
+            "seed source {} and seed destination {} are the same directory",
+            from.display(),
+            to.display()
+        )));
+    }
+    for item in items {
+        if item.source_is_link {
+            continue;
+        }
+        if path_is_within(to, &item.source) {
+            return Err(SkillManagerError::InvalidInput(format!(
+                "seed destination {} is inside the copied source directory {} ({}), which would recurse into the destination as it is written",
+                to.display(),
+                item.label,
+                item.source.display()
+            )));
+        }
+        if path_is_within(&item.source, to) {
+            return Err(SkillManagerError::InvalidInput(format!(
+                "copied source directory {} ({}) is inside seed destination {}, which would overwrite the source as it is read",
+                item.source.display(),
+                item.label,
+                to.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn components_match(left: std::path::Component<'_>, right: std::path::Component<'_>) -> bool {
+    #[cfg(windows)]
+    {
+        left.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+/// Map slash-separated relative paths to the regular files of one tree,
+/// pruning excluded top-level child names before ever walking into them.
+///
+/// Unlike [`crate::skills::directory_files`], a symlink or other special
+/// entry is skipped rather than treated as an error: a real manager home or
+/// target directory is not a skill tree subject to that portability
+/// contract, and this best-effort seeding convenience should not fail on
+/// content it merely will not copy.
+fn merge_directory_files(
+    root: &Path,
+    excluded_top_level: &'static [&'static str],
+) -> Result<BTreeMap<String, PathBuf>> {
+    let mut files = BTreeMap::new();
+    if !root.is_dir() {
+        return Ok(files);
+    }
+    let excluded = excluded_top_level
+        .iter()
+        .map(|name| fold(name))
+        .collect::<BTreeSet<_>>();
+    let walker = walkdir::WalkDir::new(root)
+        .sort_by_file_name()
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() != 1 {
+                return true;
+            }
+            !excluded.contains(&fold(&entry.file_name().to_string_lossy()))
+        });
+    for item in walker {
+        let item = item.map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
+        let metadata = std::fs::symlink_metadata(item.path())
+            .map_err(|error| SkillManagerError::io(item.path(), error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        let relative = item.path().strip_prefix(root).map_err(|error| {
+            SkillManagerError::InvalidInput(format!("invalid seed path: {error}"))
+        })?;
+        let relative = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        files.insert(relative, item.path().to_path_buf());
+    }
+    Ok(files)
+}
+
+/// Merge-copy `source` into `destination`: create directories, overwrite
+/// files by path, and never remove anything already present only at the
+/// destination. Excluded top-level child names are pruned the same way
+/// [`merge_directory_files`] prunes them from the plan.
+fn merge_copy_tree(source: &Path, destination: &Path, excluded_top_level: &[&str]) -> Result<()> {
+    // Reject a source ROOT that is a link or reparse point (finding G): this is
+    // the apply-time counterpart to the preflight `is_descendable_dir` skip, so
+    // a root swapped for a link between preflight and this write cannot make the
+    // copy descend outside `<FROM>`. Preflight would have skipped a linked root,
+    // so reaching one here means it was planted mid-flight — an error, matching
+    // the apply-time destination-link recheck.
+    match std::fs::symlink_metadata(source) {
+        Ok(metadata) if metadata.file_type().is_symlink() || is_reparse_point(&metadata) => {
+            return Err(SkillManagerError::InvalidInput(format!(
+                "seed source path must not be a link: {}",
+                source.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(SkillManagerError::io(source, error)),
+    }
+    if !source.is_dir() {
+        return Ok(());
+    }
+    let excluded = excluded_top_level
+        .iter()
+        .map(|name| fold(name))
+        .collect::<BTreeSet<_>>();
+    let walker = walkdir::WalkDir::new(source)
+        .sort_by_file_name()
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() != 1 {
+                return true;
+            }
+            !excluded.contains(&fold(&entry.file_name().to_string_lossy()))
+        });
+    for item in walker {
+        let item = item.map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
+        let metadata = std::fs::symlink_metadata(item.path())
+            .map_err(|error| SkillManagerError::io(item.path(), error))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let relative = item.path().strip_prefix(source).map_err(|error| {
+            SkillManagerError::InvalidInput(format!("invalid seed path: {error}"))
+        })?;
+        let target = destination.join(relative);
+        if metadata.is_dir() {
+            reject_link(&target)?;
+            std::fs::create_dir_all(&target)
+                .map_err(|error| SkillManagerError::io(&target, error))?;
+        } else if metadata.is_file() {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| SkillManagerError::io(parent, error))?;
+            }
+            // Traversal-safe write (defect 3): never follow a destination
+            // symlink/reparse point into an outside file. Preflight already
+            // rejected pre-planted links, so this is defense in depth against
+            // any that appeared since, matching how deployment writes to fresh
+            // inodes rather than through a link.
+            reject_link(&target)?;
+            std::fs::copy(item.path(), &target)
+                .map_err(|error| SkillManagerError::io(&target, error))?;
+        }
+    }
+    Ok(())
+}
+
+/// Build the `configs copy` `plan` event payload.
+///
+/// This intentionally does not reuse [`plan_event_data`]: that shared shape
+/// hardcodes an `entries[].skill` row key and a `summary.skills` count for
+/// the five skill-oriented commands built on [`ChangePlan`]. This plan's rows
+/// are directories, not skills, so it uses its own `items`/`summary.items`
+/// vocabulary, documented separately in `docs/json.md`.
+fn configs_copy_plan_data(
+    from: &Path,
+    to: &Path,
+    target_source: SeedTargetSource,
+    include_cache: bool,
+    rows: &[SeedRow],
+    revision: u64,
+    dry_run: bool,
+    authorization: PlanAuthorization,
+) -> Value {
+    let mut authorization_value = Map::new();
+    authorization_value.insert("kind".into(), json!(authorization.kind));
+    authorization_value.insert("mode".into(), json!(authorization.mode));
+    if let Some(default) = authorization.default {
+        authorization_value.insert("default".into(), json!(default));
+    }
+
+    let items = rows
+        .iter()
+        .map(|row| {
+            let mut value = Map::new();
+            value.insert("item".into(), json!(row.item.id));
+            value.insert("path".into(), json!(row.item.destination));
+            value.insert("existed".into(), json!(row.existed));
+            if !row.stat.is_empty() {
+                let mut diff = Map::new();
+                diff.insert("files_changed".into(), json!(row.stat.files_changed()));
+                if row.stat.insertions() > 0 {
+                    diff.insert("insertions".into(), json!(row.stat.insertions()));
+                }
+                if row.stat.deletions() > 0 {
+                    diff.insert("deletions".into(), json!(row.stat.deletions()));
+                }
+                value.insert("diff".into(), Value::Object(diff));
+            }
+            Value::Object(value)
+        })
+        .collect::<Vec<_>>();
+
+    let new_count = rows
+        .iter()
+        .filter(|row| row.action == SeedAction::Copied)
+        .count();
+    let overwrite_count = rows
+        .iter()
+        .filter(|row| row.action == SeedAction::Merged)
+        .count();
+    let skipped_count = rows
+        .iter()
+        .filter(|row| row.action == SeedAction::Skipped)
+        .count();
+    let skipped_linked_count = rows
+        .iter()
+        .filter(|row| row.action == SeedAction::LinkSkipped)
+        .count();
+    let mut totals = Map::new();
+    totals.insert("items".into(), json!(rows.len()));
+    if new_count > 0 {
+        totals.insert("new".into(), json!(new_count));
+    }
+    if overwrite_count > 0 {
+        totals.insert("overwrite".into(), json!(overwrite_count));
+    }
+    if skipped_count > 0 {
+        totals.insert("skipped".into(), json!(skipped_count));
+    }
+    if skipped_linked_count > 0 {
+        totals.insert("skipped_linked".into(), json!(skipped_linked_count));
+    }
+
+    let mut data = Map::new();
+    data.insert(
+        "plan_id".into(),
+        json!(format!("configs.copy:{}->{}", from.display(), to.display())),
+    );
+    data.insert("revision".into(), json!(revision));
+    data.insert("command".into(), json!("configs.copy"));
+    data.insert("dry_run".into(), json!(dry_run));
+    data.insert("authorization".into(), Value::Object(authorization_value));
+    data.insert("from".into(), json!(from));
+    data.insert("to".into(), json!(to));
+    data.insert("target_source".into(), json!(target_source.as_str()));
+    if include_cache {
+        data.insert("include_cache".into(), json!(true));
+    }
+    data.insert("items".into(), json!(items));
+    data.insert("totals".into(), Value::Object(totals));
+    Value::Object(data)
+}
+
+/// Render the `configs copy` plan: a `Configs copy plan` heading, `From`/`To`
+/// metadata plus a `Target discovery` line naming which configuration
+/// decided the resolved directories, then either the degenerate sentence (one
+/// item) or a table (two or more items) of every directory that would be
+/// merged — matching the degenerate-rendering rule in `docs/ux-guidelines.md`
+/// exactly (a table needs at least two rows; a single-destination command
+/// otherwise reduces to a sentence).
+fn render_configs_copy_plan(
+    from: &Path,
+    to: &Path,
+    target_source_label: &str,
+    include_cache: bool,
+    rows: &[SeedRow],
+    style: RenderStyle,
+) -> Vec<String> {
+    let mut lines = vec![heading("Configs copy plan", style.color)];
+    lines.push(String::new());
+    let mut metadata = vec![
+        ("From".to_owned(), from.display().to_string()),
+        ("To".to_owned(), to.display().to_string()),
+        (
+            "Target discovery".to_owned(),
+            target_source_label.to_owned(),
+        ),
+    ];
+    if include_cache {
+        metadata.push((
+            "Cache/backups".to_owned(),
+            "included (--include-cache)".to_owned(),
+        ));
+    }
+    let label_width = metadata
+        .iter()
+        .map(|(label, _)| display_width(label))
+        .max()
+        .unwrap_or(0);
+    for (label, value) in &metadata {
+        lines.push(join_columns(&[padded(label, label_width), value.clone()]));
+    }
+    lines.push(String::new());
+
+    if let [row] = rows {
+        lines.push(seed_row_sentence(row, style));
+    } else {
+        lines.extend(seed_row_table(rows, style));
+    }
+    lines
+}
+
+fn seed_row_action(row: &SeedRow) -> PlanAction {
+    match row.action {
+        SeedAction::Copied => PlanAction::Copy,
+        SeedAction::Merged => PlanAction::Update,
+        SeedAction::Skipped | SeedAction::LinkSkipped => PlanAction::Skip,
+    }
+}
+
+fn seed_row_change(row: &SeedRow) -> String {
+    match row.action {
+        SeedAction::Copied => creation_line("copy", &row.stat),
+        SeedAction::Merged => totals_line(&row.stat),
+        SeedAction::Skipped => "already identical".to_owned(),
+        SeedAction::LinkSkipped => "linked source, not copied".to_owned(),
+    }
+}
+
+fn seed_row_sentence(row: &SeedRow, style: RenderStyle) -> String {
+    let action = seed_row_action(row);
+    let marker = colored(
+        action_text(action, style.symbols),
+        action.color_code(),
+        style.color,
+    );
+    format!("{marker} {}: {}", row.item.label, seed_row_change(row))
+}
+
+fn seed_row_table(rows: &[SeedRow], style: RenderStyle) -> Vec<String> {
+    let headers = ["item", "change", "action"];
+    let table_rows = rows
+        .iter()
+        .map(|row| {
+            let action = seed_row_action(row);
+            let plain_action = action_text(action, style.symbols).to_owned();
+            let styled_action = colored(&plain_action, action.color_code(), style.color);
+            let change = seed_row_change(row);
+            (
+                vec![row.item.label.clone(), change.clone(), plain_action],
+                vec![row.item.label.clone(), change, styled_action],
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut widths = headers
+        .iter()
+        .map(|header| display_width(header))
+        .collect::<Vec<_>>();
+    for (measured, _) in &table_rows {
+        for (index, cell) in measured.iter().enumerate() {
+            widths[index] = widths[index].max(display_width(cell));
+        }
+    }
+    let header = headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| padded(header, widths[index]))
+        .collect::<Vec<_>>();
+    let mut lines = vec![join_columns(&header), separator(&widths)];
+    for (measured, rendered) in &table_rows {
+        let columns = measured
+            .iter()
+            .zip(rendered)
+            .enumerate()
+            .map(|(index, (raw, styled))| {
+                let padding = " ".repeat(widths[index].saturating_sub(display_width(raw)));
+                format!("{styled}{padding}")
+            })
+            .collect::<Vec<_>>();
+        lines.push(join_columns(&columns));
+    }
+    lines
+}
+
+/// The `configs copy` plan footer: total actionable items merged into the one
+/// destination, then nonzero-only new, overwrite, and already-identical
+/// clauses — the same grammar `load`'s own footer uses (see
+/// [`load_plan_footer`]), so an all-identical no-op reads as `✓ N already
+/// identical` rather than a bare, empty "changes" line.
+fn configs_copy_plan_footer(rows: &[SeedRow], style: RenderStyle) -> String {
+    let new_count = rows
+        .iter()
+        .filter(|row| row.action == SeedAction::Copied)
+        .count();
+    let overwrite_count = rows
+        .iter()
+        .filter(|row| row.action == SeedAction::Merged)
+        .count();
+    let skipped_count = rows
+        .iter()
+        .filter(|row| row.action == SeedAction::Skipped)
+        .count();
+    let linked_skipped_count = rows
+        .iter()
+        .filter(|row| row.action == SeedAction::LinkSkipped)
+        .count();
+    let clause = |symbol: &str, count: usize, noun: &str, code: Option<u8>| {
+        let text = if style.symbols {
+            format!("{symbol} {count} {noun}")
+        } else {
+            format!("{count} {noun}")
+        };
+        colored(&text, code, style.color)
+    };
+    let mut clauses = Vec::new();
+    if new_count > 0 {
+        clauses.push(clause("+", new_count, "new", PlanAction::Copy.color_code()));
+    }
+    if overwrite_count > 0 {
+        clauses.push(clause(
+            "↑",
+            overwrite_count,
+            "overwrite",
+            PlanAction::Update.color_code(),
+        ));
+    }
+    if skipped_count > 0 {
+        clauses.push(clause(
+            "✓",
+            skipped_count,
+            "already identical",
+            PlanAction::Skip.color_code(),
+        ));
+    }
+    if linked_skipped_count > 0 {
+        // Distinct reason from "already identical": a link-skip is a
+        // deliberately-not-acted-on omission, rendered with the neutral "—"
+        // marker rather than the "✓" a genuine no-op uses.
+        clauses.push(clause(
+            "—",
+            linked_skipped_count,
+            "skipped (linked source)",
+            None,
+        ));
+    }
+    format!(
+        "{} to 1 destination: {}",
+        counted_noun(new_count + overwrite_count, "change"),
+        clauses.join(", ")
+    )
+}
+
 fn review_location(scope: Scope) -> Option<SkillLocation> {
     location_of(&BTreeSet::from([scope]))
 }
@@ -6349,8 +7856,8 @@ mod tests {
 
     use super::{
         Application, RunOutcome, absolute_path, command_dry_run, find_named_key,
-        normalized_patterns, set_target_enabled, skill_action_data, source_data, source_matches,
-        status_matches, target_data, title_case,
+        normalized_patterns, path_is_within, set_target_enabled, skill_action_data, source_data,
+        source_matches, status_matches, target_data, title_case,
     };
     use crate::cache::GitHubTransport;
     use crate::cli::{
@@ -6367,6 +7874,75 @@ mod tests {
     use crate::event::{Level, Reporter};
     use crate::prompt::Prompt;
     use crate::transaction::NoopTransactionHook;
+
+    /// The recursion/self-overwrite guard compares on path COMPONENT
+    /// boundaries (finding N), so a sibling whose name merely shares a prefix —
+    /// `.../a/bc` versus `.../a/b` — must NOT be treated as nested, while a
+    /// genuine descendant must. On Windows the comparison is case-insensitive.
+    #[test]
+    fn path_is_within_matches_on_component_boundaries_not_string_prefixes() {
+        use std::path::Path;
+
+        // Genuine nesting: a directory and its descendant, and reflexive self.
+        assert!(path_is_within(Path::new("/a/b/c"), Path::new("/a/b")));
+        assert!(path_is_within(Path::new("/a/b"), Path::new("/a/b")));
+
+        // Prefix-but-not-nested: `bc` is not inside `b`.
+        assert!(!path_is_within(Path::new("/a/bc"), Path::new("/a/b")));
+        assert!(!path_is_within(Path::new("/a/b"), Path::new("/a/bc")));
+
+        #[cfg(windows)]
+        {
+            assert!(path_is_within(
+                Path::new(r"C:\Users\me\repo"),
+                Path::new(r"c:\users\ME")
+            ));
+            assert!(!path_is_within(Path::new(r"C:\a\bc"), Path::new(r"C:\a\b")));
+        }
+    }
+
+    /// Directly exercises the Windows reparse-point predicate the junction
+    /// integration tests cannot reach (a junction reports `is_symlink() ==
+    /// true` on the current toolchain, so the `is_symlink() || is_reparse_point`
+    /// guard short-circuits before the fallback). A real `mklink /J` junction
+    /// must set the reparse-point attribute so `is_reparse_point` returns
+    /// `true`, and a plain directory must not. Junction creation needs no
+    /// privilege, so this is deterministic on Windows CI.
+    #[cfg(windows)]
+    #[test]
+    fn is_reparse_point_flags_a_real_junction_but_not_a_plain_directory() {
+        let scratch = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let target = scratch.path().join("target");
+        std::fs::create_dir_all(&target).unwrap_or_else(|error| unreachable!("{error}"));
+        let plain = scratch.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap_or_else(|error| unreachable!("{error}"));
+
+        let plain_metadata =
+            std::fs::symlink_metadata(&plain).unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(
+            !super::is_reparse_point(&plain_metadata),
+            "a plain directory is not a reparse point"
+        );
+
+        let link = scratch.path().join("junction");
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(
+            output.status.success(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let junction_metadata =
+            std::fs::symlink_metadata(&link).unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(
+            super::is_reparse_point(&junction_metadata),
+            "a real junction must be flagged as a reparse point"
+        );
+    }
 
     struct NoNetwork;
 

@@ -7,11 +7,11 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::{Map, Value};
 
 use crate::cli::{
-    Cli, Command, ConfigsAction, ConfigsArgs, ConfigsConfirmArgs, ConfigsRestoreArgs, CopyArgs,
-    ImportArgs, LoadArgs, RemoveArgs, ResolveArgs, ScopeSelection, SourceAction, SourceAddArgs,
-    SourceAlternateArgs, SourceArgs, SourceLocateArgs, SourceModeArg, SourceRemoveArgs,
-    SourceSelection, SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction,
-    TargetArgs, TargetNameArgs, TargetPathArgs, TargetSelection, UpdateArgs,
+    Cli, Command, ConfigsAction, ConfigsArgs, ConfigsConfirmArgs, ConfigsCopyArgs,
+    ConfigsRestoreArgs, CopyArgs, ImportArgs, LoadArgs, RemoveArgs, ResolveArgs, ScopeSelection,
+    SourceAction, SourceAddArgs, SourceAlternateArgs, SourceArgs, SourceLocateArgs, SourceModeArg,
+    SourceRemoveArgs, SourceSelection, SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs,
+    TargetAction, TargetArgs, TargetNameArgs, TargetPathArgs, TargetSelection, UpdateArgs,
 };
 use crate::error::{Result, SkillManagerError};
 use crate::skills::is_fnmatch_operand;
@@ -102,7 +102,7 @@ fn overlay_command(command: &mut Command, object: &Map<String, Value>, base: &Pa
         Command::Resolve(args) => overlay_resolve(args, object),
         Command::Source(args) => overlay_source(&mut args.action, object, base),
         Command::Target(args) => overlay_target(&mut args.action, object, base),
-        Command::Configs(args) => overlay_configs(args, object),
+        Command::Configs(args) => overlay_configs(args, object, base),
         Command::GenerateCompletions(_) | Command::GenerateMan(_) => Err(
             SkillManagerError::InvalidInput("generation commands do not accept recipes".into()),
         ),
@@ -544,7 +544,7 @@ fn overlay_target(
     }
 }
 
-fn overlay_configs(args: &mut ConfigsArgs, object: &Map<String, Value>) -> Result<()> {
+fn overlay_configs(args: &mut ConfigsArgs, object: &Map<String, Value>, base: &Path) -> Result<()> {
     match args.action.as_mut() {
         None => reject_unknown(object, &["command", "no_input"]),
         Some(ConfigsAction::Reset(confirm)) => {
@@ -562,7 +562,62 @@ fn overlay_configs(args: &mut ConfigsArgs, object: &Map<String, Value>) -> Resul
             }
             overlay_bool(&mut restore.yes, object.get("yes"))
         }
+        Some(ConfigsAction::Copy(copy)) => overlay_configs_copy(copy, object, base),
     }
+}
+
+fn overlay_configs_copy(
+    args: &mut ConfigsCopyArgs,
+    object: &Map<String, Value>,
+    base: &Path,
+) -> Result<()> {
+    reject_unknown(
+        object,
+        &[
+            "command",
+            "no_input",
+            "from",
+            "to",
+            "include_cache",
+            "dry_run",
+            "yes",
+        ],
+    )?;
+    overlay_bool(&mut args.include_cache, object.get("include_cache"))?;
+    overlay_bool(&mut args.dry_run, object.get("dry_run"))?;
+    overlay_bool(&mut args.yes, object.get("yes"))?;
+    // Validate the recipe's `from`/`to` types strictly BEFORE argv precedence
+    // decides whether to adopt them (defect 5): a malformed recipe value such
+    // as `"from": false` must fail the whole invocation even when a valid
+    // argv operand would otherwise satisfy the field and mask the error.
+    let from = first_string(object, &["from"])?;
+    let to = first_string(object, &["to"])?;
+    if args.from.is_empty()
+        && let Some(from) = from
+    {
+        args.from = rebase_seed_path(&from, base);
+    }
+    if args.to.is_empty()
+        && let Some(to) = to
+    {
+        args.to = rebase_seed_path(&to, base);
+    }
+    Ok(())
+}
+
+/// Rebase a `configs copy` `from`/`to` recipe field the same way `--input
+/// FILE` rebases other path-bearing recipe fields such as `copy.destination`:
+/// a genuinely relative filesystem path is resolved against the recipe
+/// file's directory. An absolute path or a `~`-prefixed reference is passed
+/// through unchanged, exactly like [`rebase_reference`] treats a leading
+/// `~`, so [`crate::config::expand_home`] can still expand it against the
+/// active `--home` later, the same as an equivalent CLI argument would.
+fn rebase_seed_path(raw: &str, base: &Path) -> String {
+    let path = Path::new(raw);
+    if path.is_absolute() || raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
+        return raw.to_owned();
+    }
+    resolve_path(path, base).to_string_lossy().into_owned()
 }
 
 fn overlay_source_selection(
@@ -618,24 +673,39 @@ fn overlay_scope_selection(
     Ok(())
 }
 
+/// Overlay one boolean recipe field onto a flag argv may already have set.
+///
+/// The recipe value is validated strictly whenever it is present, even when
+/// `destination` is already `true` from argv, so a malformed value such as
+/// `"yes": "sure"` fails the invocation instead of being silently ignored
+/// because argv happened to satisfy the same flag (defect 5).
 fn overlay_bool(destination: &mut bool, value: Option<&Value>) -> Result<()> {
-    if !*destination && let Some(raw) = value {
-        *destination = strict_bool(raw)?;
+    if let Some(raw) = value {
+        let parsed = strict_bool(raw)?;
+        if !*destination {
+            *destination = parsed;
+        }
     }
     Ok(())
 }
 
+/// Overlay one repeatable string recipe field onto a list argv may already
+/// have populated.
+///
+/// The first present key is validated strictly whether or not `destination`
+/// is already populated, so a malformed recipe value fails regardless of what
+/// argv supplied (defect 5), and only adopted when argv left the list empty.
 fn overlay_strings(
     destination: &mut Vec<String>,
     object: &Map<String, Value>,
     keys: &[&str],
 ) -> Result<()> {
-    if !destination.is_empty() {
-        return Ok(());
-    }
     for key in keys {
         if let Some(value) = object.get(*key) {
-            *destination = strict_strings(value)?;
+            let parsed = strict_strings(value)?;
+            if destination.is_empty() {
+                *destination = parsed;
+            }
             break;
         }
     }
@@ -648,12 +718,9 @@ fn overlay_references(
     keys: &[&str],
     base: &Path,
 ) -> Result<()> {
-    if !destination.is_empty() {
-        return Ok(());
-    }
     for key in keys {
         if let Some(value) = object.get(*key) {
-            *destination = strict_strings(value)?
+            let parsed = strict_strings(value)?
                 .into_iter()
                 .map(|reference| {
                     if is_fnmatch_operand(&reference) {
@@ -663,6 +730,9 @@ fn overlay_references(
                     }
                 })
                 .collect();
+            if destination.is_empty() {
+                *destination = parsed;
+            }
             break;
         }
     }
@@ -752,6 +822,7 @@ fn command_name(command: &Command) -> &'static str {
             None => "configs",
             Some(ConfigsAction::Reset(_)) => "configs.reset",
             Some(ConfigsAction::Restore(_)) => "configs.restore",
+            Some(ConfigsAction::Copy(_)) => "configs.copy",
         },
         Command::GenerateCompletions(_) => "generate-completions",
         Command::GenerateMan(_) => "generate-man",
@@ -783,6 +854,7 @@ fn canonical_command(value: &str) -> Result<&'static str> {
         "configs" => Ok("configs"),
         "configs.reset" => Ok("configs.reset"),
         "configs.restore" => Ok("configs.restore"),
+        "configs.copy" => Ok("configs.copy"),
         _ => Err(SkillManagerError::InvalidInput(format!(
             "unknown recipe command: {value}"
         ))),
@@ -830,8 +902,8 @@ fn default_command(name: &str) -> Result<Command> {
             action: TargetAction::List,
         })),
         // Commands with required positional fields must be expressed on argv.
-        "copy" | "source.update" | "source.locate" | "source.alternate" | "source.swap"
-        | "target.add" | "target.enable" | "target.disable" | "target.remove"
+        "copy" | "configs.copy" | "source.update" | "source.locate" | "source.alternate"
+        | "source.swap" | "target.add" | "target.enable" | "target.disable" | "target.remove"
         | "target.set-path" => build_required_command(name),
         _ => Err(SkillManagerError::InvalidInput(format!(
             "cannot create recipe command: {name}"
@@ -844,6 +916,14 @@ fn validate_required(command: &Command) -> Result<()> {
         Command::Import(args) if args.skill.is_empty() => Some("import.skill"),
         Command::Copy(args) if args.source.is_empty() => Some("copy.source"),
         Command::Copy(args) if args.destination.as_os_str().is_empty() => Some("copy.destination"),
+        Command::Configs(ConfigsArgs {
+            action: Some(ConfigsAction::Copy(args)),
+            ..
+        }) if args.from.is_empty() => Some("configs.copy.from"),
+        Command::Configs(ConfigsArgs {
+            action: Some(ConfigsAction::Copy(args)),
+            ..
+        }) if args.to.is_empty() => Some("configs.copy.to"),
         Command::Source(SourceArgs {
             action: SourceAction::Update(args),
         }) if args.source.is_empty() => Some("source.update.source"),
@@ -897,6 +977,16 @@ fn build_required_command(name: &str) -> Result<Command> {
             dry_run: false,
             refresh: false,
             yes: false,
+        })),
+        "configs.copy" => Ok(Command::Configs(ConfigsArgs {
+            raw: false,
+            action: Some(ConfigsAction::Copy(ConfigsCopyArgs {
+                from: String::new(),
+                to: String::new(),
+                include_cache: false,
+                dry_run: false,
+                yes: false,
+            })),
         })),
         "source.update" => Ok(Command::Source(SourceArgs {
             action: SourceAction::Update(SourceUpdateArgs {
@@ -1428,6 +1518,70 @@ mod tests {
         ])
         .unwrap_or_else(|error| unreachable!("{error}"));
         assert!(apply_recipe(&mut recipe_conflict).is_err());
+    }
+
+    #[test]
+    fn configs_copy_recipe_rebases_relative_paths_and_preserves_home_expansion() {
+        assert_eq!(
+            canonical_command("configs.copy").unwrap_or_else(|error| unreachable!("{error}")),
+            "configs.copy"
+        );
+        let value = default_command("configs.copy").unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(
+            validate_required(&value).is_err(),
+            "configs.copy without from/to must be rejected as missing required fields"
+        );
+
+        let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let recipes = root.path().join("recipes");
+        std::fs::create_dir_all(&recipes).unwrap_or_else(|error| unreachable!("{error}"));
+        let recipe_path = recipes.join("configs-copy.json");
+        std::fs::write(
+            &recipe_path,
+            r#"{"command":"configs.copy","from":"~","to":"./scratch","include_cache":true,"yes":true}"#,
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        let mut cli =
+            Cli::try_parse_from(["skill-manager", "--input", &recipe_path.to_string_lossy()])
+                .unwrap_or_else(|error| unreachable!("{error}"));
+        apply_recipe(&mut cli).unwrap_or_else(|error| unreachable!("{error}"));
+        let Some(Command::Configs(configs)) = cli.command else {
+            unreachable!("configs command");
+        };
+        let Some(ConfigsAction::Copy(copy)) = configs.action else {
+            unreachable!("configs copy action");
+        };
+        assert_eq!(
+            copy.from, "~",
+            "a bare ~ must pass through unrebased so expand_home can apply --home"
+        );
+        assert_eq!(
+            copy.to,
+            resolve_path(Path::new("./scratch"), &recipes).to_string_lossy()
+        );
+        assert!(copy.include_cache);
+        assert!(copy.yes);
+
+        let mut missing_to = Cli::try_parse_from([
+            "skill-manager",
+            r#"--json={"command":"configs.copy","from":"~"}"#,
+        ])
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(apply_recipe(&mut missing_to).is_err());
+
+        let mut unknown_field = Cli::try_parse_from([
+            "skill-manager",
+            r#"--json={"command":"configs.copy","from":"~","to":"./scratch","bogus":true}"#,
+        ])
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(apply_recipe(&mut unknown_field).is_err());
+
+        let mut malformed = Cli::try_parse_from([
+            "skill-manager",
+            r#"--json={"command":"configs.copy","from":"~","to":"./scratch","include_cache":"yes"}"#,
+        ])
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(apply_recipe(&mut malformed).is_err());
     }
 
     #[test]

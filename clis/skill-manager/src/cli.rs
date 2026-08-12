@@ -562,6 +562,26 @@ pub enum ConfigsAction {
     Reset(ConfigsConfirmArgs),
     /// Restore a previously archived configuration.
     Restore(ConfigsRestoreArgs),
+    /// Seed a destination manager home from an existing one.
+    Copy(ConfigsCopyArgs),
+}
+
+/// Arguments for `configs copy`.
+#[derive(Clone, Debug, Args)]
+pub struct ConfigsCopyArgs {
+    /// Existing manager home to seed from.
+    pub from: String,
+    /// Manager home to seed; created if it does not yet exist.
+    pub to: String,
+    /// Also copy the regenerable cache, backup, and lock directories.
+    #[arg(long)]
+    pub include_cache: bool,
+    /// Plan without changing the destination.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Skip the seeding confirmation; the plan is still displayed.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 /// Destructive configuration action confirmation.

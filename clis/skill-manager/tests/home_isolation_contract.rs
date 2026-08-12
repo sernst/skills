@@ -287,6 +287,11 @@ fn known_leaf_args(leaf: &[String], home: &Path) -> Option<Vec<String>> {
             "synthetic-target-dir-2".to_owned(),
         ]),
         ["configs", "reset" | "restore"] => Some(vec!["--yes".to_owned()]),
+        ["configs", "copy"] => Some(vec![
+            home.join("configs-copy-from").display().to_string(),
+            home.join("configs-copy-to").display().to_string(),
+            "--yes".to_owned(),
+        ]),
         ["generate-completions"] => Some(vec!["--shell".to_owned(), "bash".to_owned()]),
         ["generate-man"] => Some(vec![
             "--output".to_owned(),
@@ -296,6 +301,47 @@ fn known_leaf_args(leaf: &[String], home: &Path) -> Option<Vec<String>> {
                 .to_string(),
         ]),
         _ => None,
+    }
+}
+
+/// Seed any on-disk fixture a leaf needs in order to genuinely run (rather
+/// than fail at the business-logic layer) under `--home`.
+///
+/// Most leaves in `known_leaf_args` deliberately use non-existent operands so
+/// they fail *after* reaching home resolution — that is all this contract
+/// needs from them. `configs copy` is the exception: to prove it leaves
+/// observable state under `--home` (see `assert_isolated`), it must actually
+/// copy something, so its `<FROM>` is given a real resolved target directory
+/// here. `<FROM>` carries no `.skill-manager/config.json`, so target
+/// discovery falls through to built-in defaults and the default `claude`
+/// target (`.claude/skills`) is copied into `<TO>` under `--home`. This is the
+/// honest fix for the earlier version, which pointed `configs copy` at a
+/// nonexistent source and so never exercised the command at all.
+fn prepare_leaf_fixture(leaf: &[String], home: &Path) {
+    let parts: Vec<&str> = leaf.iter().map(String::as_str).collect();
+    if let ["configs", "copy"] = parts.as_slice() {
+        let skill = home
+            .join("configs-copy-from")
+            .join(".claude")
+            .join("skills")
+            .join("isolation-fixture");
+        fs::create_dir_all(&skill).expect("create configs copy source fixture");
+        fs::write(skill.join("SKILL.md"), b"# isolation fixture\n")
+            .expect("write configs copy source fixture");
+    }
+}
+
+/// The observable state a repository-reaching leaf must leave under `--home`,
+/// proving it honored the override. Most commands touch the shared repository
+/// seam, which creates `<home>/.skill-manager`. `configs copy` deliberately
+/// never opens the active-home repository (that is the whole point of defects
+/// 1 and 2), so its observable proof is instead the destination it seeds,
+/// `<home>/configs-copy-to`.
+fn observable_state(label: &str, home: &Path) -> PathBuf {
+    if label == "configs copy" {
+        home.join("configs-copy-to")
+    } else {
+        home.join(".skill-manager")
     }
 }
 
@@ -368,11 +414,11 @@ fn assert_isolated(
     );
 
     if reaches_repository(label) {
-        let home_state = home.join(".skill-manager");
+        let home_state = observable_state(label, home);
         assert!(
             home_state.exists(),
             "`{label}` reaches the repository but left no observable state under --home ({}); \
-             expected `.skill-manager` to be created there",
+             expected it to be created there",
             home_state.display()
         );
     }
@@ -457,6 +503,7 @@ fn no_command_leaf_ever_reads_or_writes_the_decoy_home() {
                 leaf.join(" ")
             )
         });
+        prepare_leaf_fixture(leaf, home.path());
         let mut command = command_with_decoy_home(decoy.path(), home.path(), cwd.path());
         for part in leaf {
             command.arg(part);

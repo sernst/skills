@@ -347,6 +347,29 @@ snapshotting the displaced state. Non-interactive execution requires
 {"command":"configs.restore","backup":"2026-01-01T000000Z-reset","yes":true}
 ```
 
+<!-- recipe-command: configs.copy fields: command,dry_run,from,include_cache,no_input,to,yes -->
+### `configs.copy`
+
+Seed a destination manager home from an existing one: the manager
+configuration (`.skill-manager/config.json` and any other files under
+`.skill-manager/`) plus every resolved target directory that actually exists
+under `from`, merged into `to` by path without ever deleting anything already
+there. Required strings: `from`, `to`. Optional: `include_cache` (`bool`,
+also copies the regenerable `cache`/`backups`/`locks` directories, excluded by
+default), `dry_run`, `yes`, and `no_input`. Target directories are resolved
+from `from`'s own configuration when present, otherwise the active `--home`
+configuration, otherwise the built-in defaults. A relative `from`/`to` is
+rebased to the recipe file directory for `--input FILE`, the same as
+`copy.destination`; an absolute path or a `~`-prefixed reference is passed
+through unchanged so it still expands against the active `--home`.
+`configs.copy` renders its whole plan before applying; every recipe carrier
+is already non-interactive and auto-authorizes the apply step once the plan
+has rendered, so `yes` is accepted but not required to commit.
+
+```json
+{"command":"configs.copy","from":"~","to":"./tmp/scratch-home","dry_run":true}
+```
+
 ## CLI-only commands
 
 These commands deliberately do not accept recipes:

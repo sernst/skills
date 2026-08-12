@@ -1105,7 +1105,7 @@ fn normalize_config_locations(config: &mut Config) -> Result<()> {
     Ok(())
 }
 
-fn normalize_config_targets(config: &mut Config) -> Result<()> {
+pub(crate) fn normalize_config_targets(config: &mut Config) -> Result<()> {
     for (name, target) in config
         .targets
         .iter_mut()
@@ -1612,7 +1612,7 @@ fn lexically_normalized(path: &Path) -> PathBuf {
 /// resolved `--home`/`SKILL_MANAGER_HOME`/the OS home into; this function
 /// never re-resolves it, so a caller cannot silently fall back to the real
 /// OS home behind an overridden home.
-fn expand_home(raw: &str, home: &Path) -> PathBuf {
+pub(crate) fn expand_home(raw: &str, home: &Path) -> PathBuf {
     if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
         if raw == "~" {
             return home.to_path_buf();

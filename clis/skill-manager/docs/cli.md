@@ -22,6 +22,7 @@ and honors `NO_COLOR`; `always` colors even redirected output; `never` is plain.
 | `configs [--raw]` | Display the active configuration and available backups. |
 | `configs reset [--yes]` | Archive and replace the configuration with an empty v2 configuration. |
 | `configs restore [BACKUP_ID] [--yes]` | Restore a selected backup, or the latest backup when omitted. |
+| `configs copy FROM TO [--include-cache] [--dry-run] [--yes]` | Seed a destination manager home (configuration plus resolved target directories) from an existing one, merging by path and deleting nothing. |
 | `source …` / `target …` | Manage source definitions and deployment targets. |
 
 `load`, `update`, `import`, `remove`, and `status` accept built-in selectors
@@ -376,6 +377,109 @@ changing state. Non-interactive use requires `--yes`. Reset first archives the
 exact current bytes and then writes an empty v2 document. Restore uses the
 provided backup ID or the newest backup, snapshots the displaced configuration,
 and can deliberately restore a malformed backup.
+
+### `configs copy`
+
+`configs copy FROM TO` seeds a destination manager home from an existing one —
+typically to make a scratch `--home` directory (see
+[Global and project scopes](#global-and-project-scopes)) resemble a real one
+for smoke testing. It copies the manager configuration
+(`.skill-manager/config.json` and any other files or folders under
+`.skill-manager/`) plus every resolved target skill directory that actually
+exists under `FROM`. Directories that do not exist under `FROM` are skipped
+rather than created empty.
+
+Which target directories are resolved is decided by, in order: `FROM`'s own
+`.skill-manager/config.json` when it is present and already at the current
+schema; otherwise the active `--home` configuration (persisted or defaulted);
+otherwise the built-in defaults (`.claude/skills`, `.agents/skills`, and
+`.gemini/antigravity/skills`). Both `FROM` and the active `--home` are read
+directly from disk for this check and are never opened through the
+configuration repository, so neither is migrated, backed up, locked, or
+otherwise written — not even when `FROM` *is* the active home (the canonical
+`configs copy ~ ./tmp/scratch` shape), and not even under `--dry-run`, which
+changes nothing anywhere. A `FROM` configuration that is present but
+unreadable, not valid JSON, or on an unsupported schema is a hard error that
+names the offending file, rather than a silent fall-through that would copy
+those bytes while quietly resolving custom targets from somewhere else. Its
+custom target paths are lexically normalized the same way the repository
+normalizes them on load; a target path that is absolute or escapes `FROM` via
+`..` is a hard error naming the offending target, so a source configuration can
+never make the copy read outside `FROM` or — through the destination join —
+write outside `TO`.
+
+The regenerable `cache`, `backups`, and `locks` directories under
+`.skill-manager/` are excluded by default, since they can be large and are
+rebuilt automatically; pass `--include-cache` to copy them too. This exclusion
+is global and is applied to the *normalized* target path: a resolved target
+directory that itself points inside one of those reserved locations is dropped
+as well, so a target configured at, say, `.skill-manager/cache` — or an
+obfuscated spelling such as `.skill-manager/x/../cache` — cannot smuggle
+excluded bytes past the filter. A configured source ROOT that is a symlink or
+reparse point (including a Windows junction) is never descended, because
+following it could pull content from outside `FROM` into `TO`. This is checked
+with `symlink_metadata` (never a link-following `is_dir()`) on every source
+root the copy would open — the `.skill-manager` configuration root (before its
+`config.json` is ever read, which must itself be a regular file, not a link),
+the `.skill-manager` directory copied as an item, and every resolved target
+root — and is re-checked immediately before each write at apply time so a link
+planted after preflight is still caught. A linked source root is not silently
+dropped: it is reported as an explicit `skipped (linked source)` row in the
+plan and result output so the seed is never quietly incomplete. (A linked path
+found *inside* an already-descendable tree is skipped like any other special
+entry.) Destination-side links remain a hard error rather than a skip, because
+a copy must never write through a link out of `TO`. Empty directories are
+copied like any other: a folder that exists under `FROM` but is missing at
+`TO` counts as work and is recreated, honoring the "copies folders, merges
+paths, deletes nothing" contract even when the folder holds no files.
+
+Copying is a merge, never a mirror: existing files at `TO` are overwritten
+only where `FROM` has a same-path file, and nothing already present at `TO`
+that is not part of the copy is ever deleted. `TO` is created if it does not
+yet exist. `FROM` and `TO` support the same `~` expansion as other path
+arguments (resolved against the active `--home`) and may be relative to the
+current directory.
+
+`FROM` must exist and be a directory; a `TO` that exists as a file is
+rejected. Because the copy touches only `FROM`'s `.skill-manager` directory
+plus each resolved target root — not all of `FROM` — a `TO` that merely lives
+somewhere under `FROM` is fully supported; this is the canonical `configs copy
+~ ./temp/smoke-testing/` shape, where the scratch destination naturally sits
+inside the home. Only a genuine recursion or self-overwrite hazard is
+rejected, naming the specific colliding source directory: `TO` being the same
+directory as `FROM`, `TO` lying inside a source root that is actually copied
+(the configuration root or a resolved target root), or such a source root
+lying inside `TO`. It is also an error for `FROM` to have neither a
+configuration nor any existing resolved target directory to copy.
+
+Every destination path — and every ancestor of it within `TO` — is checked
+before the plan is rendered or anything is written. A symlink or other reparse
+point met there (including a Windows directory junction) is rejected, so a
+planted link cannot redirect a write to a file outside `TO`. Every incoming
+entry is classified by kind, so a conflict in either direction — an incoming
+directory over an existing destination file, or an incoming file over an
+existing destination directory — is caught here too. Because that preflight
+runs before the plan, the plan can never promise a seed that would then only
+partially apply: an unsafe destination fails cleanly with an actionable error
+and nothing on disk changes. The same link/ancestor rejection is re-run
+immediately before each item is written at apply time, so an ancestor swapped
+for a link after preflight (for example while a confirmation prompt is waiting)
+is still caught; this shrinks the window to "checked immediately before the
+write" and is not a per-handle TOCTOU guarantee.
+
+Like every other command, `configs copy` narrates what it discovered, then
+renders one consolidated plan of every directory it would create or merge
+before its one confirmation; `--yes` skips the prompt without skipping the
+plan, `--dry-run` renders the plan and applies nothing, and `--no-input`
+either auto-approves under `--json` or otherwise fails closed. Like its
+sibling commands, `configs copy` accepts `--json-input`/`--input`/
+`--json=OBJECT` recipes, with fields `from`, `to`, `include_cache`,
+`dry_run`, and `yes` mirroring the CLI flags; a relative `from`/`to` in a
+recipe file is rebased against that file's directory the same way `copy`'s
+`source`/`destination` are, while a bare `~` or an absolute path passes
+through unchanged so it still expands against the active `--home`. See
+[the JSON contract](json.md#configs-copy-events) for its `plan` payload shape
+and its `configs.copy.item`/`summary` events.
 
 See [configuration and migration](configuration.md) for storage and backup
 details, and [the JSON contract](json.md) for automation.

@@ -300,6 +300,7 @@ skill-manager configs
 skill-manager configs --raw
 skill-manager configs reset [--yes]
 skill-manager configs restore [BACKUP_ID] [--yes]
+skill-manager configs copy FROM TO [--include-cache] [--dry-run] [--yes]
 ```
 
 `configs` shows an explanatory summary plus aligned Sources, Targets, and
@@ -314,6 +315,24 @@ Reset archives exact current bytes before writing an empty schema-v2 config.
 Restore selects the provided backup or newest backup, snapshots displaced state,
 then restores the selected bytes. Interactive confirmation accepts exact
 lowercase `yes`; non-interactive execution needs `--yes`.
+
+`configs copy` seeds a destination manager home from an existing one: the
+manager configuration (`.skill-manager/`) plus every resolved target
+directory that actually exists under `FROM`, merged into `TO` by path without
+ever deleting anything already there. Target directories are resolved from
+`FROM`'s own configuration when present, otherwise the active `--home`
+configuration, otherwise the built-in defaults. `cache`, `backups`, and
+`locks` under `.skill-manager/` are excluded unless `--include-cache` is
+given. A configured source root that is a symlink or junction is never
+descended and is reported as an explicit `skipped (linked source)` item rather
+than silently dropped. `TO` may live anywhere under `FROM` (the common
+`~ ./temp/...` shape); only a genuine recursion or self-overwrite hazard —
+`TO` equal to `FROM`, `TO` inside a copied source root, or a copied source
+root inside `TO` — is rejected. Like
+the other commands above, it renders one plan before one confirmation and
+supports `--dry-run`, and like them it accepts `--json-input`/`--input`/
+`--json=OBJECT` recipes (`command: "configs.copy"`, fields `from`, `to`,
+`include_cache`, `dry_run`, `yes`).
 
 ## Hidden generation commands
 
@@ -364,7 +383,7 @@ source.add  source.remove  source.list  source.update
 source.locate  source.alternate  source.swap
 target.add  target.list  target.enable  target.disable
 target.remove  target.set-path
-configs  configs.reset  configs.restore
+configs  configs.reset  configs.restore  configs.copy
 ```
 
 Values are strict: unknown fields, wrong types, `null`, missing required

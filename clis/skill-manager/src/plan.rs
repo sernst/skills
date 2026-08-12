@@ -6,8 +6,9 @@
 //! display-width alignment, optional compact symbols, and color that is scoped
 //! to the semantic cells only.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SkillManagerError};
 use crate::skills::directory_files;
@@ -120,10 +121,27 @@ impl DiffStat {
 ///
 /// Returns an error for unsafe tree entries or filesystem reads.
 pub fn diff_directories(existing: &Path, incoming: &Path) -> Result<DiffStat> {
-    let before = directory_files(existing)?;
-    let after = directory_files(incoming)?;
+    diff_directory_maps(&directory_files(existing)?, &directory_files(incoming)?)
+}
+
+/// Compute the same per-file change plan as [`diff_directories`], but from
+/// already-enumerated relative-path maps rather than walking two directory
+/// roots directly.
+///
+/// This is the seam a caller uses to compare a filtered subset of one or both
+/// trees — for example, `configs copy` excludes the regenerable cache and
+/// backup directories from its plan without ever reading their content, by
+/// pruning them out of the map before it reaches this function.
+///
+/// # Errors
+///
+/// Returns an error when a mapped file cannot be read.
+pub fn diff_directory_maps(
+    before: &BTreeMap<String, PathBuf>,
+    after: &BTreeMap<String, PathBuf>,
+) -> Result<DiffStat> {
     let mut files = Vec::new();
-    for (relative, path) in &before {
+    for (relative, path) in before {
         let old = std::fs::read(path).map_err(|error| SkillManagerError::io(path, error))?;
         match after.get(relative) {
             None => files.push(deleted_delta(relative, &old)),
@@ -136,7 +154,7 @@ pub fn diff_directories(existing: &Path, incoming: &Path) -> Result<DiffStat> {
             }
         }
     }
-    for (relative, path) in &after {
+    for (relative, path) in after {
         if before.contains_key(relative) {
             continue;
         }
