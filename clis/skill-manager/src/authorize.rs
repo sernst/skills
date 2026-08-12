@@ -5,15 +5,18 @@
 //! question is resolvable by cancelling. Two shapes cover every command in the
 //! approved design:
 //!
-//! * [`Authorizer::confirm`] for exactly one complete outcome, where bracket
-//!   casing (`[Y/n]` versus `[y/N]`) is the only encoding of risk.
-//! * [`Authorizer::select`] for exactly one unresolved dimension, where numbered
-//!   options and an explicit cancel token are read off rendered option lines.
+//! * [`Authorizer::confirm`](crate::authorize::Authorizer::confirm) for
+//!   exactly one complete outcome, where bracket casing (`[Y/n]` versus `[y/N]`)
+//!   is the only encoding of risk.
+//! * [`Authorizer::select`](crate::authorize::Authorizer::select) for exactly
+//!   one unresolved dimension, where numbered options and an explicit cancel
+//!   token are read off rendered option lines.
 //!
-//! A progressive, multi-prompt sequence is composed by calling [`Authorizer`]
-//! once per dimension and re-rendering a narrowed plan in between; the helper
-//! deliberately holds no cross-prompt state so that narrowing stays the caller's
-//! explicit, testable step.
+//! A progressive, multi-prompt sequence is composed by calling
+//! [`Authorizer`](crate::authorize::Authorizer) once per dimension and
+//! re-rendering a narrowed plan in between; the helper deliberately holds no
+//! cross-prompt state so that narrowing stays the caller's explicit, testable
+//! step.
 
 use crate::error::{Result, SkillManagerError};
 use crate::prompt::Prompt;

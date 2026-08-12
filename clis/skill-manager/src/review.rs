@@ -8,25 +8,30 @@
 //!
 //! The model separates the two things a plan can contain:
 //!
-//! * **Answers** — [`PlannedAction`]s already decided against a [`Destination`],
-//!   plus [`PlanRow::availability`], which records only that an item *exists*
-//!   somewhere. Availability is deliberately not an action: `remove` must be
-//!   able to show where a skill lives before anything has been chosen, and
-//!   rendering that as an action would claim an operation the user never
-//!   authorized.
-//! * **Questions** — [`Decision`]s, each one unresolved authorization dimension
-//!   with its own alternatives. A [`DecisionOption`] carries its own consequence
-//!   preview, including nested destination-level previews, so `import` can show
-//!   what every candidate source copy would propagate before the first prompt.
-//!   Answering a dimension sets [`Decision::resolved`], and a resolved dimension
-//!   is gated out of every later render.
+//! * **Answers** — [`PlannedAction`](crate::review::PlannedAction)s already
+//!   decided against a [`Destination`](crate::review::Destination), plus
+//!   [`PlanRow::availability`](crate::review::PlanRow::availability), which
+//!   records only that an item *exists* somewhere. Availability is deliberately
+//!   not an action: `remove` must be able to show where a skill lives before
+//!   anything has been chosen, and rendering that as an action would claim an
+//!   operation the user never authorized.
+//! * **Questions** — [`Decision`](crate::review::Decision)s, each one
+//!   unresolved authorization dimension with its own alternatives. A
+//!   [`DecisionOption`](crate::review::DecisionOption) carries its own
+//!   consequence preview, including nested destination-level previews, so
+//!   `import` can show what every candidate source copy would propagate before
+//!   the first prompt. Answering a dimension sets
+//!   [`Decision::resolved`](crate::review::Decision::resolved), and a resolved
+//!   dimension is gated out of every later render.
 //!
-//! The model is also destination-generic. A [`Destination`] is one place a plan
-//! can write: a target/scope deployment for `load`, `update`, and `remove`; an
-//! arbitrary filesystem path for `copy`; and a canonical source collection for
-//! `import`. Destinations that share a [`Destination::column`] become one matrix
-//! column, which is why per-cell scope (`↕ both`) and the matrix layout fall out
-//! of the same data rather than needing a second model.
+//! The model is also destination-generic. A
+//! [`Destination`](crate::review::Destination) is one place a plan can write:
+//! a target/scope deployment for `load`, `update`, and `remove`; an arbitrary
+//! filesystem path for `copy`; and a canonical source collection for `import`.
+//! Destinations that share a
+//! [`Destination::column`](crate::review::Destination::column) become one
+//! matrix column, which is why per-cell scope (`↕ both`) and the matrix layout
+//! fall out of the same data rather than needing a second model.
 //!
 //! Rendering reuses the [`crate::status`] width helpers so plan tables, status
 //! tables, and diff blocks stay aligned by Unicode display width, and reuses

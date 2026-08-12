@@ -4858,9 +4858,10 @@ fn update_change_plan(
 /// requested step is present as a machine-visible entry — including an
 /// already-identical deployment, kept as a [`PlanAction::Skip`] action so the
 /// structured `plan` event stays complete — but a row whose every action is
-/// such a skip is dormant: [`PlanView::visible_rows`] hides it from the
-/// table, from column significance, and from progress lines, and it is
-/// counted only in the footer.
+/// such a skip is dormant:
+/// [`PlanView::visible_rows`](crate::review::PlanView::visible_rows) hides it
+/// from the table, from column significance, and from progress lines, and it
+/// is counted only in the footer.
 fn load_change_plan(
     steps: &[&SyncStep],
     target_names: &[String],
@@ -6422,10 +6423,11 @@ fn remove_destinations(target_names: &[String]) -> Vec<Destination> {
 }
 
 /// Build `remove`'s rows: pure availability while the scope branch is still
-/// open, or concrete [`PlannedAction::Remove`] actions once it is resolved
-/// (whether by explicit scope, `--both`, or an inference that never actually
-/// branched). Also returns the flat apply list for the resolved case; the
-/// deferred case builds its apply list only after interactive selection.
+/// open, or concrete
+/// [`crate::plan::PlanAction::Remove`] actions once it is resolved (whether by
+/// explicit scope, `--both`, or an inference that never actually branched).
+/// Also returns the flat apply list for the resolved case; the deferred case
+/// builds its apply list only after interactive selection.
 ///
 /// The single-row, single-action, no-availability case is `remove`'s
 /// degenerate sentence (shared [`render_body`](crate::review) mechanism): the
@@ -6532,11 +6534,11 @@ fn remove_totals_from_items(items: &[RemoveApplyItem]) -> Result<(usize, usize)>
 /// Total deployments and files one scope choice would actually remove.
 ///
 /// Resolves the exact apply list [`resolve_remove_apply_list`] would hand to
-/// [`App::apply_remove_items`] for this choice and diffs each item for real,
-/// rather than combining a per-skill representative count across cells. This
-/// is what keeps a branch option's advertised blast radius from drifting
-/// away from what selecting it actually deletes when deployments across
-/// scopes have genuinely diverged.
+/// [`crate::app::Application::apply_remove_items`] for this choice and diffs
+/// each item for real, rather than combining a per-skill representative count
+/// across cells. This is what keeps a branch option's advertised blast radius
+/// from drifting away from what selecting it actually deletes when deployments
+/// across scopes have genuinely diverged.
 fn remove_choice_totals(
     skill_plans: &[RemoveSkillPlan],
     choice: RemoveScopeChoice,
