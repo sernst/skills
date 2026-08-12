@@ -6196,13 +6196,22 @@ fn copy_review_fixture() -> (TempDir, PathBuf) {
     (home, source)
 }
 
+fn copy_destination(home: &TempDir) -> (PathBuf, PathBuf) {
+    let destination = home.path().join("vendor").join("skills");
+    let destination_display = portable_canonicalize(home.path())
+        .expect("canonical sandbox")
+        .join("vendor")
+        .join("skills");
+    (destination, destination_display)
+}
+
 /// The whole plan renders before the single confirmation, and copy has
 /// nothing to teach on cancel: source, destination, and filters are always
 /// stated explicitly, so nothing was inferred.
 #[test]
 fn copy_renders_its_whole_plan_before_one_confirmation_and_cancels() {
     let (home, source) = copy_review_fixture();
-    let dest = home.path().join("vendor").join("skills");
+    let (dest, dest_display) = copy_destination(&home);
 
     let declined = cli(home.path())
         .args([
@@ -6229,12 +6238,12 @@ writing-for-agents       new copy, 1 file, +1/-0  copy
 
 2 changes to 1 destination: 2 new
 Cancelled.\n",
-            dest_display = dest.display()
+            dest_display = dest_display.display()
         )
     );
     assert_eq!(
         stderr_of(&declined),
-        format!("Copy these 2 skills to {}? [Y/n] ", dest.display())
+        format!("Copy these 2 skills to {}? [Y/n] ", dest_display.display())
     );
     assert!(!dest.exists(), "declining a copy plan writes nothing");
 }
@@ -6243,7 +6252,7 @@ Cancelled.\n",
 #[test]
 fn copy_dry_run_renders_the_plan_and_concludes_once() {
     let (home, source) = copy_review_fixture();
-    let dest = home.path().join("vendor").join("skills");
+    let (dest, dest_display) = copy_destination(&home);
 
     let stdout = stdout_of(
         cli(home.path())
@@ -6272,7 +6281,7 @@ writing-for-agents       new copy, 1 file, +1/-0  copy
 2 changes to 1 destination: 2 new
 
 Dry run — no changes were made.\n",
-            dest_display = dest.display()
+            dest_display = dest_display.display()
         )
     );
     assert!(!dest.exists());
@@ -6282,9 +6291,9 @@ Dry run — no changes were made.\n",
 #[test]
 fn copy_yes_renders_the_plan_then_applies_with_a_summary_footer() {
     let (home, source) = copy_review_fixture();
-    let dest = home.path().join("vendor").join("skills");
-    let copied_drafting = dest.join("drafting-commit-message");
-    let copied_writing = dest.join("writing-for-agents");
+    let (dest, dest_display) = copy_destination(&home);
+    let copied_drafting = dest_display.join("drafting-commit-message");
+    let copied_writing = dest_display.join("writing-for-agents");
 
     let output = cli(home.path())
         .args([
@@ -6315,7 +6324,7 @@ Copied drafting-commit-message -> {copied_drafting}\n\
 Copied writing-for-agents -> {copied_writing}\n\
 \n\
 completed: 2 skills copied (2 new)\n",
-            dest_display = dest.display(),
+            dest_display = dest_display.display(),
             copied_drafting = copied_drafting.display(),
             copied_writing = copied_writing.display()
         )
@@ -6332,7 +6341,7 @@ completed: 2 skills copied (2 new)\n",
 #[test]
 fn copy_renders_as_a_degenerate_sentence_for_a_single_matched_skill() {
     let (home, source) = copy_review_fixture();
-    let dest = home.path().join("vendor").join("skills");
+    let (dest, dest_display) = copy_destination(&home);
 
     let stdout = stdout_of(
         cli(home.path())
@@ -6360,7 +6369,7 @@ copy writing-for-agents: new copy, 1 file, +1/-0
 1 change to 1 destination: 1 new
 
 Dry run — no changes were made.\n",
-            dest_display = dest.display()
+            dest_display = dest_display.display()
         )
     );
 }
@@ -6370,9 +6379,9 @@ Dry run — no changes were made.\n",
 #[test]
 fn copy_has_no_identical_hiding_and_reports_overwrites_even_when_content_matches() {
     let (home, source) = copy_review_fixture();
-    let dest = home.path().join("vendor").join("skills");
-    let overwritten_drafting = dest.join("drafting-commit-message");
-    let overwritten_writing = dest.join("writing-for-agents");
+    let (dest, dest_display) = copy_destination(&home);
+    let overwritten_drafting = dest_display.join("drafting-commit-message");
+    let overwritten_writing = dest_display.join("writing-for-agents");
     cli(home.path())
         .args([
             "copy",
@@ -6413,7 +6422,7 @@ Overwrote drafting-commit-message -> {overwritten_drafting}\n\
 Overwrote writing-for-agents -> {overwritten_writing}\n\
 \n\
 completed: 2 skills copied (2 overwritten)\n",
-            dest_display = dest.display(),
+            dest_display = dest_display.display(),
             overwritten_drafting = overwritten_drafting.display(),
             overwritten_writing = overwritten_writing.display()
         ),
@@ -6538,7 +6547,7 @@ fn copy_reviews_and_applies_skills_in_discovery_order() {
 #[test]
 fn copy_renders_the_interactive_symbol_and_color_plan_for_a_terminal_user() {
     let (home, source) = copy_review_fixture();
-    let dest = home.path().join("vendor").join("skills");
+    let (dest, dest_display) = copy_destination(&home);
 
     let stdout = stdout_of(
         cli(home.path())
@@ -6569,7 +6578,7 @@ Destination  {dest_display}\n\
 1 change to 1 destination: \u{1b}[32m+ 1 new\u{1b}[0m\n\
 \n\
 Dry run — no changes were made.\n",
-            dest_display = dest.display()
+            dest_display = dest_display.display()
         )
     );
 }
@@ -6579,7 +6588,7 @@ Dry run — no changes were made.\n",
 #[test]
 fn copy_emits_a_structured_plan_event_before_applying() {
     let (home, source) = copy_review_fixture();
-    let dest = home.path().join("vendor").join("skills");
+    let (dest, dest_display) = copy_destination(&home);
 
     let events = json_events(
         cli(home.path())
@@ -6610,7 +6619,7 @@ fn copy_emits_a_structured_plan_event_before_applying() {
                 "id": "action",
                 "kind": "path",
                 "label": "action",
-                "path": dest.display().to_string()
+                "path": dest_display.display().to_string()
             }
         ])
     );
