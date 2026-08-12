@@ -102,11 +102,38 @@ just inherits an unreliable router pick. The one exception is when the user's
 own prompt explicitly permits it, electing that cost saving; absent that, you
 always choose.
 
+Billing on this harness is metered in premium-request equivalents: every model
+turn of every agent is a billed request, weighted by a per-model multiplier,
+and that product — multiplier × request count — is the bill. Whenever it
+disagrees with token- or cache-level reasoning, the multiplier arithmetic
+wins. Read the current multiplier table from the harness itself alongside the
+roster, before your first dispatch — never from memory, since tables change.
+Multipliers do not track capability tier: frontier-class models are often ×1
+while some light/fast models carry double-digit multipliers, so a model that
+is cheap per token can be ruinous per request. Never infer billing weight from
+tier, name, or token price.
+
+Price every dispatch as multiplier × expected requests before launching it.
+Many-turn roles — executors, wide reconnaissance, anything that iterates —
+belong on the most capable ×1-class model available, never on a
+high-multiplier model; reserve high-multiplier models for short, tightly
+scoped dispatches and bound their turn budget in the brief. The judge floor
+below is unchanged, but satisfy it from ×1-class candidates first — the table
+usually prices some frontier-class models there — and when only a
+high-multiplier judge clears the floor, shrink its workload with the evidence
+pack so it renders a verdict in few requests. The batching and lifetime rules
+below are billing levers here, not just cache hygiene: fewer, larger turns and
+short-lived agents cut the request count directly. Keep the ledger in
+multiplier-weighted premium-request equivalents.
+
 Model capability class is your primary escalation lever, not reasoning effort.
 Set both deliberately on every dispatch — pick the class the task's depth
 warrants, then a matching effort level, but never lean on higher effort to
 rescue an under-provisioned tier. Raise the context tier only when inputs
-demand the larger window, not as a quality lever.
+demand the larger window, not as a quality lever. Class escalation can also be
+a multiplier escalation on this harness; price it before committing, and treat
+escalated retry attempts as short, bounded dispatches rather than many-turn
+roles.
 
 Choose tiers in the abstract, by capability class, never by naming a provider
 or model slug as routing guidance. Provider breadth here is an opportunity: an
@@ -224,8 +251,10 @@ and never let the subagent that did the work grade it.
 
 **A defect class found twice becomes a test, not a third judge finding.** Judges
 are your most expensive verification layer, so when the same class of defect
-surfaces in two separate dispatches, encode it as an assertion, invariant test,
-or lint that fails automatically, and tell later executors it exists.
+surfaces a second time — across dispatches or across fix cycles on one task —
+encode it as an assertion, invariant test, or lint that fails automatically,
+and tell later executors it exists. Have the next review sweep for the whole
+class in one pass rather than peeling instances one cycle at a time.
 
 **Brief judges with an evidence pack.** Hand the judge the diff scope, the
 current test results, the acceptance criteria, and the findings already
