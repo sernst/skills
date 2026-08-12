@@ -800,6 +800,7 @@ mod tests {
                 .to_str()
                 .unwrap_or_else(|| unreachable!("temporary path must be UTF-8")),
             Some(SourceMode::Collection),
+            sandbox.path(),
         )
         .unwrap_or_else(|error| unreachable!("{error}"));
         entry.path = Some(alias.join("collection"));

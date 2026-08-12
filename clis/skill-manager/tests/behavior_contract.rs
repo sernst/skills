@@ -87,20 +87,25 @@ fn patterns_are_unicode_folded_and_unmatched_brackets_are_literals() {
 
 #[test]
 fn source_reference_and_bare_name_resolution_cases() {
-    let tree = source_from_reference("https://github.com/acme/skills/tree/main/collection", None)
-        .expect("GitHub tree URL");
+    let temp = tempfile::tempdir().expect("temporary root");
+    let tree = source_from_reference(
+        "https://github.com/acme/skills/tree/main/collection",
+        None,
+        temp.path(),
+    )
+    .expect("GitHub tree URL");
     assert_eq!(tree.source_type, SourceType::GitHub);
     assert_eq!(tree.owner.as_deref(), Some("acme"));
     assert_eq!(tree.repo.as_deref(), Some("skills"));
     assert_eq!(tree.r#ref.as_deref(), Some("main"));
     assert_eq!(tree.repo_path.as_deref(), Some("collection"));
 
-    let shorthand = source_from_reference("acme/skills:v2/nested", None).expect("GitHub shorthand");
+    let shorthand = source_from_reference("acme/skills:v2/nested", None, temp.path())
+        .expect("GitHub shorthand");
     assert_eq!(shorthand.r#ref.as_deref(), Some("v2"));
     assert_eq!(shorthand.repo_path.as_deref(), Some("nested"));
 
-    let temp = tempfile::tempdir().expect("temporary root");
-    let local = source_from_reference(temp.path().to_str().expect("utf8 path"), None)
+    let local = source_from_reference(temp.path().to_str().expect("utf8 path"), None, temp.path())
         .expect("local source");
     assert_eq!(local.source_type, SourceType::Local);
     let canonical_temp = portable_canonicalize(temp.path()).expect("canonical temporary path");

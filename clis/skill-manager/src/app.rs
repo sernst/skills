@@ -722,7 +722,7 @@ where
                     },
                     Ok,
                 )?;
-                let index = source_selector_index(config, &selector)?;
+                let index = source_selector_index(config, &selector, &self.home)?;
                 let removed = config.sources.remove(index);
                 self.repository.save(active_path, config)?;
                 self.reporter.human(&format!(
@@ -787,7 +787,7 @@ where
             SourceModeArg::Collection => SourceMode::Collection,
             SourceModeArg::Single => SourceMode::Single,
         });
-        let mut source = source_from_reference(&reference, mode)?;
+        let mut source = source_from_reference(&reference, mode, &self.home)?;
         let new_location = source_location(&source)?;
         if let Some(existing) = find_location_owner(config, &new_location, None) {
             return Err(SkillManagerError::InvalidInput(format!(
@@ -861,7 +861,7 @@ where
                 "cache TTL must be zero or positive".into(),
             ));
         }
-        let index = source_selector_index(config, &args.source)?;
+        let index = source_selector_index(config, &args.source, &self.home)?;
         if let Some(name) = &args.name {
             if name.trim().is_empty() {
                 return Err(SkillManagerError::InvalidInput(
@@ -884,7 +884,7 @@ where
         })?;
         let mut proposed = previous.clone();
         if let Some(location) = &args.location {
-            let replacement = location_from_reference(location, proposed.mode)?;
+            let replacement = location_from_reference(location, proposed.mode, &self.home)?;
             let active = source_location(&proposed)?;
             if !locations_equal(&active, &replacement) {
                 if proposed
@@ -937,9 +937,9 @@ where
         active_path: &Path,
         args: &SourceLocateArgs,
     ) -> Result<()> {
-        let index = source_selector_index(config, &args.source)?;
+        let index = source_selector_index(config, &args.source, &self.home)?;
         let previous = config.sources[index].clone();
-        let replacement = location_from_reference(&args.location, previous.mode)?;
+        let replacement = location_from_reference(&args.location, previous.mode, &self.home)?;
         let active = source_location(&previous)?;
         if locations_equal(&active, &replacement) {
             return self.reporter.event(
@@ -980,10 +980,14 @@ where
         active_path: &Path,
         args: SourceAlternateArgs,
     ) -> Result<()> {
-        let index = source_selector_index(config, &args.source)?;
+        let index = source_selector_index(config, &args.source, &self.home)?;
         let previous = config.sources[index].clone();
         let replacement = match (args.location, args.clear) {
-            (Some(location), false) => Some(location_from_reference(&location, previous.mode)?),
+            (Some(location), false) => Some(location_from_reference(
+                &location,
+                previous.mode,
+                &self.home,
+            )?),
             (None, true) => None,
             _ => {
                 return Err(SkillManagerError::InvalidInput(
@@ -1041,7 +1045,7 @@ where
         active_path: &Path,
         args: &SourceSwapArgs,
     ) -> Result<()> {
-        let index = source_selector_index(config, &args.source)?;
+        let index = source_selector_index(config, &args.source, &self.home)?;
         let previous = config.sources[index].clone();
         let alternate = previous.alternate.clone().ok_or_else(|| {
             SkillManagerError::InvalidInput(format!(
@@ -1225,7 +1229,7 @@ where
         let mut definite_sources = Vec::new();
         let mut deferred = Vec::new();
         for operand in &operands.sources {
-            if configured_source_index(config, operand)?.is_some()
+            if configured_source_index(config, operand, &self.home)?.is_some()
                 || is_path_or_github_shaped(operand)
             {
                 definite_sources.push(operand.clone());
@@ -1268,7 +1272,7 @@ where
                 )?;
             } else {
                 for word in &promoted_sources {
-                    let entry = configured_source_or_reference(config, word, None)?;
+                    let entry = configured_source_or_reference(config, word, None, &self.home)?;
                     sources.push(materialize_source(
                         self.repository,
                         self.github,
@@ -2053,7 +2057,7 @@ where
     /// the diff itself).
     #[allow(clippy::too_many_lines)]
     fn run_copy(&mut self, config: &Config, args: &CopyArgs) -> Result<bool> {
-        let entry = configured_source_or_reference(config, &args.source, None)?;
+        let entry = configured_source_or_reference(config, &args.source, None, &self.home)?;
         let resolved = materialize_source(
             self.repository,
             self.github,
@@ -3082,7 +3086,8 @@ where
                         requested.push(name);
                     }
                 } else if path.is_dir() {
-                    let entry = source_from_reference(raw, Some(SourceMode::Collection))?;
+                    let entry =
+                        source_from_reference(raw, Some(SourceMode::Collection), &self.home)?;
                     let resolved = ResolvedSource {
                         path: entry.path.clone().ok_or_else(|| {
                             SkillManagerError::InvalidInput(format!(
@@ -3725,7 +3730,7 @@ where
         args: &ResolveArgs,
     ) -> Result<()> {
         if let Some(preferred) = &args.prefer_source {
-            let _configured = configured_source_index(config, preferred)?;
+            let _configured = configured_source_index(config, preferred, &self.home)?;
         }
         let sources =
             self.resolve_sources(config, &[], &args.source_selection, args.refresh, false)?;
@@ -3777,7 +3782,9 @@ where
             let winner_index = if let Some(preferred) = &args.prefer_source {
                 candidates
                     .iter()
-                    .position(|candidate| source_matches(&candidate.source.entry, preferred))
+                    .position(|candidate| {
+                        source_matches(&candidate.source.entry, preferred, &self.home)
+                    })
                     .ok_or_else(|| {
                         SkillManagerError::InvalidInput(format!(
                             "preferred source {preferred:?} is not a candidate for {}",
@@ -3864,7 +3871,9 @@ where
         let mut entries = Vec::new();
         if !explicit.is_empty() {
             for reference in explicit {
-                entries.push(configured_source_or_reference(config, reference, None)?);
+                entries.push(configured_source_or_reference(
+                    config, reference, None, &self.home,
+                )?);
             }
         } else if selection.cd_only {
             entries.push(source_from_reference(
@@ -3873,6 +3882,7 @@ where
                     .display()
                     .to_string(),
                 None,
+                &self.home,
             )?);
         } else {
             entries.extend(config.sources.clone());
@@ -3883,6 +3893,7 @@ where
                         .display()
                         .to_string(),
                     None,
+                    &self.home,
                 )?;
                 if !entries.iter().any(|entry| entry.id == cwd.id) {
                     entries.push(cwd);
@@ -5943,8 +5954,8 @@ fn source_change_data(current: &SourceEntry, previous: &SourceEntry, changed: bo
     data
 }
 
-fn source_selector_index(config: &Config, selector: &str) -> Result<usize> {
-    if let Some(index) = configured_source_index(config, selector)? {
+fn source_selector_index(config: &Config, selector: &str, home: &Path) -> Result<usize> {
+    if let Some(index) = configured_source_index(config, selector, home)? {
         return Ok(index);
     }
     Err(SkillManagerError::NotFound {
@@ -5953,11 +5964,11 @@ fn source_selector_index(config: &Config, selector: &str) -> Result<usize> {
     })
 }
 
-fn configured_source_index(config: &Config, selector: &str) -> Result<Option<usize>> {
-    if let Some(index) = find_source_index(config, selector)? {
+fn configured_source_index(config: &Config, selector: &str, home: &Path) -> Result<Option<usize>> {
+    if let Some(index) = find_source_index(config, selector, home)? {
         return Ok(Some(index));
     }
-    if let Ok(candidate) = location_from_reference(selector, SourceMode::Collection)
+    if let Ok(candidate) = location_from_reference(selector, SourceMode::Collection, home)
         && let Some(source) = config.sources.iter().find(|source| {
             source
                 .alternate
@@ -5977,13 +5988,14 @@ fn configured_source_or_reference(
     config: &Config,
     reference: &str,
     mode: Option<SourceMode>,
+    home: &Path,
 ) -> Result<SourceEntry> {
-    if let Some(index) = configured_source_index(config, reference)? {
+    if let Some(index) = configured_source_index(config, reference, home)? {
         return config.sources.get(index).cloned().ok_or_else(|| {
             SkillManagerError::InvalidInput("source index changed unexpectedly".into())
         });
     }
-    source_from_reference(reference, mode)
+    source_from_reference(reference, mode, home)
 }
 
 fn find_location_owner<'a>(
@@ -6195,14 +6207,14 @@ fn normalized_patterns(patterns: Vec<String>) -> Vec<String> {
     result
 }
 
-fn source_matches(source: &SourceEntry, selector: &str) -> bool {
+fn source_matches(source: &SourceEntry, selector: &str, home: &Path) -> bool {
     if [source.id.as_str(), source.name.as_str()]
         .iter()
         .any(|value| fold(value) == fold(selector))
     {
         return true;
     }
-    location_from_reference(selector, source.mode).is_ok_and(|location| {
+    location_from_reference(selector, source.mode, home).is_ok_and(|location| {
         source_location(source).is_ok_and(|active| locations_equal(&active, &location))
     })
 }
@@ -6313,11 +6325,18 @@ fn title_case(value: &str) -> String {
 
 /// Create the production repository and discover its home path together.
 ///
+/// `home_override` is the parsed `--home` flag value, if any, threaded
+/// explicitly from `main` rather than read from process-global state; it
+/// takes precedence over `SKILL_MANAGER_HOME` and the OS home (see
+/// [`manager_home`]).
+///
 /// # Errors
 ///
 /// Returns an error when the operating system does not provide a user home.
-pub fn production_repository() -> Result<(FileConfigRepository, PathBuf)> {
-    let home = manager_home()?;
+pub fn production_repository(
+    home_override: Option<&Path>,
+) -> Result<(FileConfigRepository, PathBuf)> {
+    let home = manager_home(home_override)?;
     Ok((FileConfigRepository::new(home.clone()), home))
 }
 
@@ -6520,7 +6539,7 @@ mod tests {
         std::fs::create_dir(&skill).unwrap_or_else(|error| unreachable!("{error}"));
         std::fs::write(skill.join("SKILL.md"), "# Demo")
             .unwrap_or_else(|error| unreachable!("{error}"));
-        let mut entry = source_from_reference("owner/repository", None)
+        let mut entry = source_from_reference("owner/repository", None, root.path())
             .unwrap_or_else(|error| unreachable!("{error}"));
         entry.name = "primary-source".into();
         entry.label = "Primary Collection".into();
@@ -6534,9 +6553,9 @@ mod tests {
                 temporary: None,
             },
         };
-        assert!(source_matches(&entry, "PRIMARY-SOURCE"));
-        assert!(source_matches(&entry, "OWNER/REPOSITORY"));
-        assert!(!source_matches(&entry, "secondary"));
+        assert!(source_matches(&entry, "PRIMARY-SOURCE", root.path()));
+        assert!(source_matches(&entry, "OWNER/REPOSITORY", root.path()));
+        assert!(!source_matches(&entry, "secondary", root.path()));
         assert!(
             status_matches("demo-skill", Some(&candidate), &[])
                 .unwrap_or_else(|error| unreachable!("{error}"))
@@ -6557,7 +6576,7 @@ mod tests {
     #[test]
     fn event_payload_helpers_preserve_provenance_and_target_state() {
         let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
-        let entry = source_from_reference("owner/repository:main/team", None)
+        let entry = source_from_reference("owner/repository:main/team", None, root.path())
             .unwrap_or_else(|error| unreachable!("{error}"));
         let candidate = SkillCandidate {
             name: "demo".into(),
@@ -6848,7 +6867,7 @@ mod tests {
         std::fs::create_dir_all(cwd.path().join("widget"))
             .unwrap_or_else(|error| unreachable!("{error}"));
 
-        let entry = source_from_reference("owner/repository", None)
+        let entry = source_from_reference("owner/repository", None, home.path())
             .unwrap_or_else(|error| unreachable!("{error}"));
         let mut discovery = SkillDiscovery::default();
         discovery.winners.insert(
@@ -6907,7 +6926,7 @@ mod tests {
         // No "widget" directory exists directly under this synthetic CWD.
         let cwd = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
 
-        let entry = source_from_reference("owner/repository", None)
+        let entry = source_from_reference("owner/repository", None, home.path())
             .unwrap_or_else(|error| unreachable!("{error}"));
         let mut discovery = SkillDiscovery::default();
         discovery.winners.insert(

@@ -4,6 +4,8 @@ The repository registers independent CLI components through `clis/registry.just`
 
 The quality gate uses `cargo fmt --check`, strict pedantic Clippy with warnings denied, rustdoc warnings denied, dependency policy checks, and an 85% line coverage threshold. Production code forbids unsafe and unchecked unwrap/expect/panic-style exits; narrow allowances must explain why they are safe. Exact auxiliary-tool versions are stored centrally and bootstrap scripts install locked versions.
 
+Never run a built `skill-manager` binary against the real user home while validating or smoke testing. Every manual invocation must pass `--home <scratch-dir>` (or set `SKILL_MANAGER_HOME` to a scratch dir); `--home` takes precedence and is the safest choice. Automated tests already isolate the home this way — see `tests/operations_contract.rs` and `tests/home_isolation_contract.rs`.
+
 Release version is the root `VERSION`, Cargo metadata, and changelog heading. The release recipe first validates a clean tree, version parity, and main ancestry; it creates an annotated tag and prints the push command without pushing.
 
 PR CI runs the Linux GNU quality gate. Main also packages and inspects eight targets without publishing. Annotated SemVer `v…` tags reachable from `main` run the complete matrix, assemble archives, checksums, and release manifest, then publish a GitHub Release. A prerelease tag becomes a prerelease. Releases contain executable, readme, license, completions, and man page; crates.io, SBOMs, signatures, and attestations are intentionally out of scope for v0.1.

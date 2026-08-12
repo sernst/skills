@@ -4,6 +4,7 @@ All notable changes to the downloadable CLIs are documented here.
 
 ## 0.1.3 - 2026-08-10
 
+- Adds a global `--home DIR` flag that overrides the manager home for the whole invocation, taking precedence over `SKILL_MANAGER_HOME` and the operating system home, so validation and smoke testing can never touch real user state.
 - Makes contract tests platform-independent by no longer assuming Windows path separators.
 - Fixes `load`/`install` and `update`/`up` treating a bare skill name as a current-directory path; a literal operand now resolves case-insensitively against discovered skill names when it does not name a configured source, path, or GitHub reference.
 - Adds a hard error, `no configured source, directory, or skill named "NAME"`, for a bare operand that resolves to nothing, with a hint to run `skill-manager ls`.

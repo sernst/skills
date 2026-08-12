@@ -3,7 +3,8 @@
 ## Storage layout
 
 All manager-owned state is consolidated beneath the manager home (normally the
-user home, or `SKILL_MANAGER_HOME` when set):
+user home; overridden by `--home DIR`, or by `SKILL_MANAGER_HOME` when
+`--home` is not given):
 
 ```text
 ~/.skill-manager/

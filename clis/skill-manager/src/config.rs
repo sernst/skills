@@ -217,11 +217,15 @@ pub struct FileConfigRepository {
 impl FileConfigRepository {
     /// Build a repository for the current user's home directory.
     ///
+    /// `home_override` takes the same explicit `--home` override
+    /// [`manager_home`] accepts, ahead of `SKILL_MANAGER_HOME` and the OS
+    /// home; pass `None` to resolve the unoverridden current-user home.
+    ///
     /// # Errors
     ///
     /// Returns an error when the user home directory is unavailable.
-    pub fn for_current_user() -> Result<Self> {
-        Ok(Self::new(manager_home()?))
+    pub fn for_current_user(home_override: Option<&Path>) -> Result<Self> {
+        Ok(Self::new(manager_home(home_override)?))
     }
 
     /// Build a repository rooted at an explicit home, primarily for tests.
@@ -511,7 +515,7 @@ impl ConfigRepository for FileConfigRepository {
         }
         let migrated = schema < u64::from(CONFIG_SCHEMA_VERSION);
         if schema == 0 {
-            value = migrate_v0(&value)?;
+            value = migrate_v0(&value, &self.user_home)?;
         }
         if value
             .get("schema_version")
@@ -755,11 +759,11 @@ fn lock_is_contended(error: &std::io::Error) -> bool {
     false
 }
 
-fn migrate_v0(value: &Value) -> Result<Value> {
+fn migrate_v0(value: &Value, home: &Path) -> Result<Value> {
     let mut root = value.as_object().cloned().ok_or_else(|| {
         SkillManagerError::InvalidInput("configuration root must be a JSON object".into())
     })?;
-    migrate_v0_sources(&mut root)?;
+    migrate_v0_sources(&mut root, home)?;
     migrate_v0_targets(&mut root)?;
     root.insert("schema_version".into(), Value::Number(1_u32.into()));
     migrate_v1(&Value::Object(root))
@@ -819,7 +823,7 @@ fn migrate_v1_target_template(raw: &str) -> Result<PathBuf> {
     normalize_target_template(&segments[start..].join("/"))
 }
 
-fn migrate_v0_sources(root: &mut Map<String, Value>) -> Result<()> {
+fn migrate_v0_sources(root: &mut Map<String, Value>, home: &Path) -> Result<()> {
     let sources = match root.remove("sources") {
         Some(Value::Array(values)) => values,
         Some(_) => {
@@ -836,7 +840,7 @@ fn migrate_v0_sources(root: &mut Map<String, Value>) -> Result<()> {
     let mut explicit_local_paths = BTreeSet::new();
     let mut seen_source_ids = BTreeSet::new();
     for raw in sources {
-        let entry = coerce_v0_source(&raw)?;
+        let entry = coerce_v0_source(&raw, home)?;
         if entry.source_type == SourceType::Local
             && let Some(path) = &entry.path
         {
@@ -855,7 +859,7 @@ fn migrate_v0_sources(root: &mut Map<String, Value>) -> Result<()> {
             )
         })?;
         for (path, metadata) in directories {
-            let mut entry = source_from_reference(path, None)?;
+            let mut entry = source_from_reference(path, None, home)?;
             entry.id = legacy_local_source_id(&entry);
             let meta = metadata.as_object().ok_or_else(|| {
                 SkillManagerError::InvalidInput(format!(
@@ -986,9 +990,9 @@ fn legacy_local_source_id(source: &SourceEntry) -> String {
     format!("src_local_{}", &hex::encode(digest)[..12])
 }
 
-fn coerce_v0_source(raw: &Value) -> Result<SourceEntry> {
+fn coerce_v0_source(raw: &Value, home: &Path) -> Result<SourceEntry> {
     if let Some(reference) = raw.as_str() {
-        return source_from_reference(reference, None);
+        return source_from_reference(reference, None, home);
     }
     if let Some(alias) = raw.as_object().and_then(|object| object.get("alias"))
         && !alias.is_string()
@@ -1013,7 +1017,8 @@ fn coerce_v0_source(raw: &Value) -> Result<SourceEntry> {
             let path = entry.path.as_ref().ok_or_else(|| {
                 SkillManagerError::InvalidInput("legacy local source requires path".into())
             })?;
-            let mut normalized = source_from_reference(&path.to_string_lossy(), Some(entry.mode))?;
+            let mut normalized =
+                source_from_reference(&path.to_string_lossy(), Some(entry.mode), home)?;
             normalized.exclude = entry.exclude;
             normalized.cache_ttl_hours = entry.cache_ttl_hours;
             normalized.extra = entry.extra;
@@ -1200,10 +1205,18 @@ fn validate_source(source: &SourceEntry) -> Result<()> {
 
 /// Normalize a local path or supported GitHub reference into a source.
 ///
+/// `home` is the caller's already-resolved manager home (see
+/// [`manager_home`]), used only to expand a leading `~` in a local path
+/// reference; it is ignored for GitHub references.
+///
 /// # Errors
 ///
 /// Returns an error when a local path cannot be absolutized or the user home is unavailable.
-pub fn source_from_reference(raw: &str, mode: Option<SourceMode>) -> Result<SourceEntry> {
+pub fn source_from_reference(
+    raw: &str,
+    mode: Option<SourceMode>,
+    home: &Path,
+) -> Result<SourceEntry> {
     if let Some((owner, repo, reference, repo_path)) = parse_github_reference(raw) {
         let mut entry = SourceEntry {
             id: String::new(),
@@ -1224,7 +1237,7 @@ pub fn source_from_reference(raw: &str, mode: Option<SourceMode>) -> Result<Sour
         entry.id = derive_source_id(&entry);
         return Ok(entry);
     }
-    let expanded = expand_home(raw)?;
+    let expanded = expand_home(raw, home);
     let absolute = if expanded.is_absolute() {
         expanded
     } else {
@@ -1268,13 +1281,15 @@ pub fn source_from_reference(raw: &str, mode: Option<SourceMode>) -> Result<Sour
 /// Parse and normalize a reference into a location without changing source metadata.
 ///
 /// `mode` is supplied so local location changes never infer or change a source's
-/// collection/single layout based on whether the path currently exists.
+/// collection/single layout based on whether the path currently exists. `home`
+/// is the caller's already-resolved manager home, forwarded to
+/// [`source_from_reference`] for `~` expansion.
 ///
 /// # Errors
 ///
 /// Returns an error when a reference cannot be normalized safely.
-pub fn location_from_reference(raw: &str, mode: SourceMode) -> Result<SourceLocation> {
-    let entry = source_from_reference(raw, Some(mode))?;
+pub fn location_from_reference(raw: &str, mode: SourceMode, home: &Path) -> Result<SourceLocation> {
+    let entry = source_from_reference(raw, Some(mode), home)?;
     source_location(&entry)
 }
 
@@ -1592,26 +1607,36 @@ fn lexically_normalized(path: &Path) -> PathBuf {
     normalized
 }
 
-fn expand_home(raw: &str) -> Result<PathBuf> {
+/// Expand a leading `~` in `raw` against `home`, the already-resolved manager
+/// home (see [`manager_home`]). `home` must be the SAME value the caller
+/// resolved `--home`/`SKILL_MANAGER_HOME`/the OS home into; this function
+/// never re-resolves it, so a caller cannot silently fall back to the real
+/// OS home behind an overridden home.
+fn expand_home(raw: &str, home: &Path) -> PathBuf {
     if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
-        let home = manager_home()?;
         if raw == "~" {
-            return Ok(home);
+            return home.to_path_buf();
         }
-        return Ok(home.join(&raw[2..]));
+        return home.join(&raw[2..]);
     }
-    Ok(PathBuf::from(raw))
+    PathBuf::from(raw)
 }
 
 /// Resolve skill-manager's home directory.
 ///
-/// `SKILL_MANAGER_HOME` is an explicit automation/test override controlling
-/// configuration, cache, `~` source expansion, and all built-in targets.
+/// Precedence is `home_override` (the `--home` flag, threaded explicitly by
+/// every caller from the value `main` parsed once), then `SKILL_MANAGER_HOME`
+/// as an explicit automation/test override, then the operating system home.
+/// The winning value controls configuration, cache, `~` source expansion, and
+/// all built-in targets.
 ///
 /// # Errors
 ///
-/// Returns an error when neither the override nor the operating system supplies a home.
-pub fn manager_home() -> Result<PathBuf> {
+/// Returns an error when neither override nor the operating system supplies a home.
+pub fn manager_home(home_override: Option<&Path>) -> Result<PathBuf> {
+    if let Some(home) = home_override {
+        return Ok(home.to_path_buf());
+    }
     if let Some(override_home) = std::env::var_os("SKILL_MANAGER_HOME")
         && !override_home.is_empty()
     {
@@ -1754,10 +1779,13 @@ fn push_unicode_escape(output: &mut String, code: u32) {
 
 /// Find a configured source by ID, name, unique label, path, or canonical reference.
 ///
+/// `home` is the caller's already-resolved manager home, forwarded to
+/// [`location_from_reference`] for `~` expansion of a local-path selector.
+///
 /// # Errors
 ///
 /// Returns an ambiguity error when multiple sources share the selected label.
-pub fn find_source_index(config: &Config, selector: &str) -> Result<Option<usize>> {
+pub fn find_source_index(config: &Config, selector: &str, home: &Path) -> Result<Option<usize>> {
     let selector_folded = fold(selector);
     let direct = config.sources.iter().position(|source| {
         fold(&source.id) == selector_folded || fold(&source.name) == selector_folded
@@ -1765,7 +1793,7 @@ pub fn find_source_index(config: &Config, selector: &str) -> Result<Option<usize
     if direct.is_some() {
         return Ok(direct);
     }
-    if let Ok(location) = location_from_reference(selector, SourceMode::Collection)
+    if let Ok(location) = location_from_reference(selector, SourceMode::Collection, home)
         && let Some(index) = config.sources.iter().position(|source| {
             source_location(source).is_ok_and(|active| locations_equal(&active, &location))
         })
@@ -1980,6 +2008,8 @@ pub fn fold(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use indexmap::IndexMap;
     use serde_json::json;
 
@@ -1991,6 +2021,14 @@ mod tests {
         source_reference, validate_config, validate_source,
     };
     use crate::domain::{Scope, SourceEntry, SourceLocation, SourceMode, SourceType, TargetEntry};
+
+    /// Placeholder manager home for call sites whose reference is a GitHub
+    /// shorthand or an already-absolute local path, neither of which is
+    /// `~`-prefixed; `expand_home` never dereferences this value unless the
+    /// raw string begins with `~`, so a fixed nonexistent path is safe here.
+    fn unused_home() -> PathBuf {
+        PathBuf::from("unused-manager-home")
+    }
 
     fn write_absent_backup_record(
         repository: &FileConfigRepository,
@@ -2306,7 +2344,7 @@ mod tests {
 
     #[test]
     fn source_id_is_stable() {
-        let source = source_from_reference("owner/repo:main/team", None)
+        let source = source_from_reference("owner/repo:main/team", None, &unused_home())
             .unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(source.id, derive_source_id(&source));
         assert!(source.id.starts_with("src_"));
@@ -2315,8 +2353,9 @@ mod tests {
 
     #[test]
     fn salted_source_id_uses_canonical_identity_bytes_and_decimal_salt() {
-        let source = source_from_reference("owner/repo", Some(SourceMode::Collection))
-            .unwrap_or_else(|error| unreachable!("{error}"));
+        let source =
+            source_from_reference("owner/repo", Some(SourceMode::Collection), &unused_home())
+                .unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(derive_salted_source_id(&source, 1), "src_e5e18bfaf9b8");
         assert_eq!(
             derive_salted_source_id(&source, 1),
@@ -2489,8 +2528,9 @@ mod tests {
 
     #[test]
     fn source_references_cover_urls_shorthand_local_identity_and_lookup() {
-        let shorthand = source_from_reference("owner/repo:feature/team/skills", None)
-            .unwrap_or_else(|error| unreachable!("{error}"));
+        let shorthand =
+            source_from_reference("owner/repo:feature/team/skills", None, &unused_home())
+                .unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(shorthand.source_type, SourceType::GitHub);
         assert_eq!(shorthand.r#ref.as_deref(), Some("feature"));
         assert_eq!(shorthand.repo_path.as_deref(), Some("team/skills"));
@@ -2502,6 +2542,7 @@ mod tests {
         let url = source_from_reference(
             "https://github.com/owner/repo.git/tree/main/nested/skills",
             None,
+            &unused_home(),
         )
         .unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(url.owner.as_deref(), Some("owner"));
@@ -2510,7 +2551,7 @@ mod tests {
         assert_eq!(url.repo_path.as_deref(), Some("nested/skills"));
 
         let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
-        let local = source_from_reference(&root.path().to_string_lossy(), None)
+        let local = source_from_reference(&root.path().to_string_lossy(), None, root.path())
             .unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(local.source_type, SourceType::Local);
         let config = Config {
@@ -2523,7 +2564,7 @@ mod tests {
             "OWNER/REPO:feature/team/skills",
         ] {
             assert_eq!(
-                find_source_index(&config, selector)
+                find_source_index(&config, selector, root.path())
                     .unwrap_or_else(|error| unreachable!("{error}")),
                 Some(0)
             );
@@ -2535,13 +2576,15 @@ mod tests {
                     .path
                     .as_ref()
                     .unwrap_or_else(|| unreachable!())
-                    .to_string_lossy()
+                    .to_string_lossy(),
+                root.path(),
             )
             .unwrap_or_else(|error| unreachable!("{error}")),
             Some(1)
         );
         assert_eq!(
-            find_source_index(&config, "missing").unwrap_or_else(|error| unreachable!("{error}")),
+            find_source_index(&config, "missing", root.path())
+                .unwrap_or_else(|error| unreachable!("{error}")),
             None
         );
 
@@ -2552,10 +2595,10 @@ mod tests {
 
     #[test]
     fn source_lookup_accepts_unique_labels_and_rejects_ambiguous_labels() {
-        let mut first = source_from_reference("owner/first", None)
+        let mut first = source_from_reference("owner/first", None, &unused_home())
             .unwrap_or_else(|error| unreachable!("{error}"));
         first.label = "Team Skills".into();
-        let mut second = source_from_reference("owner/second", None)
+        let mut second = source_from_reference("owner/second", None, &unused_home())
             .unwrap_or_else(|error| unreachable!("{error}"));
         second.label = "Other Skills".into();
         let mut config = Config {
@@ -2563,14 +2606,15 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(
-            find_source_index(&config, "TEAM SKILLS")
+            find_source_index(&config, "TEAM SKILLS", &unused_home())
                 .unwrap_or_else(|error| unreachable!("{error}")),
             Some(0)
         );
         config.sources[1].label = "team skills".into();
-        assert!(find_source_index(&config, "Team Skills").is_err());
+        assert!(find_source_index(&config, "Team Skills", &unused_home()).is_err());
         assert_eq!(
-            find_source_index(&config, "first").unwrap_or_else(|error| unreachable!("{error}")),
+            find_source_index(&config, "first", &unused_home())
+                .unwrap_or_else(|error| unreachable!("{error}")),
             Some(0),
             "unique names take precedence even when labels collide"
         );
@@ -2646,16 +2690,16 @@ mod tests {
         assert!(repository.save(&active, &invalid_schema).is_err());
 
         let mut negative_ttl = Config::default();
-        let mut source = source_from_reference("owner/repo", None)
+        let mut source = source_from_reference("owner/repo", None, home.path())
             .unwrap_or_else(|error| unreachable!("{error}"));
         source.cache_ttl_hours = Some(-1);
         negative_ttl.sources.push(source);
         assert!(repository.save(&active, &negative_ttl).is_err());
 
         let mut duplicate = Config::default();
-        let one = source_from_reference("owner/one", None)
+        let one = source_from_reference("owner/one", None, home.path())
             .unwrap_or_else(|error| unreachable!("{error}"));
-        let mut two = source_from_reference("owner/two", None)
+        let mut two = source_from_reference("owner/two", None, home.path())
             .unwrap_or_else(|error| unreachable!("{error}"));
         two.name.clone_from(&one.name);
         duplicate.sources = vec![one, two];
@@ -2730,7 +2774,8 @@ mod tests {
                 }
             }
         });
-        let migrated = migrate_v0(&value).unwrap_or_else(|error| unreachable!("{error}"));
+        let migrated =
+            migrate_v0(&value, home.path()).unwrap_or_else(|error| unreachable!("{error}"));
         let config: Config =
             serde_json::from_value(migrated).unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(config.sources.len(), 4);
@@ -2874,7 +2919,8 @@ mod tests {
                 }
             }
         });
-        let migrated = migrate_v0(&value).unwrap_or_else(|error| unreachable!("{error}"));
+        let migrated =
+            migrate_v0(&value, home.path()).unwrap_or_else(|error| unreachable!("{error}"));
         let config: Config =
             serde_json::from_value(migrated).unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(config.sources.len(), 2);
@@ -2950,7 +2996,7 @@ mod tests {
                 }
             }
         });
-        let error = migrate_v0(&value)
+        let error = migrate_v0(&value, &unused_home())
             .err()
             .unwrap_or_else(|| unreachable!("case-folded aliases must collide"));
         assert!(
@@ -2969,7 +3015,7 @@ mod tests {
             json!({"targets": []}),
             json!({"sources": [{"type": "github", "owner": "", "repo": ""}]}),
         ] {
-            assert!(migrate_v0(&value).is_err(), "{value}");
+            assert!(migrate_v0(&value, &unused_home()).is_err(), "{value}");
         }
 
         let base = SourceEntry {
@@ -3054,7 +3100,7 @@ mod tests {
         }
 
         let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
-        let mut source = source_from_reference("owner/repo:main/skills", None)
+        let mut source = source_from_reference("owner/repo:main/skills", None, root.path())
             .unwrap_or_else(|error| unreachable!("{error}"));
         source
             .extra
@@ -3081,7 +3127,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
         let repository = FileConfigRepository::new(root.path());
         let config_path = root.path().join(".skill-manager.config.json");
-        let mut source = source_from_reference("owner/repo:main/Skills", None)
+        let mut source = source_from_reference("owner/repo:main/Skills", None, root.path())
             .unwrap_or_else(|error| unreachable!("{error}"));
         source.repo_path = Some(r"Skills\Team".into());
         source.alternate = Some(SourceLocation::Local {
@@ -3160,7 +3206,7 @@ mod tests {
         let repository = FileConfigRepository::new(root.path());
         let config_path = root.path().join(".skill-manager.config.json");
         let location = root.path().join("skills");
-        let mut source = source_from_reference(&location.to_string_lossy(), None)
+        let mut source = source_from_reference(&location.to_string_lossy(), None, root.path())
             .unwrap_or_else(|error| unreachable!("{error}"));
         source.alternate = Some(SourceLocation::Local {
             path: location.clone(),
@@ -3198,7 +3244,7 @@ mod tests {
         }
         input.push("clamped-location-that-does-not-exist");
 
-        let source = source_from_reference(&input.to_string_lossy(), None)
+        let source = source_from_reference(&input.to_string_lossy(), None, temporary.path())
             .unwrap_or_else(|error| unreachable!("{error}"));
         let location = source_location(&source).unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(
@@ -3212,7 +3258,7 @@ mod tests {
     #[test]
     fn own_location_duplicates_are_invalid_but_legacy_cross_source_collisions_load() {
         let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
-        let mut first = source_from_reference(&root.path().to_string_lossy(), None)
+        let mut first = source_from_reference(&root.path().to_string_lossy(), None, root.path())
             .unwrap_or_else(|error| unreachable!("{error}"));
         first.name = "first".into();
         first.alternate =

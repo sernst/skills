@@ -48,7 +48,7 @@ fn main() -> ExitCode {
     if let Some(outcome) = run_generation(&command, &mut reporter) {
         return outcome;
     }
-    let (repository, home) = match production_repository() {
+    let (repository, home) = match production_repository(cli.home.as_deref()) {
         Ok(value) => value,
         Err(error) => {
             report_error(&mut reporter, &error);

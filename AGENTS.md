@@ -60,3 +60,9 @@ Other docs in `clis/skill-manager/docs/`:
   behavior differences from the legacy Python manager.
 - [`parity-ledger.md`](clis/skill-manager/docs/parity-ledger.md) — test
   traceability between the Python and Rust implementations.
+
+**Never run a built `skill-manager` binary against your real user home while
+validating, smoke testing, or otherwise manually exercising it.** Always pass
+`--home <scratch-dir>` (it outranks `SKILL_MANAGER_HOME` and the OS home).
+A prior session skipped this and corrupted live configuration that had to be
+manually undone — treat it as a hard rule, not a suggestion.

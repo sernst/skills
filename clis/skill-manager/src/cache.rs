@@ -1030,7 +1030,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
         let content = root.path().join("content");
         fs::create_dir_all(content.join("team")).unwrap_or_else(|error| unreachable!("{error}"));
-        let mut source = source_from_reference("owner/repo:main/team", None)
+        let mut source = source_from_reference("owner/repo:main/team", None, root.path())
             .unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(
             select_repo_path(&content, &source).unwrap_or_else(|error| unreachable!("{error}")),

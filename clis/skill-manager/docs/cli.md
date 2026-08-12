@@ -6,6 +6,9 @@ Running without a command is `status`; `ls` and `list` are aliases. `--json`
 emits NDJSON and implies `--no-input`. `--verbose` adds advanced human details
 and full import paths without changing JSON. `--color auto` colors only a TTY
 and honors `NO_COLOR`; `always` colors even redirected output; `never` is plain.
+`--home DIR` overrides the manager home for the whole invocation, ahead of
+`SKILL_MANAGER_HOME` and the operating system home; see
+[Global and project scopes](#global-and-project-scopes) below.
 
 | Command | Purpose |
 | --- | --- |
@@ -31,11 +34,11 @@ target. The built-ins resolve to `.claude/skills`, `.agents/skills`, and
 ## Global and project scopes
 
 Every built-in and custom target has two possible locations. `--global`/`-g`
-resolves its root-relative template below the manager home (including the
-`SKILL_MANAGER_HOME` override); `--project`/`-p` resolves it below the exact
-current working directory. The manager does not search for a Git root or an
-ancestor directory. Project deployments override global deployments for status
-and effective-skill selection.
+resolves its root-relative template below the manager home (`--home`, then
+`SKILL_MANAGER_HOME`, then the OS home, in that order); `--project`/`-p`
+resolves it below the exact current working directory. The manager does not
+search for a Git root or an ancestor directory. Project deployments override
+global deployments for status and effective-skill selection.
 
 The scope flags are mutually exclusive.
 

@@ -32,6 +32,14 @@ pub struct Cli {
     /// Show advanced details and full paths in human output.
     #[arg(long, global = true)]
     pub verbose: bool,
+    /// Override the manager home; beats `SKILL_MANAGER_HOME` and the OS home.
+    #[arg(
+        long,
+        global = true,
+        value_name = "DIR",
+        value_parser = parse_home_override
+    )]
+    pub home: Option<PathBuf>,
     /// Requested operation; omitted means `status`.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -43,6 +51,24 @@ impl Cli {
     pub fn machine_mode(&self) -> bool {
         self.json.is_some() || self.json_input || self.input.is_some()
     }
+}
+
+/// Reject a blank or whitespace-only `--home` value at parse time.
+///
+/// An empty `PathBuf` still wins the `--home` > `SKILL_MANAGER_HOME` > OS
+/// home precedence order, which would silently root `.skill-manager` in the
+/// current working directory instead of failing loudly — exactly the
+/// isolation hazard `--home` exists to prevent. The pre-existing
+/// `SKILL_MANAGER_HOME` environment variable already ignores an empty value
+/// (see `manager_home` in `config.rs`); this parser keeps the flag at least
+/// as strict by rejecting the value outright rather than falling through.
+fn parse_home_override(raw: &str) -> Result<PathBuf, String> {
+    if raw.trim().is_empty() {
+        return Err(
+            "--home must not be blank; provide a directory path or omit the flag".to_owned(),
+        );
+    }
+    Ok(PathBuf::from(raw))
 }
 
 /// Color selection for human output.
@@ -688,5 +714,25 @@ mod tests {
             ));
         }
         assert!(Cli::try_parse_from(["skill-manager", "configs", "--raw", "reset"]).is_err());
+    }
+
+    #[test]
+    fn blank_home_override_is_rejected_at_parse_time() {
+        for blank in ["", "   ", "\t"] {
+            let error = Cli::try_parse_from(["skill-manager", "--home", blank, "status"])
+                .err()
+                .unwrap_or_else(|| unreachable!("blank --home {blank:?} must fail to parse"));
+            assert!(
+                error.to_string().contains("--home must not be blank"),
+                "unexpected error for {blank:?}: {error}"
+            );
+        }
+
+        let parsed = Cli::try_parse_from(["skill-manager", "--home", "some/dir", "status"])
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            parsed.home.as_deref(),
+            Some(std::path::Path::new("some/dir"))
+        );
     }
 }
