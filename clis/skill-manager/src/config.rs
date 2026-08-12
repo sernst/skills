@@ -1635,16 +1635,42 @@ pub(crate) fn expand_home(raw: &str, home: &Path) -> PathBuf {
 /// Returns an error when neither override nor the operating system supplies a home.
 pub fn manager_home(home_override: Option<&Path>) -> Result<PathBuf> {
     if let Some(home) = home_override {
-        return Ok(home.to_path_buf());
+        return absolutize_home(home.to_path_buf());
     }
     if let Some(override_home) = std::env::var_os("SKILL_MANAGER_HOME")
         && !override_home.is_empty()
     {
-        return Ok(PathBuf::from(override_home));
+        return absolutize_home(PathBuf::from(override_home));
     }
-    home::home_dir().ok_or_else(|| {
-        SkillManagerError::InvalidInput("could not determine the user home directory".into())
-    })
+    home::home_dir()
+        .ok_or_else(|| {
+            SkillManagerError::InvalidInput("could not determine the user home directory".into())
+        })
+        .and_then(absolutize_home)
+}
+
+/// Resolve a manager-home value to an absolute, lexically clean path.
+///
+/// A relative `--home` or `SKILL_MANAGER_HOME` value must be made absolute
+/// before it is threaded into any derived path, or its raw `.`/`..`/mixed
+/// separators leak into cache staging paths and trip the journal's own
+/// path-safety validation (which is correct — the input was wrong). Both
+/// override sources funnel through here so they cannot diverge.
+///
+/// `canonicalize` is deliberately NOT used: the home is frequently created by
+/// the very command being run, so it may not exist yet, and `canonicalize`
+/// fails on missing paths. Instead a relative value is joined against the
+/// current directory and `.`/`..` segments are collapsed lexically, which also
+/// normalizes mixed separators, a trailing separator, and a bare `.`.
+fn absolutize_home(path: PathBuf) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map_err(|error| SkillManagerError::io(".", error))?
+            .join(path)
+    };
+    Ok(portable_path(&lexically_normalized(&absolute)))
 }
 
 fn parse_github_reference(raw: &str) -> Option<(String, String, Option<String>, Option<String>)> {
@@ -2016,9 +2042,9 @@ mod tests {
     use super::{
         BuiltinTargetSettings, Config, ConfigRepository, FileConfigRepository,
         derive_salted_source_id, derive_source_id, ensure_ascii, find_source_index,
-        is_builtin_name, locations_equal, migrate_v0, normalize_target_template, paths_equal,
-        resolved_targets, resolved_targets_for_scope, source_from_reference, source_location,
-        source_reference, validate_config, validate_source,
+        is_builtin_name, locations_equal, manager_home, migrate_v0, normalize_target_template,
+        paths_equal, resolved_targets, resolved_targets_for_scope, source_from_reference,
+        source_location, source_reference, validate_config, validate_source,
     };
     use crate::domain::{Scope, SourceEntry, SourceLocation, SourceMode, SourceType, TargetEntry};
 
@@ -3277,5 +3303,45 @@ mod tests {
             validate_config(&config, &root.path().join("config.json")).is_ok(),
             "pre-existing cross-source collisions remain loadable"
         );
+    }
+
+    /// A `--home` override carrying `.`/`..` segments must resolve to the
+    /// lexically collapsed absolute path, not be threaded through verbatim.
+    /// The raw form is what leaked into cache staging paths and tripped the
+    /// journal's path-safety validation.
+    #[test]
+    fn manager_home_collapses_dot_and_parent_segments_in_an_absolute_override() {
+        let base = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let messy = base.path().join(".").join("a").join("..").join("b");
+        let expected = base.path().join("b");
+        let resolved = manager_home(Some(&messy)).unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(resolved, expected);
+    }
+
+    /// A trailing separator on an override must normalize away so the resolved
+    /// home matches the same path without it.
+    #[test]
+    fn manager_home_normalizes_a_trailing_separator() {
+        let base = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let expected = base.path().join("c");
+        let mut trailing = expected.clone().into_os_string();
+        trailing.push(std::path::MAIN_SEPARATOR.to_string());
+        let resolved = manager_home(Some(std::path::Path::new(&trailing)))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(resolved, expected);
+    }
+
+    /// On Windows a mixed-separator override must normalize to the platform
+    /// spelling rather than leave a foreign separator in a derived path.
+    #[cfg(windows)]
+    #[test]
+    fn manager_home_normalizes_mixed_separators_on_windows() {
+        let base = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let mut mixed = base.path().join("mixed").into_os_string();
+        mixed.push("/seg");
+        let expected = base.path().join("mixed").join("seg");
+        let resolved = manager_home(Some(std::path::Path::new(&mixed)))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(resolved, expected);
     }
 }

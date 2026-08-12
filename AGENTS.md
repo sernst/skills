@@ -77,9 +77,15 @@ Pass `FROM` as an already-expanded absolute path, not a literal `~`. The CLI
 expands a leading `~` against the *active* `--home`, so a literal `~` here
 would resolve to the scratch home — the same path as `TO` — and the command
 would refuse the identical operands. Let the shell expand the real home
-instead (`$HOME` in PowerShell, `~` in POSIX shells before it reaches the CLI),
-and give `--home`/`TO` an absolute scratch path so every following command
-resolves the same home cleanly:
+instead (`$HOME` in PowerShell, `~` in POSIX shells before it reaches the CLI).
+
+A relative `--home` is supported — it is normalized to an absolute path
+(against the current directory at invocation time) before anything derives a
+path from it, so relative and absolute values resolve the same store. Prefer
+an absolute scratch path anyway when a smoke test spans several commands: a
+relative value re-resolves against whatever the CWD happens to be for each
+invocation, so an absolute path keeps every command pinned to the identical
+home regardless of where it runs:
 
 ```powershell
 PS> $smoke = Join-Path $env:TEMP 'skill-manager-smoke'

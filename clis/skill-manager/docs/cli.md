@@ -7,7 +7,9 @@ emits NDJSON and implies `--no-input`. `--verbose` adds advanced human details
 and full import paths without changing JSON. `--color auto` colors only a TTY
 and honors `NO_COLOR`; `always` colors even redirected output; `never` is plain.
 `--home DIR` overrides the manager home for the whole invocation, ahead of
-`SKILL_MANAGER_HOME` and the operating system home; see
+`SKILL_MANAGER_HOME` and the operating system home; a relative value (and a
+relative `SKILL_MANAGER_HOME`) is normalized to an absolute, lexically clean
+path against the current directory before any derived path is built. See
 [Global and project scopes](#global-and-project-scopes) below.
 
 | Command | Purpose |

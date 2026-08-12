@@ -4,7 +4,8 @@
 
 All manager-owned state is consolidated beneath the manager home (normally the
 user home; overridden by `--home DIR`, or by `SKILL_MANAGER_HOME` when
-`--home` is not given):
+`--home` is not given, either of which may be relative and is normalized to an
+absolute, lexically clean path against the current directory):
 
 ```text
 ~/.skill-manager/
