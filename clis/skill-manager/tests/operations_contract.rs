@@ -6043,7 +6043,8 @@ fn load_emits_a_structured_plan_event_before_applying() {
         serde_json::json!({ "mode": "inferred", "value": "global" }),
         "the machine stream reports the resolved selection, never gated columns"
     );
-    let home_root = home.path().to_str().expect("utf8 home").to_owned();
+    let claude_destination = home.path().join(".claude").join("skills");
+    let shared_destination = home.path().join(".agents").join("skills");
     assert_eq!(
         data["destinations"],
         serde_json::json!([
@@ -6053,7 +6054,7 @@ fn load_emits_a_structured_plan_event_before_applying() {
                 "label": "claude · global",
                 "target": "claude",
                 "scope": "global",
-                "path": format!("{home_root}\\.claude\\skills")
+                "path": claude_destination.display().to_string()
             },
             {
                 "id": "shared:global",
@@ -6061,7 +6062,7 @@ fn load_emits_a_structured_plan_event_before_applying() {
                 "label": "shared · global",
                 "target": "shared",
                 "scope": "global",
-                "path": format!("{home_root}\\.agents\\skills")
+                "path": shared_destination.display().to_string()
             }
         ])
     );
@@ -6282,6 +6283,8 @@ Dry run — no changes were made.\n",
 fn copy_yes_renders_the_plan_then_applies_with_a_summary_footer() {
     let (home, source) = copy_review_fixture();
     let dest = home.path().join("vendor").join("skills");
+    let copied_drafting = dest.join("drafting-commit-message");
+    let copied_writing = dest.join("writing-for-agents");
 
     let output = cli(home.path())
         .args([
@@ -6308,11 +6311,13 @@ writing-for-agents       new copy, 1 file, +1/-0  copy
 
 2 changes to 1 destination: 2 new
 
-Copied drafting-commit-message -> {dest_display}\\drafting-commit-message\n\
-Copied writing-for-agents -> {dest_display}\\writing-for-agents\n\
+Copied drafting-commit-message -> {copied_drafting}\n\
+Copied writing-for-agents -> {copied_writing}\n\
 \n\
 completed: 2 skills copied (2 new)\n",
-            dest_display = dest.display()
+            dest_display = dest.display(),
+            copied_drafting = copied_drafting.display(),
+            copied_writing = copied_writing.display()
         )
     );
     assert!(!stderr_of(&output).contains("Copy these"));
@@ -6366,6 +6371,8 @@ Dry run — no changes were made.\n",
 fn copy_has_no_identical_hiding_and_reports_overwrites_even_when_content_matches() {
     let (home, source) = copy_review_fixture();
     let dest = home.path().join("vendor").join("skills");
+    let overwritten_drafting = dest.join("drafting-commit-message");
+    let overwritten_writing = dest.join("writing-for-agents");
     cli(home.path())
         .args([
             "copy",
@@ -6402,11 +6409,13 @@ writing-for-agents       no file changes  update
 
 2 changes to 1 destination: 2 overwrite
 
-Overwrote drafting-commit-message -> {dest_display}\\drafting-commit-message\n\
-Overwrote writing-for-agents -> {dest_display}\\writing-for-agents\n\
+Overwrote drafting-commit-message -> {overwritten_drafting}\n\
+Overwrote writing-for-agents -> {overwritten_writing}\n\
 \n\
 completed: 2 skills copied (2 overwritten)\n",
-            dest_display = dest.display()
+            dest_display = dest.display(),
+            overwritten_drafting = overwritten_drafting.display(),
+            overwritten_writing = overwritten_writing.display()
         ),
         "copy reports the unchanged content as an overwrite rather than hiding the row"
     );
