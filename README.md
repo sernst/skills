@@ -14,77 +14,46 @@ want to inspect or adapt the instructions.
 
 ## Install
 
-Download the archive for your operating system and CPU from the
-[latest release](https://github.com/sernst/skills/releases/latest), verify it
-against `SHA256SUMS`, extract `skill-manager` (or `skill-manager.exe`), and put
-it on `PATH`.
+Install or upgrade `skill-manager` with the script for your platform. Each one
+resolves the latest release, verifies the download against `SHA256SUMS`, and
+prompts for an install location.
 
-For a complete, paste-into-an-agent installation and upgrade procedure on
-Windows, macOS, and Linux, use
-[`install.skill-manager.md`](./install.skill-manager.md). The release archive
-also includes shell completions and a man page.
+macOS and Linux:
 
-### Install from the terminal
-
-Each snippet resolves the latest release, downloads the archive for your CPU,
-extracts just the `skill-manager` binary into the current directory, and
-removes the download. They skip `SHA256SUMS` verification for brevity; use
-`install.skill-manager.md` above for the fully verified procedure.
+```console
+$ curl -fsSL https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.sh | sh
+```
 
 Windows (PowerShell):
 
 ```powershell
-$ErrorActionPreference = 'Stop'
-$repo  = 'sernst/skills'
-$tag   = (Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest").tag_name
-$arch  = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
-$asset = "skill-manager-$tag-$arch-pc-windows-msvc.zip"
-$tmp   = Join-Path $env:TEMP "skill-manager-$tag"
-New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-Invoke-WebRequest "https://github.com/$repo/releases/download/$tag/$asset" `
-  -OutFile (Join-Path $tmp $asset)
-Expand-Archive -Path (Join-Path $tmp $asset) -DestinationPath $tmp -Force
-Get-ChildItem -Path $tmp -Recurse -Filter 'skill-manager.exe' |
-  Select-Object -First 1 | Move-Item -Destination . -Force
-Remove-Item -Recurse -Force $tmp
+powershell -c "irm https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.ps1 | iex"
 ```
 
-macOS (bash):
+### Customize an installation
 
-```bash
-set -euo pipefail
-repo="sernst/skills"
-tag=$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" \
-  | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
-arch=$(uname -m)
-if [ "$arch" = "arm64" ]; then arch=aarch64; else arch=x86_64; fi
-asset="skill-manager-$tag-$arch-apple-darwin.tar.gz"
-tmp=$(mktemp -d)
-curl -fsSL -o "$tmp/$asset" "https://github.com/$repo/releases/download/$tag/$asset"
-tar -xzf "$tmp/$asset" -C "$tmp"
-mv "$tmp"/*/skill-manager .
-rm -rf "$tmp"
+On macOS and Linux, pass `--version`, `--dir`, `--yes`, `--force`, or
+`--no-modify-path` through the pipe:
+
+```console
+$ curl -fsSL https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.sh | sh -s -- --version 0.1.3 --dir "$HOME/.local/bin" --yes --no-modify-path
 ```
 
-Linux (bash, static musl build):
+The scripts also read `SKILL_MANAGER_VERSION`, `SKILL_MANAGER_INSTALL_DIR`,
+`SKILL_MANAGER_INSTALL_YES=1`, and `SKILL_MANAGER_NO_MODIFY_PATH=1`. Because
+`irm | iex` cannot receive parameters, use those environment variables on
+Windows:
 
-```bash
-set -euo pipefail
-repo="sernst/skills"
-tag=$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" \
-  | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
-arch=$(uname -m)
-if [ "$arch" = "aarch64" ]; then arch=aarch64; else arch=x86_64; fi
-asset="skill-manager-$tag-$arch-unknown-linux-musl.tar.gz"
-tmp=$(mktemp -d)
-curl -fsSL -o "$tmp/$asset" "https://github.com/$repo/releases/download/$tag/$asset"
-tar -xzf "$tmp/$asset" -C "$tmp"
-mv "$tmp"/*/skill-manager .
-rm -rf "$tmp"
+```powershell
+$env:SKILL_MANAGER_INSTALL_DIR = 'C:\tools\bin'
+powershell -c "irm https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.ps1 | iex"
 ```
 
-Run `./skill-manager --version` (or `.\skill-manager.exe --version` on
-Windows) to confirm it landed, then move the binary onto `PATH`.
+For a manual, independently verified installation, use the
+[latest release](https://github.com/sernst/skills/releases/latest) and its
+`SHA256SUMS`. For agent-assisted installation, use
+[`install.skill-manager.md`](./install.skill-manager.md). Release archives also
+include shell completions and a man page.
 
 ## Five-minute quick start
 

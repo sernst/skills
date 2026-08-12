@@ -12,7 +12,9 @@ conversational operation; the
 
 ## Install
 
-Download the archive matching your operating system and CPU from the GitHub release, unpack it, and add the executable to `PATH`. Archives include shell completions and a man page.
+Install with the macOS/Linux or Windows one-liner in the repository
+[README](../../README.md#install). It also covers customization and manual,
+checksum-verified release installation.
 
 ## Quick start
 

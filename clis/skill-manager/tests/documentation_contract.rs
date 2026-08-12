@@ -882,8 +882,110 @@ fn machine_requirements_and_all_target_semantics_match_production() {
     }
 }
 
+fn values_after_marker(source: &str, marker: &str, terminator: char) -> BTreeSet<String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let start = line.find(marker)?;
+            let value = &line[start + marker.len()..];
+            let end = value.find(terminator)?;
+            Some(value[..end].to_owned())
+        })
+        .collect()
+}
+
+fn assert_installer_targets_are_released(
+    installer: &str,
+    architectures: &BTreeSet<String>,
+    platforms: &BTreeSet<String>,
+    released_targets: &BTreeSet<String>,
+) {
+    assert!(
+        !architectures.is_empty(),
+        "{installer} installer must map at least one architecture"
+    );
+    assert!(
+        !platforms.is_empty(),
+        "{installer} installer must map at least one platform"
+    );
+    for architecture in architectures {
+        for platform in platforms {
+            let target = format!("{architecture}-{platform}");
+            assert!(
+                released_targets.contains(&target),
+                "{installer} installer references release target absent from the canonical matrix: {target}"
+            );
+        }
+    }
+}
+
+fn assert_posix_installer_release_contract(source: &str, released_targets: &BTreeSet<String>) {
+    let architectures = values_after_marker(source, "arch=\"", '"');
+    let platforms = values_after_marker(source, "platform=\"", '"');
+    assert_eq!(
+        architectures,
+        BTreeSet::from(["aarch64".to_owned(), "x86_64".to_owned()]),
+        "POSIX installer must map both released architectures"
+    );
+    assert_installer_targets_are_released("POSIX", &architectures, &platforms, released_targets);
+    assert_eq!(
+        platforms,
+        BTreeSet::from(["apple-darwin".to_owned(), "unknown-linux-musl".to_owned(),]),
+        "POSIX installer must map its supported operating systems to release platforms"
+    );
+    assert_eq!(
+        values_after_marker(source, "archive_ext=\"", '"'),
+        BTreeSet::from(["tar.gz".to_owned()]),
+        "POSIX installer must request tar.gz release archives"
+    );
+    assert!(
+        source
+            .lines()
+            .any(|line| line.trim_start().starts_with("asset=") && line.contains("archive_ext")),
+        "POSIX asset name must use its archive extension mapping"
+    );
+    assert!(
+        source.contains("SHA256SUMS")
+            && (source.contains("sha256sum") || source.contains("shasum"))
+            && source.contains("checksum mismatch"),
+        "POSIX installer must verify downloads against SHA256SUMS"
+    );
+}
+
+fn assert_windows_installer_release_contract(source: &str, released_targets: &BTreeSet<String>) {
+    let architectures = values_after_marker(source, "$arch = '", '\'');
+    let platforms = values_after_marker(source, "$target = \"$arch-", '"');
+    assert_eq!(
+        architectures,
+        BTreeSet::from(["aarch64".to_owned(), "x86_64".to_owned()]),
+        "Windows installer must map both released architectures"
+    );
+    assert_installer_targets_are_released("Windows", &architectures, &platforms, released_targets);
+    assert_eq!(
+        platforms,
+        BTreeSet::from(["pc-windows-msvc".to_owned()]),
+        "Windows installer must map Windows to its released platform"
+    );
+    let assets = values_after_marker(source, "$asset = \"", '"');
+    assert!(
+        !assets.is_empty()
+            && assets.iter().all(|asset| {
+                Path::new(asset)
+                    .extension()
+                    .is_some_and(|extension| extension == "zip")
+            }),
+        "Windows installer must request zip release archives: {assets:?}"
+    );
+    assert!(
+        source.contains("SHA256SUMS")
+            && source.contains("Get-FileHash")
+            && source.contains("checksum mismatch"),
+        "Windows installer must verify downloads against SHA256SUMS"
+    );
+}
+
 #[test]
-fn installer_asset_mapping_covers_the_release_matrix() {
+fn installers_map_release_assets_to_the_canonical_matrix() {
     let root = repository_root();
     let matrix = read(&root.join("tools/build-matrix-contract.ps1"));
     let marker = "function Get-CanonicalFullBuildTargets";
@@ -892,72 +994,28 @@ fn installer_asset_mapping_covers_the_release_matrix() {
         .unwrap_or_else(|| unreachable!("canonical build matrix function"));
     let remainder = &matrix[start + marker.len()..];
     let end = remainder.find("\nfunction ").unwrap_or(remainder.len());
-    let block = &remainder[..end];
-    let targets = block
-        .lines()
-        .filter_map(|line| {
-            let marker = "target='";
-            let start = line.find(marker)?;
-            let value = &line[start + marker.len()..];
-            let end = value.find('\'')?;
-            Some(value[..end].to_owned())
-        })
-        .collect::<BTreeSet<_>>();
-    assert_eq!(targets.len(), 8, "canonical release matrix target count");
-
-    let installer = read(&root.join("install.skill-manager.md"));
-    for target in &targets {
-        assert!(
-            installer.contains(target),
-            "installer does not map release target {target}"
-        );
-    }
-    for required in [
-        "skill-manager-v$($Latest.Text)-$Target.zip",
-        "asset_name=\"skill-manager-v${latest}-${target}.tar.gz\"",
-        "SHA256SUMS must contain exactly one checksum",
-        "%LOCALAPPDATA%\\skill-manager\\bin",
-        "$HOME/.local/share/skill-manager/bin",
-        "'schema_version', 'repository', 'tag', 'version', 'asset', 'sha256', 'installed_at'",
-        "\"schema_version\", \"repository\", \"tag\", \"version\",\n    \"asset\", \"sha256\", \"installed_at\"",
-        "Assert-ExactObjectFields $Event @('version', 'event', 'level', 'data')",
-        "set(event) != {\"version\", \"event\", \"level\", \"data\"}",
-        "Join-Path ([string]$Deployment[0].path) 'SKILL.md'",
-        "pathlib.Path(matches[0][\"path\"]) / \"SKILL.md\"",
-        "require_command python3",
-        "installed_at must be an RFC 3339 timestamp with an offset",
-        "installed_at must be RFC 3339 with an offset",
-        "$ManagedBinaryItem = Get-ManagedPathItem $ManagedBinary",
-        "Assert-OrdinaryFile $ManagedBinaryItem 'Managed binary'",
-        "($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)",
-        "[ -f \"$1\" ] && [ ! -L \"$1\" ]",
-        "path_present \"$managed_binary\" && binary_present=true",
-        "targets = $ExpectedTargets",
-        "\\\"targets\\\":$targets_json",
-        "Explicit name selection deliberately installs to a disabled built-in target",
-        "Reset-InstallerFilePair $StagedBinary $StagedProvenance",
-        "Reset-InstallerFilePair $RollbackBinary $RollbackProvenance",
-        "reset_file_pair \"$staged_binary\" \"$staged_provenance\"",
-        "reset_file_pair \"$rollback_binary\" \"$rollback_provenance\"",
-        "A system-level skill-manager precedes User PATH",
-        "source.locations-swapped",
-        "action-event set does not equal",
-    ] {
-        assert!(
-            installer.contains(required),
-            "installer is missing release/install contract: {required}"
-        );
-    }
-    for forbidden in [
-        "installed_at_utc",
-        "Join-Path ([string]$Deployment[0].path) 'managing-skills",
-        "pathlib.Path(matches[0][\"path\"]) / \"managing-skills\"",
-        "$TargetFields",
-        "$targets,\"global\"",
-    ] {
-        assert!(
-            !installer.contains(forbidden),
-            "installer contains stale or reconstructed-path logic: {forbidden}"
-        );
-    }
+    let released_targets = values_after_marker(&remainder[..end], "target='", '\'');
+    assert_eq!(
+        released_targets.len(),
+        8,
+        "canonical release matrix target count"
+    );
+    assert_posix_installer_release_contract(
+        &read(&root.join("clis/skill-manager/install.sh")),
+        &released_targets,
+    );
+    assert_windows_installer_release_contract(
+        &read(&root.join("clis/skill-manager/install.ps1")),
+        &released_targets,
+    );
+    let installer_document = read(&root.join("install.skill-manager.md"));
+    assert!(
+        installer_document.contains("install.sh") && installer_document.contains("install.ps1"),
+        "installer instructions must point agents to both hosted installer scripts"
+    );
+    assert!(
+        installer_document.contains("AI agent")
+            && installer_document.contains("Agent instructions"),
+        "installer instructions must remain agent-directed"
+    );
 }

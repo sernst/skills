@@ -74,6 +74,22 @@ jobs:
       - name: Validate registry contract
         shell: pwsh
         run: pwsh -File tools/get-build-matrix.ps1 -ValidateOnly
+      - name: Lint POSIX installer
+        shell: bash
+        run: |
+          shellcheck --version
+          shellcheck clis/skill-manager/install.sh
+      - name: Lint PowerShell installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = pwsh -File tools/get-tool-version.ps1 psscriptanalyzer
+          Install-Module PSScriptAnalyzer -RequiredVersion $version -Force -Scope CurrentUser
+          $findings = @(Invoke-ScriptAnalyzer -Path clis/skill-manager/install.ps1)
+          if ($findings.Count -gt 0) {
+            $findings | Format-List * | Out-String | Write-Host
+            exit 1
+          }
       - name: Full Linux GNU quality gate
         run: just check
       - name: Audit GitHub workflows
