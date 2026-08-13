@@ -102,38 +102,38 @@ just inherits an unreliable router pick. The one exception is when the user's
 own prompt explicitly permits it, electing that cost saving; absent that, you
 always choose.
 
-Billing on this harness is metered in premium-request equivalents: every model
-turn of every agent is a billed request, weighted by a per-model multiplier,
-and that product — multiplier × request count — is the bill. Whenever it
-disagrees with token- or cache-level reasoning, the multiplier arithmetic
-wins. Read the current multiplier table from the harness itself alongside the
-roster, before your first dispatch — never from memory, since tables change.
-Multipliers do not track capability tier: frontier-class models are often ×1
-while some light/fast models carry double-digit multipliers, so a model that
-is cheap per token can be ruinous per request. Never infer billing weight from
-tier, name, or token price.
+This harness has changed its billing basis at least once — per-request
+multipliers one season, per-token credits the next — so never assume either
+model from memory or from this skill. Before your first dispatch, determine
+the current basis from the harness itself: its pricing reference and, when
+available, the local usage telemetry it records per model call. Price
+dispatches in whatever unit the harness actually bills, keep the ledger in
+that unit, and re-check the telemetry at phase boundaries per the ledger
+rule — it is cheap here and turns divergence into a quantitative stop signal.
 
-Price every dispatch as multiplier × expected requests before launching it.
-Many-turn roles — executors, wide reconnaissance, anything that iterates —
-belong on the most capable ×1-class model available, never on a
-high-multiplier model; reserve high-multiplier models for short, tightly
-scoped dispatches and bound their turn budget in the brief. The judge floor
-below is unchanged, but satisfy it from ×1-class candidates first — the table
-usually prices some frontier-class models there — and when only a
-high-multiplier judge clears the floor, shrink its workload with the evidence
-pack so it renders a verdict in few requests. The batching and lifetime rules
-below are billing levers here, not just cache hygiene: fewer, larger turns and
-short-lived agents cut the request count directly. Keep the ledger in
-multiplier-weighted premium-request equivalents.
+The basis decides which levers dominate. Under per-token billing, spend
+tracks output tokens and call counts across all agents, so loop count and
+dispatch duration dominate while model choice matters at the margins. Under
+per-request billing with per-model multipliers, the bill is multiplier ×
+request count, overriding token- and cache-level reasoning — and multipliers
+do not track capability tier, so a model that is cheap per token can be
+ruinous per request: read the current table, never infer billing weight from
+tier, name, or token price, keep many-turn roles on low-multiplier models,
+and reserve high-multiplier models for short, tightly scoped dispatches.
+Under either basis the judge floor below is unchanged: satisfy it from
+candidates that are cheap in the current basis first, and when only an
+expensive judge clears the floor, shrink its workload with the evidence pack
+so it verdicts within its call budget. The batching and lifetime rules below
+are billing levers here, not just cache hygiene.
 
 Model capability class is your primary escalation lever, not reasoning effort.
 Set both deliberately on every dispatch — pick the class the task's depth
 warrants, then a matching effort level, but never lean on higher effort to
 rescue an under-provisioned tier. Raise the context tier only when inputs
 demand the larger window, not as a quality lever. Class escalation can also be
-a multiplier escalation on this harness; price it before committing, and treat
-escalated retry attempts as short, bounded dispatches rather than many-turn
-roles.
+a billing escalation on this harness; price it in the current basis before
+committing, and treat escalated retry attempts as short, bounded dispatches
+rather than many-turn roles.
 
 Choose tiers in the abstract, by capability class, never by naming a provider
 or model slug as routing guidance. Provider breadth here is an opportunity: an
@@ -244,7 +244,11 @@ own inspection. Those layers establish that the work runs, not that it is the
 right work, so for consequential output — code that ships, anything hard to
 reverse, anything relied on downstream — still bias toward an independent judge;
 mechanical evidence reduces what that judge must re-verify rather than replacing
-it. Cheapness here means shrinking the judge's workload, never its capability:
+it. Exhaust the deterministic layers before the first judge pass, including
+the gates the work must eventually clear downstream — CI, cross-platform
+probes, staged-state checks — so judge cycles never rediscover what a
+deterministic check would have caught for a fraction of the price. Cheapness
+here means shrinking the judge's workload, never its capability:
 the judge floor below is not a cost lever, and a weaker judge over a stronger
 executor is a false economy. Exploratory or throwaway legwork needs no judge,
 and never let the subagent that did the work grade it.
@@ -260,7 +264,12 @@ class in one pass rather than peeling instances one cycle at a time.
 current test results, the acceptance criteria, and the findings already
 adjudicated or ruled out of scope. That constrains what the judge must
 re-derive, not what it may conclude, and it never preempts the judge's right
-below to surface gaps the execution itself revealed.
+below to surface gaps the execution itself revealed. Give the brief an
+explicit call budget sized to the review's scope, with instructions to render
+a verdict within it — flagging anything left unverified — rather than running
+silently long. Only the first pass on a subtask reviews the full acceptance
+surface; each later pass is scoped to what changed since the last verdict
+plus the findings it must re-verify, never a fresh full review.
 
 Before dispatching the executor, write explicit, checkable acceptance criteria
 and hand the same criteria to both the executor and the judge — this prevents
@@ -355,10 +364,13 @@ iterate — so your delegation choices are never a black box.
 **Keep a running cost ledger from what you already see.** Most harnesses report
 per-dispatch usage in results; where yours doesn't, estimate in
 order-of-magnitude buckets from context size, turns, and duration, in whatever
-unit your harness meters. Never spend turns querying usage for reporting's own
-sake — the ledger rides on data already in front of you. Surface it at
-checkpoints you already own: a rough expectation on non-trivial dispatches, a
-one-line tally at milestones, and a closing accounting of where the session's
-spend went and what earned its cost. Expected-versus-actual divergence is the
-steering signal: when a dispatch runs well past its expectation, say so in the
-moment and reconsider the approach rather than absorbing it silently.
+unit your harness meters. Never poll usage turn by turn or query it for
+reporting's own sake — the ledger rides on data already in front of you. But
+where the harness keeps cheap local usage telemetry, reading it at phase
+boundaries is steering, not reporting. Surface the ledger at checkpoints you
+already own: a rough expectation on non-trivial dispatches, a one-line tally
+at milestones, and a closing accounting of where the session's spend went and
+what earned its cost. Expected-versus-actual divergence is the steering
+signal: when a dispatch runs well past its expectation, say so in the moment,
+check actuals if telemetry is at hand, and reconsider the approach rather
+than absorbing it silently.
