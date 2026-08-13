@@ -17,7 +17,9 @@ param(
     [switch] $Help
 )
 
+$dirWasBound = $PSBoundParameters.ContainsKey('Dir')
 $ErrorActionPreference = 'Stop'
+$invocationCwd = (Get-Location).Path
 
 function Show-Usage {
     @'
@@ -31,6 +33,8 @@ Options:
                     Defaults to the latest release.
   -Dir <path>       Install destination directory.
                     Defaults to $env:LOCALAPPDATA\Programs\skill-manager.
+                    ~ uses the active home; other relative paths use the
+                    invocation directory. Paths are lexically normalized.
   -Yes              Skip the confirmation prompt and proceed with the plan as
                     resolved (does not force a same-version reinstall; see
                     -Force).
@@ -140,10 +144,85 @@ function Test-InteractiveHost {
     return $true
 }
 
+function Resolve-InstallDirectory {
+    param([string] $Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        Fail 'install directory must not be empty'
+    }
+    $activeHome = if ($env:HOME) {
+        $env:HOME
+    } elseif ($env:USERPROFILE) {
+        $env:USERPROFILE
+    } else {
+        $HOME
+    }
+    $candidate = $Path
+    if ($candidate -eq '~') {
+        $candidate = $activeHome
+    } elseif ($candidate.StartsWith('~/') -or $candidate.StartsWith('~\')) {
+        $candidate = Join-Path $activeHome $candidate.Substring(2)
+    }
+    if ($candidate -match '^[A-Za-z]:[\\/]' -or $candidate -match '^[\\/]{2}') {
+        # Fully qualified drive and UNC paths are already independent of
+        # process-global current-directory state.
+    } elseif ($candidate -match '^([A-Za-z]):(.*)$') {
+        $candidateDrive = $Matches[1]
+        $driveRelativeTail = $Matches[2]
+        if ($invocationCwd -notmatch '^([A-Za-z]):[\\/]') {
+            Fail "drive-relative install directory $Path cannot be resolved from invocation directory $invocationCwd"
+        }
+        $invocationDrive = $Matches[1]
+        if (-not $candidateDrive.Equals($invocationDrive, [StringComparison]::OrdinalIgnoreCase)) {
+            Fail "drive-relative install directory $Path uses drive ${candidateDrive}: but the invocation directory is on ${invocationDrive}:; use a fully qualified path"
+        }
+        $candidate = Join-Path $invocationCwd $driveRelativeTail
+    } elseif ($candidate -match '^[\\/]') {
+        if ($invocationCwd -notmatch '^([A-Za-z]):[\\/]') {
+            Fail "root-relative install directory $Path cannot be resolved from invocation directory $invocationCwd"
+        }
+        $candidate = "$($Matches[1]):$candidate"
+    } else {
+        $candidate = Join-Path $invocationCwd $candidate
+    }
+    return [System.IO.Path]::GetFullPath($candidate)
+}
+
+function Select-InstallDirectory {
+    param([string] $RequestedDirectory)
+
+    if ($dirWasBound) {
+        $selected = $RequestedDirectory
+        $script:destSource = '-Dir'
+    } elseif ($env:SKILL_MANAGER_INSTALL_DIR) {
+        $selected = $env:SKILL_MANAGER_INSTALL_DIR
+        $script:destSource = '$env:SKILL_MANAGER_INSTALL_DIR'
+    } elseif ($interactive) {
+        $reply = Read-Host "Install directory [$defaultDest]"
+        $selected = if ($reply) { $reply } else { $defaultDest }
+        $script:destSource = 'prompted value'
+    } else {
+        $selected = $defaultDest
+        $script:destSource = 'default (no interactive host detected)'
+    }
+    return Resolve-InstallDirectory -Path $selected
+}
+
 $yesFlag = [bool]$Yes -or ($env:SKILL_MANAGER_INSTALL_YES -eq '1')
 $forceFlag = [bool]$Force -or ($env:SKILL_MANAGER_INSTALL_FORCE -eq '1')
 $noModifyPathFlag = [bool]$NoModifyPath -or ($env:SKILL_MANAGER_NO_MODIFY_PATH -eq '1')
 $interactive = Test-InteractiveHost
+$defaultDest = Join-Path $env:LOCALAPPDATA 'Programs\skill-manager'
+if ($env:SKILL_MANAGER_TEST_RESOLVE_DIR -eq '1' -and $env:SKILL_MANAGER_TEST_FORCE_INTERACTIVE -eq '1') {
+    $interactive = $true
+}
+
+# Undocumented process-test hook. It deliberately runs before release
+# resolution, downloads, temporary files, PATH checks, or writes.
+if ($env:SKILL_MANAGER_TEST_RESOLVE_DIR -eq '1') {
+    [Console]::Out.WriteLine((Select-InstallDirectory -RequestedDirectory $Dir))
+    return
+}
 
 $tempDir = $null
 
@@ -243,33 +322,11 @@ try {
 
     # --- 5. Resolve the destination ----------------------------------------------
 
-    $defaultDest = Join-Path $env:LOCALAPPDATA 'Programs\skill-manager'
-
-    if ($Dir) {
-        $destDir = $Dir
-        Write-Step "destination: using -Dir $destDir"
-    } elseif ($env:SKILL_MANAGER_INSTALL_DIR) {
-        $destDir = $env:SKILL_MANAGER_INSTALL_DIR
-        Write-Step "destination: using `$env:SKILL_MANAGER_INSTALL_DIR $destDir"
-    } elseif ($interactive) {
-        $reply = Read-Host "Install directory [$defaultDest]"
-        $destDir = if ($reply) { $reply } else { $defaultDest }
-        Write-Step "destination: using prompted value $destDir"
-    } else {
-        $destDir = $defaultDest
-        Write-Step "destination: no interactive host detected, using default $destDir"
-    }
-
-    # Validate the destination early: reject empty/whitespace-only values,
-    # reject a path that already exists as a non-directory file, and
-    # normalize a relative path to absolute so it is never persisted into
-    # PATH as an unusable relative entry.
-    if ([string]::IsNullOrWhiteSpace($destDir)) {
-        Fail 'install directory must not be empty'
-    }
-    if (-not [System.IO.Path]::IsPathRooted($destDir)) {
-        $destDir = Join-Path (Get-Location).Path $destDir
-    }
+    # Normalize before confirmation, existence checks, installation, and PATH
+    # handling. This is lexical only and therefore supports nonexistent paths
+    # without resolving symlinks.
+    $destDir = Select-InstallDirectory -RequestedDirectory $Dir
+    Write-Step "destination: using $destSource $destDir"
     if ((Test-Path -LiteralPath $destDir) -and -not (Test-Path -LiteralPath $destDir -PathType Container)) {
         Fail "install directory $destDir already exists and is not a directory"
     }

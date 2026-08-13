@@ -2,7 +2,28 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+
+#[cfg(any(unix, windows))]
+mod support;
+
+#[cfg(any(unix, windows))]
+use support::portable_canonicalize;
+
+/// Resolve a scratch root to the spelling a child process observes.
+///
+/// Shells report the physical, long-form directory (`(Get-Location).Path` on
+/// Windows, `pwd -L` falling back to `getcwd` on POSIX), while `tempfile`
+/// hands back whatever `TMPDIR`/`TEMP` spelled — an 8.3 short path on Windows
+/// or `/var` instead of `/private/var` on macOS.  Expected paths must be
+/// derived from the canonical spelling so the two agree.
+#[cfg(any(unix, windows))]
+fn canonical_scratch_root(path: &Path) -> PathBuf {
+    portable_canonicalize(path)
+        .unwrap_or_else(|error| unreachable!("canonicalize installer test root: {error}"))
+}
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -790,6 +811,408 @@ fn root_catalog_covers_every_skill_directory() {
     for name in directories {
         let link = format!("(./skills/{name}/SKILL.md)");
         assert!(readme.contains(&link), "README catalog is missing {name}");
+    }
+}
+
+fn clear_installer_environment(command: &mut Command) {
+    for name in [
+        "SKILL_MANAGER_VERSION",
+        "SKILL_MANAGER_INSTALL_DIR",
+        "SKILL_MANAGER_INSTALL_YES",
+        "SKILL_MANAGER_INSTALL_FORCE",
+        "SKILL_MANAGER_NO_MODIFY_PATH",
+        "SKILL_MANAGER_TEST_RESOLVE_DIR",
+        "SKILL_MANAGER_TEST_FORCE_INTERACTIVE",
+        "SKILL_MANAGER_TEST_PATH_ENTRY",
+    ] {
+        command.env_remove(name);
+    }
+}
+
+fn run_resolver(mut command: Command, stdin: Option<&str>) -> Output {
+    if let Some(input) = stdin {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| unreachable!("start installer resolver process: {error}"));
+        child
+            .stdin
+            .take()
+            .unwrap_or_else(|| unreachable!("resolver stdin must be piped"))
+            .write_all(input.as_bytes())
+            .unwrap_or_else(|error| unreachable!("write resolver stdin: {error}"));
+        child
+            .wait_with_output()
+            .unwrap_or_else(|error| unreachable!("wait for installer resolver process: {error}"))
+    } else {
+        command
+            .output()
+            .unwrap_or_else(|error| unreachable!("run installer resolver process: {error}"))
+    }
+}
+
+fn assert_resolver_output(command: Command, expected: &Path) {
+    let output = run_resolver(command, None);
+    assert!(
+        output.status.success(),
+        "resolver failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)
+        .unwrap_or_else(|error| unreachable!("resolver output is UTF-8: {error}"));
+    let normalized_stdout = stdout.replace("\r\n", "\n");
+    assert_eq!(
+        normalized_stdout,
+        format!("{}\n", expected.display()),
+        "resolver mode must print only the absolute destination"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "resolver mode wrote stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_resolver_rejects_empty_directory(command: Command, conflicting: &Path) {
+    let output = run_resolver(command, None);
+    assert!(
+        !output.status.success(),
+        "resolver accepted an explicitly empty install directory"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
+    assert!(
+        !stdout.lines().any(|line| Path::new(line).is_absolute()),
+        "resolver emitted a resolved destination: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains(conflicting.to_string_lossy().as_ref()),
+        "resolver emitted the conflicting environment destination: {stdout:?}",
+    );
+    assert!(
+        format!("{stdout}{stderr}").contains("install directory must not be empty"),
+        "resolver did not report the empty-directory error: stdout={stdout:?}, stderr={stderr:?}"
+    );
+}
+
+fn assert_prompted_resolver_output(command: Command, stdin: &str, expected: &Path) {
+    let output = run_resolver(command, Some(stdin));
+    assert!(
+        output.status.success(),
+        "prompted resolver failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)
+        .unwrap_or_else(|error| unreachable!("resolver output is UTF-8: {error}"))
+        .replace("\r\n", "\n");
+    assert!(
+        stdout.ends_with(&format!("{}\n", expected.display())),
+        "prompted resolver did not end with destination {}: {stdout:?}",
+        expected.display()
+    );
+    let transcript = format!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+    let echoed_input = stdout
+        .lines()
+        .next()
+        .is_some_and(|line| line == stdin.trim_end_matches(['\r', '\n']));
+    assert!(
+        transcript.contains("Install directory [") || echoed_input,
+        "prompted resolver neither rendered its prompt nor consumed stdin through the host prompt reader: {transcript:?}"
+    );
+}
+
+#[cfg(unix)]
+fn assert_resolver_text(command: Command, expected: &str) {
+    let output = run_resolver(command, None);
+    assert!(
+        output.status.success(),
+        "resolver failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+}
+
+#[cfg(unix)]
+fn posix_resolver_command(
+    script: &Path,
+    cwd: &Path,
+    home: &Path,
+    local_app_data: &Path,
+) -> Command {
+    let mut command = Command::new("sh");
+    command
+        .arg(script)
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("LOCALAPPDATA", local_app_data)
+        .env("TMPDIR", cwd.join("tmp"))
+        .env("SKILL_MANAGER_TEST_RESOLVE_DIR", "1");
+    clear_installer_environment(&mut command);
+    command.env("SKILL_MANAGER_TEST_RESOLVE_DIR", "1");
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_installer_resolves_destination_spellings_without_side_effects() {
+    if !Command::new("sh")
+        .arg("-c")
+        .arg("exit 0")
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        eprintln!("skipping: sh is unavailable");
+        return;
+    }
+
+    let root = repository_root();
+    let scratch = tempfile::tempdir()
+        .unwrap_or_else(|error| unreachable!("isolated installer test root: {error}"));
+    let scratch_root = canonical_scratch_root(scratch.path());
+    let cwd = scratch_root.join("cwd");
+    let home = scratch_root.join("home");
+    let local_app_data = scratch_root.join("local");
+    fs::create_dir_all(&cwd)
+        .unwrap_or_else(|error| unreachable!("create invocation directory: {error}"));
+    fs::create_dir_all(&home)
+        .unwrap_or_else(|error| unreachable!("create synthetic home: {error}"));
+    fs::create_dir_all(cwd.join("tmp"))
+        .unwrap_or_else(|error| unreachable!("create synthetic temporary directory: {error}"));
+    let script = root.join("clis/skill-manager/install.sh");
+
+    let mut dot = posix_resolver_command(&script, &cwd, &home, &local_app_data);
+    dot.args(["--dir", "."]);
+    assert_resolver_output(dot, &cwd);
+
+    let mut nested = posix_resolver_command(&script, &cwd, &home, &local_app_data);
+    nested.args(["--dir", "nested/./missing/../leaf"]);
+    assert_resolver_output(nested, &cwd.join("nested/leaf"));
+
+    let mut home_exact = posix_resolver_command(&script, &cwd, &home, &local_app_data);
+    home_exact.env("SKILL_MANAGER_INSTALL_DIR", "~");
+    assert_resolver_output(home_exact, &home);
+
+    let default_dest = home.join(".local/bin");
+    assert_resolver_output(
+        posix_resolver_command(&script, &cwd, &home, &local_app_data),
+        &default_dest,
+    );
+
+    let mut prompted = posix_resolver_command(&script, &cwd, &home, &local_app_data);
+    prompted.env("SKILL_MANAGER_TEST_FORCE_INTERACTIVE", "1");
+    assert_prompted_resolver_output(prompted, "~/tools/../bin\n", &home.join("bin"));
+
+    let mut empty_prompt = posix_resolver_command(&script, &cwd, &home, &local_app_data);
+    empty_prompt.env("SKILL_MANAGER_TEST_FORCE_INTERACTIVE", "1");
+    assert_prompted_resolver_output(empty_prompt, "\n", &default_dest);
+
+    let dirty_absolute = format!("{}/absolute//./deep/../leaf", cwd.display());
+    let mut dirty = posix_resolver_command(&script, &cwd, &home, &local_app_data);
+    dirty.env("SKILL_MANAGER_INSTALL_DIR", dirty_absolute);
+    assert_resolver_output(dirty, &cwd.join("absolute/leaf"));
+
+    let mut precedence = posix_resolver_command(&script, &cwd, &home, &local_app_data);
+    precedence
+        .args(["--dir", "argument/../winner"])
+        .env("SKILL_MANAGER_INSTALL_DIR", "environment")
+        .env("SKILL_MANAGER_TEST_FORCE_INTERACTIVE", "1");
+    assert_resolver_output(precedence, &cwd.join("winner"));
+
+    let conflicting = cwd.join("environment");
+    let mut empty_argument = posix_resolver_command(&script, &cwd, &home, &local_app_data);
+    empty_argument
+        .args(["--dir", ""])
+        .env("SKILL_MANAGER_INSTALL_DIR", &conflicting);
+    assert_resolver_rejects_empty_directory(empty_argument, &conflicting);
+
+    let mut environment_wins = posix_resolver_command(&script, &cwd, &home, &local_app_data);
+    environment_wins
+        .env("SKILL_MANAGER_INSTALL_DIR", "environment/../winner")
+        .env("SKILL_MANAGER_TEST_FORCE_INTERACTIVE", "1");
+    assert_resolver_output(environment_wins, &cwd.join("winner"));
+
+    let mut literal_tilde = posix_resolver_command(&script, &cwd, &home, &local_app_data);
+    literal_tilde.env("SKILL_MANAGER_TEST_PATH_ENTRY", "~/.local/bin");
+    assert_resolver_text(literal_tilde, "no-match\n");
+
+    let mut lexical_match = posix_resolver_command(&script, &cwd, &home, &local_app_data);
+    lexical_match.args(["--dir", "missing/bin"]).env(
+        "SKILL_MANAGER_TEST_PATH_ENTRY",
+        format!("{}/missing/./tools/../bin", cwd.display()),
+    );
+    assert_resolver_text(lexical_match, "match\n");
+
+    let physical = scratch_root.join("physical/target");
+    fs::create_dir_all(&physical)
+        .unwrap_or_else(|error| unreachable!("create symlink target: {error}"));
+    let alias = cwd.join("alias");
+    if std::os::unix::fs::symlink(&physical, &alias).is_ok() {
+        let mut lexical = posix_resolver_command(&script, &cwd, &home, &local_app_data);
+        lexical.args(["--dir", "alias/../lexical"]);
+        assert_resolver_output(lexical, &cwd.join("lexical"));
+
+        if Command::new("realpath")
+            .arg(&alias)
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            let mut canonical = posix_resolver_command(&script, &cwd, &home, &local_app_data);
+            canonical
+                .args(["--dir", physical.to_string_lossy().as_ref()])
+                .env("SKILL_MANAGER_TEST_PATH_ENTRY", &alias);
+            assert_resolver_text(canonical, "match\n");
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_resolver_command(
+    script: &Path,
+    cwd: &Path,
+    home: &Path,
+    local_app_data: &Path,
+) -> Command {
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(script)
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("LOCALAPPDATA", local_app_data)
+        .env("TEMP", cwd.join("temp"))
+        .env("TMP", cwd.join("temp"));
+    clear_installer_environment(&mut command);
+    command.env("SKILL_MANAGER_TEST_RESOLVE_DIR", "1");
+    command
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_installer_resolves_destination_spellings_without_side_effects() {
+    let root = repository_root();
+    let scratch = tempfile::tempdir()
+        .unwrap_or_else(|error| unreachable!("isolated installer test root: {error}"));
+    let scratch_root = canonical_scratch_root(scratch.path());
+    let cwd = scratch_root.join("cwd");
+    let home = scratch_root.join("home");
+    let local_app_data = scratch_root.join("local");
+    fs::create_dir_all(cwd.join("temp"))
+        .unwrap_or_else(|error| unreachable!("create invocation and temporary directory: {error}"));
+    fs::create_dir_all(&home)
+        .unwrap_or_else(|error| unreachable!("create synthetic home: {error}"));
+    let script = root.join("clis/skill-manager/install.ps1");
+
+    let mut dot = windows_resolver_command(&script, &cwd, &home, &local_app_data);
+    dot.args(["-Dir", "."]);
+    assert_resolver_output(dot, &cwd);
+
+    let mut nested = windows_resolver_command(&script, &cwd, &home, &local_app_data);
+    nested.args(["-Dir", r"nested\.\missing\..\leaf"]);
+    assert_resolver_output(nested, &cwd.join(r"nested\leaf"));
+
+    let mut home_exact = windows_resolver_command(&script, &cwd, &home, &local_app_data);
+    home_exact.env("SKILL_MANAGER_INSTALL_DIR", "~");
+    assert_resolver_output(home_exact, &home);
+
+    let default_dest = local_app_data.join(r"Programs\skill-manager");
+    assert_resolver_output(
+        windows_resolver_command(&script, &cwd, &home, &local_app_data),
+        &default_dest,
+    );
+
+    let mut prompted = windows_resolver_command(&script, &cwd, &home, &local_app_data);
+    prompted.env("SKILL_MANAGER_TEST_FORCE_INTERACTIVE", "1");
+    assert_prompted_resolver_output(prompted, "~/tools/../bin\n", &home.join("bin"));
+
+    let mut empty_prompt = windows_resolver_command(&script, &cwd, &home, &local_app_data);
+    empty_prompt.env("SKILL_MANAGER_TEST_FORCE_INTERACTIVE", "1");
+    assert_prompted_resolver_output(empty_prompt, "\n", &default_dest);
+
+    let dirty_absolute = format!(r"{}\absolute\\.\deep\..\leaf", cwd.display());
+    let mut dirty = windows_resolver_command(&script, &cwd, &home, &local_app_data);
+    dirty.env("SKILL_MANAGER_INSTALL_DIR", dirty_absolute);
+    assert_resolver_output(dirty, &cwd.join(r"absolute\leaf"));
+
+    let mut unc = windows_resolver_command(&script, &cwd, &home, &local_app_data);
+    unc.args(["-Dir", r"\\server\share\tools\..\bin"]);
+    assert_resolver_output(unc, Path::new(r"\\server\share\bin"));
+
+    let mut precedence = windows_resolver_command(&script, &cwd, &home, &local_app_data);
+    precedence
+        .args(["-Dir", r"argument\..\winner"])
+        .env("SKILL_MANAGER_INSTALL_DIR", "environment")
+        .env("SKILL_MANAGER_TEST_FORCE_INTERACTIVE", "1");
+    assert_resolver_output(precedence, &cwd.join("winner"));
+
+    let conflicting = cwd.join("environment");
+    let mut empty_argument = windows_resolver_command(&script, &cwd, &home, &local_app_data);
+    empty_argument
+        .args(["-Dir", ""])
+        .env("SKILL_MANAGER_INSTALL_DIR", &conflicting);
+    assert_resolver_rejects_empty_directory(empty_argument, &conflicting);
+
+    let mut environment_wins = windows_resolver_command(&script, &cwd, &home, &local_app_data);
+    environment_wins
+        .env("SKILL_MANAGER_INSTALL_DIR", r"environment\..\winner")
+        .env("SKILL_MANAGER_TEST_FORCE_INTERACTIVE", "1");
+    assert_resolver_output(environment_wins, &cwd.join("winner"));
+
+    let drive = cwd
+        .to_string_lossy()
+        .get(..2)
+        .unwrap_or_else(|| unreachable!("Windows temporary path must have a drive"))
+        .to_owned();
+    let mut root_relative = windows_resolver_command(&script, &cwd, &home, &local_app_data);
+    root_relative.args(["-Dir", r"\tools\bin"]);
+    assert_resolver_output(root_relative, &PathBuf::from(format!(r"{drive}\tools\bin")));
+
+    let drive_relative_input = format!(r"{drive}tools\bin");
+    let mut drive_relative = windows_resolver_command(&script, &cwd, &home, &local_app_data);
+    drive_relative.args(["-Dir", &drive_relative_input]);
+    assert_resolver_output(drive_relative, &cwd.join(r"tools\bin"));
+
+    let mut stale_process_cwd = Command::new("powershell.exe");
+    stale_process_cwd
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "Set-Location -LiteralPath $env:SKILL_MANAGER_TEST_INVOCATION_CWD; & $env:SKILL_MANAGER_TEST_SCRIPT -Dir $env:SKILL_MANAGER_TEST_DRIVE_RELATIVE",
+        ])
+        .current_dir(&home)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("LOCALAPPDATA", &local_app_data)
+        .env("TEMP", cwd.join("temp"))
+        .env("TMP", cwd.join("temp"));
+    clear_installer_environment(&mut stale_process_cwd);
+    stale_process_cwd
+        .env("SKILL_MANAGER_TEST_RESOLVE_DIR", "1")
+        .env("SKILL_MANAGER_TEST_INVOCATION_CWD", &cwd)
+        .env("SKILL_MANAGER_TEST_SCRIPT", &script)
+        .env("SKILL_MANAGER_TEST_DRIVE_RELATIVE", &drive_relative_input);
+    assert_resolver_output(stale_process_cwd, &cwd.join(r"tools\bin"));
+
+    let physical = scratch_root.join(r"physical\target");
+    fs::create_dir_all(&physical)
+        .unwrap_or_else(|error| unreachable!("create symlink target: {error}"));
+    let alias = cwd.join("alias");
+    if std::os::windows::fs::symlink_dir(&physical, &alias).is_ok() {
+        let mut lexical = windows_resolver_command(&script, &cwd, &home, &local_app_data);
+        lexical.args(["-Dir", r"alias\..\lexical"]);
+        assert_resolver_output(lexical, &cwd.join("lexical"));
     }
 }
 

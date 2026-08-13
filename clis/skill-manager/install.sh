@@ -20,9 +20,11 @@ REPO="sernst/skills"
 BINARY_NAME="skill-manager"
 GITHUB_API="https://api.github.com/repos/${REPO}/releases/latest"
 GITHUB_DOWNLOAD="https://github.com/${REPO}/releases/download"
+invocation_cwd="$(pwd -L)"
 
 version_arg=""
 dir_arg=""
+dir_arg_supplied=0
 yes_flag=0
 force_flag=0
 no_modify_path_flag=0
@@ -45,6 +47,8 @@ Options:
                          Defaults to the latest release.
   --dir <path>           Install destination directory.
                          Defaults to $HOME/.local/bin.
+                         ~ uses $HOME; other relative paths use the invocation
+                         directory. Paths are lexically normalized.
   --yes                  Skip the confirmation prompt and proceed with the
                          plan as resolved (does not force a same-version
                          reinstall; see --force).
@@ -78,15 +82,14 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --dir)
-      case "${2-}" in
-        '') die "--dir requires a non-empty value" ;;
-      esac
+      [ $# -ge 2 ] || die "--dir requires a non-empty value"
       dir_arg="$2"
+      dir_arg_supplied=1
       shift 2
       ;;
     --dir=*)
       dir_arg="${1#*=}"
-      [ -n "$dir_arg" ] || die "--dir requires a non-empty value"
+      dir_arg_supplied=1
       shift
       ;;
     --yes)
@@ -116,6 +119,160 @@ done
 if [ "${SKILL_MANAGER_INSTALL_YES:-0}" = "1" ]; then yes_flag=1; fi
 if [ "${SKILL_MANAGER_INSTALL_FORCE:-0}" = "1" ]; then force_flag=1; fi
 if [ "${SKILL_MANAGER_NO_MODIFY_PATH:-0}" = "1" ]; then no_modify_path_flag=1; fi
+
+normalize_install_dir() {
+  normalize_input="$1"
+  if ! printf '%s' "$normalize_input" | grep -q '[^[:space:]]'; then
+    die "install directory must not be empty"
+  fi
+
+  # Case patterns undergo tilde expansion themselves, so quote the literal
+  # tilde patterns. Only exact ~ and ~/... are home-relative.
+  # shellcheck disable=SC2088
+  case "$normalize_input" in
+    "~") normalize_input="$HOME" ;;
+    "~/"*) normalize_input="${HOME}/${normalize_input#\~/}" ;;
+  esac
+  case "$normalize_input" in
+    /*) : ;;
+    *) normalize_input="${invocation_cwd}/${normalize_input}" ;;
+  esac
+
+  normalize_output=""
+  normalize_old_ifs="$IFS"
+  IFS='/'
+  set -f
+  # Intentional field splitting on slash implements lexical path traversal
+  # without requiring the path to exist or resolving symlinks.
+  # shellcheck disable=SC2086
+  set -- $normalize_input
+  set +f
+  IFS="$normalize_old_ifs"
+  for normalize_component do
+    case "$normalize_component" in
+      ''|.) ;;
+      ..) normalize_output="${normalize_output%/*}" ;;
+      *) normalize_output="${normalize_output}/${normalize_component}" ;;
+    esac
+  done
+  printf '%s\n' "${normalize_output:-/}"
+}
+
+default_dest="${HOME}/.local/bin"
+
+is_tty_available() {
+  # Resolver tests must not consult the developer's controlling terminal.
+  # Forced prompt tests still exercise the same fd 3 reader.
+  if [ "${SKILL_MANAGER_TEST_RESOLVE_DIR:-0}" = "1" ]; then
+    if [ "${SKILL_MANAGER_TEST_FORCE_INTERACTIVE:-0}" = "1" ]; then
+      exec 3<&0
+      return 0
+    fi
+    return 1
+  fi
+
+  # `[ -t 0 ]` is not sufficient: under `curl ... | sh`, fd 0 is the pipe
+  # carrying the script itself, not a terminal, and may already be closed by
+  # the time this runs. Test /dev/tty directly instead.
+  #
+  # A redirection failure on a POSIX "special built-in" (`:`, `exec`, ...) is
+  # fatal to a non-interactive shell -- it terminates the whole script,
+  # bypassing normal error handling -- so the probe must never redirect a
+  # special built-in in the current shell. In a true headless environment (no
+  # controlling terminal, e.g. CI/Docker without a pty) opening /dev/tty fails
+  # with ENXIO even though `[ -r ]` reports it as permission-readable.
+  # Contain that failure inside a subshell first (a subshell exiting on this
+  # rule only ends the subshell, not the script), and only `exec` for real in
+  # the current shell once openability is already confirmed.
+  if ! [ -r /dev/tty ]; then return 1; fi
+  if ! (: < /dev/tty) 2>/dev/null; then return 1; fi
+  exec 3</dev/tty
+}
+interactive=0
+if is_tty_available; then interactive=1; fi
+
+select_install_dir() {
+  if [ "$dir_arg_supplied" = "1" ]; then
+    dest_dir="$dir_arg"
+    dest_source="--dir"
+  elif [ -n "${SKILL_MANAGER_INSTALL_DIR:-}" ]; then
+    dest_dir="$SKILL_MANAGER_INSTALL_DIR"
+    dest_source="\$SKILL_MANAGER_INSTALL_DIR"
+  elif [ "$interactive" = "1" ]; then
+    printf 'Install directory [%s]: ' "$default_dest" >&2
+    IFS= read -r reply <&3 || reply=""
+    dest_dir="${reply:-$default_dest}"
+    dest_source="prompted value"
+  else
+    dest_dir="$default_dest"
+    dest_source="default (no TTY detected)"
+  fi
+  dest_dir="$(normalize_install_dir "$dest_dir")"
+}
+
+normalize_path_entry() {
+  normalize_path_input="$1"
+  case "$normalize_path_input" in
+    /*) : ;;
+    *) printf '%s\n' "$normalize_path_input"; return ;;
+  esac
+
+  normalize_path_output=""
+  normalize_path_old_ifs="$IFS"
+  IFS='/'
+  set -f
+  # shellcheck disable=SC2086
+  set -- $normalize_path_input
+  set +f
+  IFS="$normalize_path_old_ifs"
+  for normalize_path_component do
+    case "$normalize_path_component" in
+      ''|.) ;;
+      ..) normalize_path_output="${normalize_path_output%/*}" ;;
+      *) normalize_path_output="${normalize_path_output}/${normalize_path_component}" ;;
+    esac
+  done
+  printf '%s\n' "${normalize_path_output:-/}"
+}
+
+path_dir_matches() {
+  # path_dir_matches <candidate-dir> <target-dir>
+  # PATH entries are shell data, not installer inputs: do not expand a literal
+  # tilde or reinterpret a relative entry through install-input normalization.
+  # Only trust canonical comparison when both realpath calls succeed. If
+  # either path does not exist, lexically clean absolute entries without
+  # expanding or anchoring shell spellings such as "~" or relative entries.
+  candidate="$1"
+  target_dir="$2"
+  [ "$candidate" = "$target_dir" ] && return 0
+  if have_cmd realpath; then
+    resolved_candidate="$(realpath "$candidate" 2>/dev/null)" || resolved_candidate=""
+    resolved_target="$(realpath "$target_dir" 2>/dev/null)" || resolved_target=""
+    if [ -n "$resolved_candidate" ] && [ -n "$resolved_target" ]; then
+      [ "$resolved_candidate" = "$resolved_target" ]
+      return $?
+    fi
+  fi
+  normalized_candidate="$(normalize_path_entry "$candidate")"
+  normalized_target="$(normalize_path_entry "$target_dir")"
+  [ "$normalized_candidate" = "$normalized_target" ]
+}
+
+# Undocumented process-test hook. It deliberately runs before curl, release
+# resolution, temporary files, profile checks, or any installation work.
+if [ "${SKILL_MANAGER_TEST_RESOLVE_DIR:-0}" = "1" ]; then
+  select_install_dir
+  if [ "${SKILL_MANAGER_TEST_PATH_ENTRY+x}" = "x" ]; then
+    if path_dir_matches "$SKILL_MANAGER_TEST_PATH_ENTRY" "$dest_dir"; then
+      printf 'match\n'
+    else
+      printf 'no-match\n'
+    fi
+  else
+    printf '%s\n' "$dest_dir"
+  fi
+  exit 0
+fi
 
 tmp_dir=""
 cleanup() {
@@ -301,66 +458,11 @@ verify_checksum
 
 # --- 5. Resolve the destination ---------------------------------------------
 
-default_dest="${HOME}/.local/bin"
-
-is_tty_available() {
-  # `[ -t 0 ]` is not sufficient: under `curl ... | sh`, fd 0 is the pipe
-  # carrying the script itself, not a terminal, and may already be closed by
-  # the time this runs. Test /dev/tty directly instead.
-  #
-  # A redirection failure on a POSIX "special built-in" (`:`, `exec`, ...) is
-  # fatal to a non-interactive shell -- it terminates the whole script,
-  # bypassing normal error handling -- so the probe must never redirect a
-  # special built-in in the current shell. In a true headless environment (no
-  # controlling terminal, e.g. CI/Docker without a pty) opening /dev/tty fails
-  # with ENXIO even though `[ -r ]` reports it as permission-readable.
-  # Contain that failure inside a subshell first (a subshell exiting on this
-  # rule only ends the subshell, not the script), and only `exec` for real in
-  # the current shell once openability is already confirmed.
-  if ! [ -r /dev/tty ]; then return 1; fi
-  if ! (: < /dev/tty) 2>/dev/null; then return 1; fi
-  exec 3</dev/tty
-}
-interactive=0
-if is_tty_available; then interactive=1; fi
-
-if [ -n "$dir_arg" ]; then
-  dest_dir="$dir_arg"
-  log "destination: using --dir ${dest_dir}"
-elif [ -n "${SKILL_MANAGER_INSTALL_DIR:-}" ]; then
-  dest_dir="$SKILL_MANAGER_INSTALL_DIR"
-  log "destination: using \$SKILL_MANAGER_INSTALL_DIR ${dest_dir}"
-elif [ "$interactive" = "1" ]; then
-  printf 'Install directory [%s]: ' "$default_dest" >&2
-  IFS= read -r reply <&3 || reply=""
-  dest_dir="${reply:-$default_dest}"
-  log "destination: using prompted value ${dest_dir}"
-else
-  dest_dir="$default_dest"
-  log "destination: no TTY detected, using default ${dest_dir}"
-fi
-
-# Case patterns undergo tilde expansion themselves (POSIX), so an unquoted
-# `~` pattern here would match "$HOME" literally instead of a literal tilde
-# character typed by the user. Quoting the pattern suppresses that expansion
-# so this correctly detects a leading "~" in the user's input.
-# shellcheck disable=SC2088
-case "$dest_dir" in
-  "~") dest_dir="$HOME" ;;
-  "~/"*) dest_dir="${HOME}/${dest_dir#\~/}" ;;
-esac
-
 # Validate the destination early: reject empty/whitespace-only values, reject
-# a path that already exists as a non-directory, and normalize a relative
-# path to absolute so it is never persisted into PATH as an unusable relative
-# entry.
-if ! printf '%s' "$dest_dir" | grep -q '[^[:space:]]'; then
-  die "install directory must not be empty"
-fi
-case "$dest_dir" in
-  /*) : ;;
-  *) dest_dir="$(pwd)/${dest_dir}" ;;
-esac
+# a path that already exists as a non-directory, and normalize all spellings
+# to a clean lexical absolute path before any downstream behavior uses it.
+select_install_dir
+log "destination: using ${dest_source} ${dest_dir}"
 if [ -e "$dest_dir" ] && [ ! -d "$dest_dir" ]; then
   die "install directory ${dest_dir} already exists and is not a directory"
 fi
@@ -394,25 +496,6 @@ if [ -e "$existing_path" ]; then
 else
   log "existing installation: none found at ${dest_dir}"
 fi
-
-path_dir_matches() {
-  # path_dir_matches <candidate-dir> <target-dir>
-  # Only trust canonicalized comparison when BOTH canonicalizations succeed
-  # and are non-empty; two failed lookups must never be treated as a match,
-  # so this falls back to the literal (already-failed) comparison instead.
-  candidate="$1"
-  target_dir="$2"
-  [ "$candidate" = "$target_dir" ] && return 0
-  if have_cmd realpath; then
-    resolved_candidate="$(realpath "$candidate" 2>/dev/null)" || resolved_candidate=""
-    resolved_target="$(realpath "$target_dir" 2>/dev/null)" || resolved_target=""
-    if [ -n "$resolved_candidate" ] && [ -n "$resolved_target" ]; then
-      [ "$resolved_candidate" = "$resolved_target" ]
-      return $?
-    fi
-  fi
-  return 1
-}
 
 dest_on_path=0
 old_ifs="$IFS"
