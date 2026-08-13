@@ -1,22 +1,50 @@
 # Skills and skill-manager
 
-This repository is a two-part toolkit:
+This repository offers two things:
 
-1. [`skills/`](./skills) contains reusable instructions that teach AI agents
-   specialized workflows.
-2. [`skill-manager`](./clis/skill-manager) is a native CLI that discovers those
-   skills from local or GitHub sources and deploys them to the skill directories
-   used by agent harnesses.
+- [`skills/`](./skills): reusable Markdown instructions that teach AI agents
+  specialized workflows.
+- [`skill-manager`](./clis/skill-manager): the supported way to discover and
+  deploy these skills across Claude Code, Codex/OpenAI agents, and Google
+  Antigravity.
 
-Use the CLI when you want one source of truth for skills across Claude Code,
-Codex/OpenAI agents, and Google Antigravity. Use the skills directly when you
-want to inspect or adapt the instructions.
+Choose **a skill** below to inspect or adapt its instructions. Choose
+**skill-manager** to install skills, keep one source of truth, and manage
+updates across agent harnesses.
 
-## Install
+## Skill catalog
 
-Install or upgrade `skill-manager` with the script for your platform. Each one
-resolves the latest release, verifies the download against `SHA256SUMS`, and
-prompts for an install location.
+### [`drafting-commit-message`](./skills/drafting-commit-message/SKILL.md)
+
+Draft a concise, imperative commit title and motivation-focused change bullets
+from staged or unstaged changes.
+
+### [`grill-me`](./skills/grill-me/SKILL.md)
+
+Explore project context, then interview the user one decision at a time until a
+plan or design has no unresolved branches.
+
+### [`managing-skills`](./skills/managing-skills/SKILL.md)
+
+Operate the complete `skill-manager` CLI conversationally, with explicit safety
+and confirmation rules.
+
+### [`reviewing-implemented-work-order`](./skills/reviewing-implemented-work-order/SKILL.md)
+
+Review a work-order implementation against its job, research, plan, repository
+patterns, security requirements, and test coverage.
+
+### [`reviewing-my-code`](./skills/reviewing-my-code/SKILL.md)
+
+Prepare a focused branch review covering correctness, security, performance,
+and test coverage.
+
+### [`running-as-maestro`](./skills/running-as-maestro/SKILL.md)
+
+Run an agent as an accountable orchestrator that delegates work to subagents,
+selects appropriate model tiers, and verifies their output.
+
+## Install skill-manager
 
 macOS and Linux:
 
@@ -30,149 +58,78 @@ Windows (PowerShell):
 powershell -c "irm https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.ps1 | iex"
 ```
 
-### Customize an installation
+The installers prompt for a destination when interactive. Windows verifies the
+release against `SHA256SUMS`; the POSIX installer verifies it when `sha256sum`
+or `shasum` is available and prints a prominent warning if neither exists.
 
-On macOS and Linux, pass `--version`, `--dir`, `--yes`, `--force`, or
-`--no-modify-path` through the pipe:
+### Customize the install directory
+
+`--dir` and `-Dir` accept absolute paths, `~`/`~/...` relative to the active
+home, and other relative paths resolved from the invocation directory. The
+resolved absolute path is shown before installation.
+
+On macOS and Linux, pass options through the pipe:
 
 ```console
-$ curl -fsSL https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.sh | sh -s -- --version 0.1.3 --dir "$HOME/.local/bin" --yes --no-modify-path
+$ curl -fsSL https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.sh | sh -s -- --dir "./tools/bin" --yes --no-modify-path
 ```
 
-The scripts also read `SKILL_MANAGER_VERSION`, `SKILL_MANAGER_INSTALL_DIR`,
-`SKILL_MANAGER_INSTALL_YES=1`, and `SKILL_MANAGER_NO_MODIFY_PATH=1`. Because
-`irm | iex` cannot receive parameters, use those environment variables on
+Because `irm | iex` cannot receive parameters, use environment variables on
 Windows:
 
 ```powershell
-$env:SKILL_MANAGER_INSTALL_DIR = 'C:\tools\bin'
+$env:SKILL_MANAGER_INSTALL_DIR = '.\tools\bin'
 powershell -c "irm https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.ps1 | iex"
 ```
 
-For a manual, independently verified installation, use the
+Both scripts also support `SKILL_MANAGER_VERSION`,
+`SKILL_MANAGER_INSTALL_YES=1`, and `SKILL_MANAGER_NO_MODIFY_PATH=1`. For a
+manual installation, use the
 [latest release](https://github.com/sernst/skills/releases/latest) and its
 `SHA256SUMS`. For agent-assisted installation, use
-[`install.skill-manager.md`](./install.skill-manager.md). Release archives also
-include shell completions and a man page.
+[`install.skill-manager.md`](./install.skill-manager.md).
 
-## Five-minute quick start
+## Try an interactive workflow
 
-The repository hosts its own skills below `skills/`, so it is also a useful
-self-hosting example:
+Add this repository's skill collection, preview one deployment, then apply it:
 
 ```console
-$ skill-manager --json-input
-{"command":"source.add","source":"sernst/skills/skills","name":"sernst-skills","label":"sernst skills"}
-{"version":1,"event":"source.added","level":"info","data":{...}}
-
-$ skill-manager --json-input
-{"command":"load","sources":["sernst-skills"],"filters":["managing-skills"],"shared":true,"global":true,"dry_run":true}
-{"version":1,"event":"skill.loaded","level":"info","data":{"skill":"managing-skills",...,"dry_run":true}}
-{"version":1,"event":"summary","level":"info","data":{"action":"load",...}}
-
-$ skill-manager --json-input
-{"command":"load","sources":["sernst-skills"],"filters":["managing-skills"],"shared":true,"global":true}
-{"version":1,"event":"skill.loaded","level":"info","data":{"skill":"managing-skills",...}}
-{"version":1,"event":"summary","level":"info","data":{"action":"load",...}}
-
-$ skill-manager --json-input
-{"command":"status","filters":["managing-skills"],"shared":true,"global":true}
-{"version":1,"event":"status.row","level":"info","data":{"skill":"managing-skills",...}}
-{"version":1,"event":"summary","level":"info","data":{"action":"status","skills":1}}
+$ skill-manager source add sernst/skills/skills sernst-skills --label "sernst skills"
+$ skill-manager load sernst-skills --filter managing-skills --shared --global --dry-run
+$ skill-manager load sernst-skills --filter managing-skills --shared --global
+$ skill-manager status managing-skills --shared --global
 ```
 
-Start a new agent session if the harness scans installed skills only at
-startup. You can then ask the agent to use `$managing-skills` for conversational
-skill discovery, deployment, update, removal, and configuration.
+The dry run shows the same plan without deploying the skill. The next command
+shows the plan again and asks for authorization. Start a new agent session if
+your harness scans installed skills only at startup; you can then ask it to use
+`$managing-skills`.
 
-For an interactive shell, the equivalent shorter flow is:
-
-```console
-skill-manager source add sernst/skills/skills sernst-skills --label "sernst skills"
-skill-manager load sernst-skills --filter managing-skills --shared --global --dry-run --no-input
-skill-manager load sernst-skills --filter managing-skills --shared --global --no-input
-skill-manager status managing-skills --shared --global --no-input
-```
-
-## Mental model
+## Mental model and safety
 
 ```text
-sources -> discovered skills -> targets
-                              -> global scope
-                              -> project scope
+sources -> discovered skills -> target + scope deployments
 ```
 
-- A **source** is a local directory or GitHub repository path containing one
-  skill or a collection of skill directories.
-- A **skill** is a directory whose root contains `SKILL.md`. Patterns, filters,
-  and exact skill names (case-insensitive) all select which discovered skills
-  an operation uses; a bare name that matches both a discovered skill and a
-  same-named directory in the current directory selects the skill and warns
-  (use `./name` to force the directory), and a name matching none of those is
-  a hard error.
-- A **target** is a root-relative deployment template. Built-ins are `claude`
-  (`.claude/skills`), `shared` (`.agents/skills`), and `antigravity`
-  (`.gemini/antigravity/skills`).
-- A **scope** resolves a target beneath the manager home (`global`) or the exact
-  current working directory (`project`). A project deployment takes precedence
-  over a global deployment. When CWD is the manager home, only global scope is
-  available; explicit `--project` is rejected instead of aliasing global files.
+- A **source** is a local directory or GitHub repository path containing skill
+  directories.
+- A **skill** is a directory whose root contains `SKILL.md`.
+- A **target** is an agent harness's skill directory; built-ins are `claude`,
+  `shared`, and `antigravity`.
+- A **scope** is `global` (under the manager home) or `project` (under the
+  current project). Project deployments take precedence.
 
 Manager-owned configuration, cache, backups, and locks live beneath
-`~/.skill-manager/` by default. Set `SKILL_MANAGER_HOME` to isolate that state.
+`~/.skill-manager/` by default. Preview `load`, `update`, `copy`, and `remove`
+with `--dry-run`. A dry run does not change deployments, though startup storage
+migration or a required remote-cache refresh can still update manager-owned
+state.
 
-## Learn the CLI
+## Go deeper
 
-- [`cheatsheet.skill-manager.md`](./cheatsheet.skill-manager.md): goal-oriented
-  command, flag, JSON, NDJSON, configuration, and safety reference.
-- [`clis/skill-manager/docs/cli.md`](./clis/skill-manager/docs/cli.md):
-  canonical human CLI behavior.
-- [`clis/skill-manager/docs/json.md`](./clis/skill-manager/docs/json.md):
-  strict recipe and NDJSON contract for automation.
-- [`clis/skill-manager/docs/configuration.md`](./clis/skill-manager/docs/configuration.md):
-  storage, target templates, backups, migration, and filesystem safety.
-- [`clis/skill-manager/README.md`](./clis/skill-manager/README.md): CLI package
-  overview and contributor entry point.
-
-Preview `load`, `update`, `copy`, and `remove` with `--dry-run`. A dry run does
-not deploy or remove skills, but startup storage migration and a required
-remote-cache refresh can still update manager-owned state. Use explicit targets
-and scopes in unattended calls, parse every NDJSON line, and check the process
-exit code.
-
-## Skill catalog
-
-### [`drafting-commit-message`](./skills/drafting-commit-message/SKILL.md)
-
-Draft a concise, imperative commit title and motivation-focused change bullets
-from staged or unstaged changes.
-
-### [`grill-me`](./skills/grill-me/SKILL.md)
-
-Explore the available project context, then interview the user one decision at
-a time until a plan or design has no unresolved branches.
-
-### [`managing-skills`](./skills/managing-skills/SKILL.md)
-
-Operate the complete `skill-manager` CLI conversationally through strict JSON
-recipes and parsed NDJSON, with explicit safety and confirmation rules.
-
-### [`reviewing-implemented-work-order`](./skills/reviewing-implemented-work-order/SKILL.md)
-
-Review a work-order implementation against its job, research, plan, repository
-patterns, security requirements, and test coverage.
-
-### [`reviewing-my-code`](./skills/reviewing-my-code/SKILL.md)
-
-Prepare a focused review of branch changes by identifying key themes and
-surfacing correctness, security, performance, and coverage issues.
-
-### [`running-as-maestro`](./skills/running-as-maestro/SKILL.md)
-
-Run an agent as an accountable orchestrator that delegates work to subagents,
-selects appropriate model tiers, and verifies their output.
-
-## Contributing and releases
-
-See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the Just-based quality workflow
-and [`RELEASES.md`](./RELEASES.md) for tagged release procedures.
+- [Configuration and filesystem safety](./clis/skill-manager/docs/configuration.md)
+- [Human CLI reference](./clis/skill-manager/docs/cli.md)
+- [NDJSON and automation contract](./clis/skill-manager/docs/json.md)
+- [Goal-oriented cheatsheet](./cheatsheet.skill-manager.md)
+- [Architecture and development](./clis/skill-manager/docs/development.md)
+- [Contributing](./CONTRIBUTING.md) and [releases](./RELEASES.md)

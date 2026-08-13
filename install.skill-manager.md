@@ -9,7 +9,9 @@ appropriate installer below; do not ask the user to perform its prompts.
    `install.sh` on macOS or Linux. Stop and report an unsupported platform.
 2. Choose an explicit, user-writable install directory. The normal defaults are
    `%LOCALAPPDATA%\Programs\skill-manager` on Windows and `$HOME/.local/bin` on
-   macOS and Linux.
+   macOS and Linux. `~` and `~/...` use the active home; every other relative
+   path uses the installer's invocation directory. The installer displays and
+   uses a lexically normalized absolute path.
 3. Use the non-interactive overrides: install directory, assume-yes, and
    suppress PATH modification. The installers detect no TTY and use defaults,
    but explicit settings let you control and report the result. Add `--force`
@@ -40,8 +42,10 @@ skill-manager --version
 ```
 
 The optional version override is `--version <tag>` on macOS/Linux or
-`SKILL_MANAGER_VERSION` on Windows. The scripts verify release downloads
-against `SHA256SUMS`; do not bypass a checksum mismatch.
+`SKILL_MANAGER_VERSION` on Windows. Windows verifies release downloads against
+`SHA256SUMS`. The POSIX installer does so when `sha256sum` or `shasum` is
+available and warns prominently if neither is installed. Never bypass a
+checksum mismatch.
 
 ## Verify and report
 

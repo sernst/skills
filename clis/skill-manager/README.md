@@ -3,7 +3,7 @@
 `skill-manager` discovers `SKILL.md` directories from local or GitHub sources and deploys them to AI-tool skill directories. It is a standalone Rust 2024 executable with a testable library and recoverable filesystem deployment.
 
 Start with the repository [README](../../README.md) for the two-part toolkit and
-five-minute setup, or keep the
+interactive setup, or keep the
 [skill-manager cheatsheet](../../cheatsheet.skill-manager.md) nearby for
 goal-oriented examples. Agents can use the
 [`managing-skills` skill](../../skills/managing-skills/SKILL.md) for complete
@@ -12,23 +12,23 @@ conversational operation; the
 
 ## Install
 
-Install with the macOS/Linux or Windows one-liner in the repository
-[README](../../README.md#install). It also covers customization and manual,
-checksum-verified release installation.
+Install with the default macOS/Linux or Windows one-liner in the repository
+[README](../../README.md#install-skill-manager). It also covers custom
+directories and manual verification. Relative install directories resolve from
+the invocation directory; `~` and `~/...` resolve from the active home.
 
 ## Quick start
 
 ```console
-$ skill-manager source add ./my-skills --name team --label "Team skills"
-$ skill-manager load --all --global --no-input
+$ skill-manager source add ./my-skills team --label "Team skills"
+$ skill-manager load team --all --global --dry-run
+$ skill-manager load team --all --global
 $ skill-manager status
-$ skill-manager up --target claude --no-input
-$ skill-manager import my-skill --claude --global --dry-run --no-input
 ```
 
-Use `--dry-run` before a deployment mutation to emit its plan without changing
-skill deployments or source content. Startup storage migration still runs, and discovery may
-refresh manager-owned remote cache when required, even during a dry run.
+The dry run previews the plan; the next command renders it again and asks for
+authorization. Startup storage migration still runs, and discovery may refresh
+manager-owned remote cache when required, even during a dry run.
 
 ## Commands
 
