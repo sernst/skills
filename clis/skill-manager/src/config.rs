@@ -1217,20 +1217,20 @@ pub fn source_from_reference(
     mode: Option<SourceMode>,
     home: &Path,
 ) -> Result<SourceEntry> {
-    if let Some((owner, repo, reference, repo_path)) = parse_github_reference(raw) {
+    if let Some(reference) = parse_github_reference(raw)? {
         let mut entry = SourceEntry {
             id: String::new(),
             source_type: SourceType::GitHub,
             mode: mode.unwrap_or(SourceMode::Collection),
-            name: repo.clone(),
-            label: title_case(&repo),
+            name: reference.repo.clone(),
+            label: title_case(&reference.repo),
             exclude: Vec::new(),
             cache_ttl_hours: None,
             path: None,
-            owner: Some(owner),
-            repo: Some(repo),
-            r#ref: reference,
-            repo_path,
+            owner: Some(reference.owner),
+            repo: Some(reference.repo),
+            r#ref: reference.reference,
+            repo_path: reference.repo_path,
             alternate: None,
             extra: IndexMap::new(),
         };
@@ -1673,64 +1673,209 @@ fn absolutize_home(path: PathBuf) -> Result<PathBuf> {
     Ok(portable_path(&lexically_normalized(&absolute)))
 }
 
-fn parse_github_reference(raw: &str) -> Option<(String, String, Option<String>, Option<String>)> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GitHubReference {
+    owner: String,
+    repo: String,
+    reference: Option<String>,
+    repo_path: Option<String>,
+}
+
+/// Parse a canonical GitHub source reference.
+///
+/// `Ok(None)` means the operand is not a canonical GitHub reference and may
+/// be interpreted as a local path. An explicit `github.com` URL is never
+/// silently downgraded to a local path: malformed URLs return an input error.
+pub(crate) fn parse_github_reference(raw: &str) -> Result<Option<GitHubReference>> {
+    // Local spelling is intentional, even when its first two path components
+    // happen to satisfy the GitHub shorthand grammar (for example `./skills`).
+    // Keep this boundary here so every source-reference consumer agrees before
+    // add-operand inference gets a chance to probe the filesystem.
+    if is_explicit_local_reference(raw) {
+        return Ok(None);
+    }
     if let Ok(url) = Url::parse(raw) {
         if url.scheme() != "http" && url.scheme() != "https" {
-            return None;
+            return Ok(None);
         }
         if !matches!(url.host_str(), Some("github.com" | "www.github.com")) {
-            return None;
+            return Ok(None);
         }
-        let parts: Vec<_> = url
-            .path_segments()?
-            .filter(|part| !part.is_empty())
-            .collect();
-        if parts.len() < 2 {
-            return None;
-        }
-        if parts.get(2) == Some(&"tree") && parts.len() >= 4 {
-            return Some((
-                parts[0].to_owned(),
-                parts[1].trim_end_matches(".git").to_owned(),
-                Some(parts[3].to_owned()),
-                (parts.len() > 4).then(|| parts[4..].join("/")),
-            ));
-        }
-        return Some((
-            parts[0].to_owned(),
-            parts[1].trim_end_matches(".git").to_owned(),
-            None,
-            None,
-        ));
+        return parse_github_url(raw, &url).map(Some);
+    }
+    if is_explicit_github_url(raw) {
+        return Err(invalid_github_reference(raw));
     }
     if raw.contains("://") || raw.contains('\\') {
-        return None;
+        return Ok(None);
     }
-    let (owner, rest) = raw.split_once('/')?;
-    if !valid_github_segment(owner) {
-        return None;
+    let parts = raw.split('/').collect::<Vec<_>>();
+    if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
+        return Ok(None);
     }
-    let (repo_ref, repo_path) = rest
-        .split_once('/')
-        .map_or((rest, None), |(head, tail)| (head, Some(tail.to_owned())));
-    let (repo, reference) = repo_ref
-        .split_once(':')
-        .map_or((repo_ref, None), |(name, value)| {
-            (name, (!value.is_empty()).then(|| value.to_owned()))
-        });
-    if !valid_github_segment(repo) {
-        return None;
+    let owner = parts[0];
+    let (repo, reference) = match parts[1].split_once(':') {
+        Some((repo, reference)) if is_safe_github_path_component(reference) => {
+            (repo, Some(reference.to_owned()))
+        }
+        Some(_) => return Ok(None),
+        None => (parts[1], None),
+    };
+    if !valid_github_segment(owner) || !valid_github_segment(repo) {
+        return Ok(None);
     }
-    Some((
-        owner.to_owned(),
-        repo.to_owned(),
+    let repo_path = (parts.len() > 2).then(|| parts[2..].join("/"));
+    if repo_path
+        .as_deref()
+        .is_some_and(|path| !is_normalized_github_repo_path(path))
+    {
+        return Ok(None);
+    }
+    Ok(Some(GitHubReference {
+        owner: owner.to_owned(),
+        repo: repo.to_owned(),
         reference,
-        repo_path.filter(|path| !path.is_empty()),
-    ))
+        repo_path,
+    }))
+}
+
+/// Return whether the complete operand is a canonical GitHub source
+/// reference. This is the sole predicate used by argv role inference and JSON
+/// recipe rebasing, so neither can drift from source parsing.
+#[must_use]
+pub(crate) fn is_github_reference(raw: &str) -> bool {
+    parse_github_reference(raw).is_ok_and(|parsed| parsed.is_some())
+}
+
+fn parse_github_url(raw: &str, url: &Url) -> Result<GitHubReference> {
+    if url.username() != "" || url.password().is_some() || url.port().is_some() {
+        return Err(invalid_github_reference(raw));
+    }
+    let mut parts = url
+        .path_segments()
+        .ok_or_else(|| invalid_github_reference(raw))?
+        .collect::<Vec<_>>();
+    while parts.last() == Some(&"") {
+        parts.pop();
+    }
+    if parts.iter().any(|part| part.is_empty()) || raw_url_path_has_unsafe_components(raw) {
+        return Err(invalid_github_reference(raw));
+    }
+    if parts.len() < 2 {
+        return Err(invalid_github_reference(raw));
+    }
+    let owner = parts[0];
+    let repo = parts[1].strip_suffix(".git").unwrap_or(parts[1]);
+    if !valid_github_segment(owner) || !valid_github_segment(repo) {
+        return Err(invalid_github_reference(raw));
+    }
+    let (reference, repo_path) = match parts.as_slice() {
+        [_, _] => (None, None),
+        [_, _, "tree", reference, tail @ ..]
+            if is_safe_github_path_component(reference)
+                && tail.iter().all(|part| is_safe_github_path_component(part)) =>
+        {
+            (
+                Some((*reference).to_owned()),
+                (!tail.is_empty()).then(|| tail.join("/")),
+            )
+        }
+        _ => return Err(invalid_github_reference(raw)),
+    };
+    Ok(GitHubReference {
+        owner: owner.to_owned(),
+        repo: repo.to_owned(),
+        reference,
+        repo_path,
+    })
+}
+
+fn invalid_github_reference(raw: &str) -> SkillManagerError {
+    SkillManagerError::InvalidInput(format!("invalid GitHub source reference: {raw}"))
+}
+
+fn is_explicit_github_url(raw: &str) -> bool {
+    let lowercase = raw.to_ascii_lowercase();
+    [
+        "http://github.com",
+        "https://github.com",
+        "http://www.github.com",
+        "https://www.github.com",
+    ]
+    .iter()
+    .any(|prefix| {
+        lowercase
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(['/', '?', '#', ':']))
+    })
+}
+
+fn raw_url_path_has_unsafe_components(raw: &str) -> bool {
+    let Some((_, authority_and_path)) = raw.split_once("://") else {
+        return true;
+    };
+    let path = authority_and_path
+        .find('/')
+        .map(|index| &authority_and_path[index + 1..])
+        .unwrap_or_default()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    let mut components = path.split('/').collect::<Vec<_>>();
+    while components.last() == Some(&"") {
+        components.pop();
+    }
+    components
+        .iter()
+        .any(|component| !is_safe_github_path_component(component))
+}
+
+fn is_normalized_github_repo_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\\')
+        && !path.starts_with('/')
+        && !path.ends_with('/')
+        && path.split('/').all(is_safe_github_path_component)
+}
+
+fn is_safe_github_path_component(component: &str) -> bool {
+    if component.is_empty() || matches!(component, "." | ".." | "~") {
+        return false;
+    }
+    let lowercase = component.to_ascii_lowercase();
+    !(component.contains('\\')
+        || lowercase.contains("%2f")
+        || lowercase.contains("%5c")
+        || matches!(lowercase.as_str(), "%2e" | "%2e%2e" | ".%2e" | "%2e.")
+        || (component.len() == 2
+            && component.as_bytes()[0].is_ascii_alphabetic()
+            && component.as_bytes()[1] == b':'))
+}
+
+/// Return whether `raw` uses a filesystem spelling that takes precedence over
+/// GitHub shorthand parsing on every supported platform.
+fn is_explicit_local_reference(raw: &str) -> bool {
+    raw == "~"
+        || raw.starts_with("~/")
+        || raw.starts_with("~\\")
+        || raw.starts_with("./")
+        || raw.starts_with("../")
+        || raw.starts_with(".\\")
+        || raw.starts_with("..\\")
+        || raw.starts_with(['/', '\\'])
+        || Path::new(raw).is_absolute()
+        // Recognize Windows drive-rooted paths even when parsing a persisted
+        // configuration on a non-Windows host.
+        || raw.as_bytes().get(1) == Some(&b':')
+            && raw
+                .as_bytes()
+                .get(2)
+                .is_some_and(|separator| matches!(separator, b'/' | b'\\'))
 }
 
 fn valid_github_segment(value: &str) -> bool {
     !value.is_empty()
+        && !matches!(value, "." | "..")
         && value
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || "_.-".contains(character))
@@ -2042,9 +2187,10 @@ mod tests {
     use super::{
         BuiltinTargetSettings, Config, ConfigRepository, FileConfigRepository,
         derive_salted_source_id, derive_source_id, ensure_ascii, find_source_index,
-        is_builtin_name, locations_equal, manager_home, migrate_v0, normalize_target_template,
-        paths_equal, resolved_targets, resolved_targets_for_scope, source_from_reference,
-        source_location, source_reference, validate_config, validate_source,
+        is_builtin_name, is_github_reference, locations_equal, manager_home, migrate_v0,
+        normalize_target_template, parse_github_reference, paths_equal, resolved_targets,
+        resolved_targets_for_scope, source_from_reference, source_location, source_reference,
+        validate_config, validate_source,
     };
     use crate::domain::{Scope, SourceEntry, SourceLocation, SourceMode, SourceType, TargetEntry};
 
@@ -2565,6 +2711,26 @@ mod tests {
             "owner/repo:feature/team/skills"
         );
 
+        // These local markers must retain their meaning on every host: a
+        // Windows spelling may be read while validating configuration on a
+        // non-Windows machine, and vice versa.
+        for local_spelling in [
+            "./skills",
+            "../skills",
+            r".\skills",
+            r"..\skills",
+            "~/skills",
+            r"~\skills",
+            "/skills",
+            r"\skills",
+            "C:/skills",
+            r"C:\skills",
+        ] {
+            let local = source_from_reference(local_spelling, None, &unused_home())
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            assert_eq!(local.source_type, SourceType::Local, "{local_spelling}");
+        }
+
         let url = source_from_reference(
             "https://github.com/owner/repo.git/tree/main/nested/skills",
             None,
@@ -2617,6 +2783,85 @@ mod tests {
         assert_eq!(ensure_ascii("é😀"), "\\u00e9\\ud83d\\ude00");
         assert!(is_builtin_name("CLAUDE"));
         assert!(!is_builtin_name("custom"));
+    }
+
+    #[test]
+    fn github_reference_classification_validates_the_complete_reference() {
+        for reference in [
+            "owner/repo",
+            "owner/repo/subdir",
+            "owner/repo:main/subdir/nested",
+            "https://github.com/owner/repo",
+            "https://www.github.com/owner/repo.git/",
+            "https://github.com/owner/repo/tree/main",
+            "https://github.com/owner/repo/tree/main/subdir/nested",
+        ] {
+            assert!(
+                is_github_reference(reference),
+                "expected GitHub: {reference}"
+            );
+            assert!(
+                parse_github_reference(reference)
+                    .unwrap_or_else(|error| unreachable!("{reference}: {error}"))
+                    .is_some(),
+                "{reference}"
+            );
+        }
+
+        for reference in [
+            "./bar",
+            "../bar",
+            r".\bar",
+            r"..\bar",
+            "/rooted/bar",
+            r"\rooted\bar",
+            "C:/rooted/bar",
+            r"C:\rooted\bar",
+            "~/bar",
+            r"~\bar",
+            "owner/repo/../local",
+            "owner/repo:../local",
+            "owner/./repo",
+            "owner/repo//subdir",
+            "owner/repo/~/subdir",
+            "owner/repo/C:/subdir",
+            r"owner\repo\subdir",
+            r"owner/repo/subdir\escape",
+        ] {
+            assert!(
+                !is_github_reference(reference),
+                "expected local: {reference}"
+            );
+            assert!(
+                parse_github_reference(reference)
+                    .unwrap_or_else(|error| unreachable!("{reference}: {error}"))
+                    .is_none(),
+                "{reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_explicit_github_urls_are_input_errors() {
+        for reference in [
+            "https://github.com/owner",
+            "https://github.com/owner/repo/not-tree/main",
+            "https://github.com/owner/repo/tree",
+            "https://github.com/owner/repo/tree/main/../local",
+            "https://github.com/owner/repo/tree/main//local",
+            "https://github.com/owner/repo/tree/main/%2E%2E/local",
+            "https://github.com/owner/repo/tree/main/C:/local",
+        ] {
+            let Err(error) = source_from_reference(reference, None, &unused_home()) else {
+                unreachable!("malformed explicit GitHub URL succeeded: {reference}");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid GitHub source reference"),
+                "{reference}: {error}"
+            );
+        }
     }
 
     #[test]

@@ -95,13 +95,16 @@ Add this repository's skill collection, preview one deployment, then apply it:
 
 ```console
 $ skill-manager source add sernst/skills/skills sernst-skills --label "sernst skills"
+$ skill-manager describe sernst-skills:managing-skills
 $ skill-manager load sernst-skills --filter managing-skills --shared --global --dry-run
 $ skill-manager load sernst-skills --filter managing-skills --shared --global
 $ skill-manager status managing-skills --shared --global
 ```
 
-The dry run shows the same plan without deploying the skill. The next command
-shows the plan again and asks for authorization. Start a new agent session if
+`describe` shows trigger text and a bounded README/SKILL.md excerpt; qualify a
+skill with its source to inspect an excluded or shadowed copy. The dry run
+shows the same plan without deploying the skill. The next command shows the
+plan again and asks for authorization. Start a new agent session if
 your harness scans installed skills only at startup; you can then ask it to use
 `$managing-skills`.
 

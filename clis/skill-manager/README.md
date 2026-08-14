@@ -21,6 +21,7 @@ the invocation directory; `~` and `~/...` resolve from the active home.
 
 ```console
 $ skill-manager source add ./my-skills team --label "Team skills"
+$ skill-manager describe team:managing-skills
 $ skill-manager load team --all --global --dry-run
 $ skill-manager load team --all --global
 $ skill-manager status
@@ -34,7 +35,20 @@ manager-owned remote cache when required, even during a dry run.
 
 `status` is the default command and has `ls` and `list` aliases. `load`, whose visible alias is `install`, creates or replaces deployments, while `update` (`up`) only changes skills already present and confirms a compact, changed-only plan first. Both accept a positional operand that is a configured source, a path/GitHub reference, an exact discovered skill name (case-insensitive), or an existing directory; a name matching both a skill and a same-named directory selects the skill and warns, and one matching none of those is a hard error pointing at `skill-manager ls`. `import` reverses `load` by adopting one deployed, possibly agent-modified copy as the new source content, then can offer to synchronize other outdated installed copies. `copy` copies one source to an arbitrary destination. `remove` removes deployments and needs `--yes` for unattended use. `resolve` records a collision preference by excluding the losing source's duplicate.
 
-`source add|remove|list|update|locate|alternate|swap` manages sources. For example, pair a development checkout with its normal remote and switch without retyping either location:
+`describe` is the quickest way to inspect a skill or source: it prints trigger
+text, bounded README/SKILL.md documentation, source configuration, and source
+skill listings. Use `describe --all`, `describe --skills`, `describe --sources`,
+or `describe --source NAME --installed` to browse. A qualified selector such as
+`personal:teach` diagnoses that exact source copy, including excluded or
+shadowed copies. `--json` emits NDJSON for automation.
+
+`source add|remove|list|update|locate|alternate|swap` manages sources. `source
+add` and `target add` accept their name and location/path in either positional
+order when exactly one operand is an existing folder (or, for sources, one is
+an explicit GitHub URL or shorthand). Both-or-neither folders are an
+interactive ambiguity with two explicit mappings; for scripts use `LOCATION
+--name NAME`. For example, pair a development checkout with its normal remote
+and switch without retyping either location:
 
 ```console
 $ skill-manager source alternate personal sernst/skills

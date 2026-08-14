@@ -26,6 +26,10 @@ dual-scope `remove` still needs one. A recipe uses canonical `configs`,
 `configs.reset`, or `configs.restore` for configuration operations.
 `configs.reset` and `configs.restore` need `yes: true` in non-interactive
 mode; `configs.restore` optionally accepts the strict `backup` field.
+`source.add` and `target.add` recipes are deterministic named-field forms:
+they require `source`/`path` and `name`, never infer positional roles, and do
+not accept `yes`. The direct argv commands retain `--yes` only as a way to
+declare that prompting is unavailable; it cannot resolve ambiguous roles.
 
 ## Event stream
 
@@ -36,11 +40,56 @@ Every semantic stdout line is a JSON object with this envelope:
 ```
 
 `version` is currently `1`; `level` is `info`, `warning`, or `error`. Events
-cover planned and committed skill actions, status rows, sources, targets,
-collisions, diagnostics, configuration lifecycle, summaries, cancellation, and
-`command.failed`. Action data includes provenance, target path, dry-run state,
-and `scope` (`global` or `project`). Events follow plan order and a summary is
-last. A partial transaction emits committed actions before `command.failed`.
+cover planned and committed skill actions, read-only descriptions, status rows,
+sources, targets, collisions, diagnostics, configuration lifecycle, summaries,
+cancellation, and `command.failed`. Action data includes provenance, target
+path, dry-run state, and `scope` (`global` or `project`). Events follow plan
+order and a summary is last. A partial transaction emits committed actions
+before `command.failed`.
+
+### `describe` events
+
+`skill-manager describe … --json` is a read-only NDJSON stream. It emits one
+`describe.skill` or `describe.source` event for every selected result, in the
+same deterministic order as human output. Unmatched selectors that do not make
+the whole result empty emit `diagnostic` warning events first; an empty final
+result ends with `command.failed` and exit `1`. A successful stream ends with
+one `summary` event containing `{"action":"describe","skills":N,
+"sources":N}`. `describe` does not accept a recipe carrier: use `--json` for
+machine output.
+
+A `describe.skill` payload contains `skill`, a nested `source` metadata object,
+`trigger`, `resolver_status`, optional `resolver_detail`, `installation`, and
+bounded documentation. `installation` contains `installed`, `outdated`, and
+the inspected `deployments`; it is present whether or not a state filter was
+used. Its `content` is `{"kind":"readme"|"skill","lines":[…],
+"truncated":bool,"total_lines":N}`: lines are verbatim; README content is
+limited to 100 lines and SKILL.md fallback content to 20. Resolver status is
+`effective`, `excluded`, or `shadowed`; its detail explains an exclusion or
+the winning source when relevant.
+
+A `describe.source` payload contains a `source` configuration object, optional
+bounded README `content`, and `skills`. The source object includes persisted
+IDs, names, labels, locations, type/mode, exclusions, and cache settings. Each
+`skills[]` entry contains `skill`, `trigger`, `resolver_status`, and optional
+`resolver_detail`, so it can include excluded or shadowed skills. No describe
+event contains ANSI formatting or rendered Markdown headings.
+
+If a source cannot be materialized or inspected, `describe` first emits a
+`diagnostic` warning whose `message` preserves the source name and underlying
+cause. When no result survives, that diagnostic is followed by the terminal
+`command.failed` event; the generic empty-result error never replaces the
+materialization cause.
+
+### Ambiguous add diagnostics
+
+When two direct `source add` or `target add` operands have unresolved roles,
+NDJSON emits a `diagnostic` warning before the terminal `command.failed`
+event. Its data includes `kind: "ambiguous-argument-roles"`, `command`, the two
+`operands`, both tokenized `mappings` (`location` plus `name`), and an
+actionable `resolution` naming the canonical `LOCATION --name=NAME` form.
+This is not a `plan` event: the stable plan schema remains exclusive to the
+reviewable mutation plans documented below.
 
 `status.row` retains its effective `targets` state map and adds:
 

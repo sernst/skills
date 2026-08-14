@@ -16,8 +16,8 @@
 //!   neither fails this test immediately, naming itself, until a future
 //!   change handles it deliberately.
 //! - `no_command_leaf_ever_reads_or_writes_the_decoy_home` is the
-//!   behavioral check: it actually invokes every non-skipped leaf (plus one
-//!   deliberately added non-leaf invocation, bare `configs`; see
+//!   behavioral check: it actually invokes every non-skipped leaf (plus
+//!   deliberately added non-leaf invocations, including base `describe`; see
 //!   `additional_invocations`) against a decoy directory standing in for
 //!   the OS home, and proves the decoy is never read (no sentinel marker
 //!   leaks into stdout/stderr) or written (a byte-for-byte snapshot of the
@@ -257,13 +257,15 @@ fn known_leaf_args(leaf: &[String], home: &Path) -> Option<Vec<String>> {
             home.join("copy-destination").display().to_string(),
             "--dry-run".to_owned(),
         ]),
-        ["resolve"] => Some(vec!["nonexistent-skill".to_owned()]),
+        ["describe", "skill"] | ["resolve"] => Some(vec!["nonexistent-skill".to_owned()]),
+        ["describe", "source"] | ["source", "remove" | "swap"] => {
+            Some(vec!["nonexistent-source".to_owned()])
+        }
         ["status"] | ["source" | "target", "list"] => Some(Vec::new()),
         ["source", "add"] => Some(vec![
             home.join("synthetic-source").display().to_string(),
             "synthetic-source-name".to_owned(),
         ]),
-        ["source", "remove" | "swap"] => Some(vec!["nonexistent-source".to_owned()]),
         ["source", "update"] => Some(vec![
             "nonexistent-source".to_owned(),
             "--label".to_owned(),
@@ -345,20 +347,26 @@ fn observable_state(label: &str, home: &Path) -> PathBuf {
     }
 }
 
-/// One deliberately added invocation that is not a clap LEAF (bare
-/// `configs` dispatches into an optional subcommand, so `configs` itself
-/// has subcommand children in the tree and is excluded from
-/// `command_leaves`) but is behaviorally distinct from every leaf, and was
-/// the concrete deficiency motivating this rewrite: bare `configs` reads
-/// and renders the stored configuration, so a read-side bypass there is
-/// exactly as dangerous as one in `status` (already a leaf).
+/// Deliberately added invocations that are not clap LEAFs. `configs` and
+/// `describe` each dispatch into optional subcommands, so neither base
+/// command appears in `command_leaves`; each is behaviorally distinct from
+/// its children. Bare `configs` reads and renders stored configuration, and
+/// base `describe` performs its own polymorphic selection before it reaches
+/// skill/source rendering. A read-side bypass in either is as dangerous as
+/// one in an ordinary leaf.
 ///
 /// Bare invocation of the root command itself is deliberately NOT added
 /// here: `main.rs` maps an absent subcommand to `Command::Status` before
 /// dispatch even happens, so it is provably identical to the already-
 /// covered `status` leaf and adding it would just be a redundant iteration.
 fn additional_invocations() -> Vec<(Vec<String>, Vec<String>)> {
-    vec![(vec!["configs".to_owned()], Vec::new())]
+    vec![
+        (vec!["configs".to_owned()], Vec::new()),
+        (
+            vec!["describe".to_owned()],
+            vec!["nonexistent-skill-or-source".to_owned()],
+        ),
+    ]
 }
 
 /// `generate-completions` and `generate-man` are handled entirely in
@@ -478,9 +486,9 @@ fn every_command_leaf_is_known_or_explicitly_skipped() {
 }
 
 /// Behavioral guarantee: actually invoke every non-skipped leaf (plus the
-/// deliberately added non-leaf `configs` invocation) against a decoy
-/// standing in for the OS home, and prove the decoy is never read or
-/// written when `--home` is supplied.
+/// deliberately added non-leaf invocations) against a decoy standing in for
+/// the OS home, and prove the decoy is never read or written when `--home`
+/// is supplied.
 #[test]
 fn no_command_leaf_ever_reads_or_writes_the_decoy_home() {
     let leaves = command_leaves();

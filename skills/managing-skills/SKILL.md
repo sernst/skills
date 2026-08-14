@@ -5,23 +5,41 @@ description: Manage reusable agent skills with the installed skill-manager CLI. 
 
 # Manage skills
 
-Use `skill-manager` as the sole mutation boundary. Translate the user's intent
-into non-interactive commands, parse the complete result, and report what
-actually happened.
+Use `skill-manager` as the sole skill-management mutation boundary. Translate
+the user's intent into non-interactive commands, parse the complete result, and
+report what actually happened.
+
+## Bootstrap
+
+1. Run `skill-manager --version`.
+2. If it is absent, read [references/install.skill-manager.md](references/install.skill-manager.md)
+   in full. Detect the operating system, run its documented non-interactive
+   installer with an explicit user-writable directory and PATH modification
+   suppressed, and record the installed binary's absolute path (for example,
+   `C:\\...\\skill-manager.exe` or `/.../skill-manager`). Invoke that exact path
+   for every remaining `skill-manager` call in this operation; agent shell calls
+   can be separate processes, so do not rely on a one-off PATH change. When the
+   environment supports a persistent process PATH update, it may also prepend
+   the binary's directory, but never modify persistent shell PATH. Verify the
+   recorded executable with `--version`, then establish the needed source and
+   target context and continue with this workflow.
+3. If installation or verification fails, stop and report the exact failure.
 
 ## Start every operation
 
-1. Run `skill-manager --version`. If it is absent, stop and direct the user to
-   the repository's `install.skill-manager.md`; do not invent an installer.
-2. Read [references/recipes.md](references/recipes.md) before constructing a
+1. Read [references/recipes.md](references/recipes.md) before constructing a
    recipe. Read [references/events.md](references/events.md) before interpreting
    output. Read [references/workflows.md](references/workflows.md) for
    multi-command and conversational patterns.
-3. Establish initial context with `source.list` and `target.list` (or unfiltered
-   `status`) before using a narrow status filter. Once a relevant source is
-   configured, preflight with the narrowest applicable `status` or lifecycle
-   query. Do not infer hidden state from files.
-4. Resolve selectors to exact sources, skills, targets, and scopes. Ask one
+2. Start inspection with direct `skill-manager describe` calls: use exact or
+   qualified selectors for a known skill, `--source NAME` to scope a source,
+   and `--installed`/`--outdated`/`--not-installed` for deployment state.
+   Use `describe --skills` or `describe --sources` for type-wide discovery.
+   Inspect qualified excluded/shadowed copies only when the user identifies the
+   source. Use `source.list`, `target.list`, or `status` only when their
+   configuration/deployment matrix is specifically needed. Do not infer hidden
+   state from files.
+3. Resolve selectors to exact sources, skills, targets, and scopes. Ask one
    concise question if the user's intent remains ambiguous.
 
 ## Execute with structured input
@@ -62,9 +80,11 @@ needs a configured local alternate location — without one, import fails
 outright, interactively or not; with one, it imports into that alternate like
 any other destination. `all_targets:true` selects
 enabled configured targets only; select a disabled target explicitly by name
-when the user intends that override. A machine `source.add` must include a
-nonblank `name`. Supply an explicit scope whenever required. Never answer
-prompts, depend on TTY behavior, or use `--color` for machine work.
+when the user intends that override. For direct argv, machine use should pass
+`SOURCE --name=NAME` to `source.add` and `PATH --name=NAME` to `target.add`;
+recipes use their explicit named fields. Supply an explicit scope whenever
+required. Never answer prompts, depend on TTY behavior, or use `--color` for
+machine work.
 
 The manager home is global-only. Never request project scope when CWD resolves
 to the manager home; use global scope or change to a project directory.
@@ -106,6 +126,8 @@ remains blocking; never ignore an exit code by itself.
 
 Recipes cover all ordinary operations. Use direct argv only for:
 
+- `skill-manager describe [SELECTOR...] [--json]` (read-only inspection; see
+  [references/workflows.md](references/workflows.md#discover-and-inspect));
 - `skill-manager configs --raw` (raw bytes; never combine with JSON);
 - `skill-manager generate-completions --shell bash|zsh|fish|powershell`;
 - `skill-manager generate-man --output FILE`;

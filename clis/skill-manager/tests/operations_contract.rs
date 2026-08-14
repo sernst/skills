@@ -57,7 +57,7 @@ fn update_fixture_named_alpha() -> TempDir {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "alpha",
+            "--name=alpha",
         ])
         .assert()
         .success();
@@ -136,7 +136,7 @@ fn source_lifecycle_persists_updates_and_removal() {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "team",
+            "--name=team",
             "--label",
             "Team Skills",
             "--exclude",
@@ -245,6 +245,237 @@ fn source_add_and_remove_without_a_reference_use_the_current_directory() {
 }
 
 #[test]
+fn source_add_infers_argument_roles_and_accepts_explicit_and_identical_forms() {
+    let home = sandbox();
+    let source = home.path().join("existing-source");
+    fs::create_dir_all(&source).expect("create source directory");
+
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            "team",
+            source.to_str().expect("utf8 source"),
+        ])
+        .assert()
+        .success();
+    assert_eq!(read_config(home.path())["sources"][0]["name"], "team");
+
+    let reversed = sandbox();
+    let reversed_source = reversed.path().join("existing-source");
+    fs::create_dir_all(&reversed_source).expect("create reversed source directory");
+    cli(reversed.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            reversed_source.to_str().expect("utf8 source"),
+            "team",
+        ])
+        .assert()
+        .success();
+    assert_eq!(read_config(reversed.path())["sources"][0]["name"], "team");
+
+    let remote = sandbox();
+    cli(remote.path())
+        .args(["--json", "source", "add", "team", "owner/repository"])
+        .assert()
+        .success();
+    assert_eq!(read_config(remote.path())["sources"][0]["name"], "team");
+    assert_eq!(read_config(remote.path())["sources"][0]["type"], "github");
+
+    let identical = sandbox();
+    fs::create_dir_all(identical.path().join("same")).expect("create identical source");
+    cli(identical.path())
+        .args(["--json", "source", "add", "same", "same"])
+        .assert()
+        .success();
+    assert_eq!(read_config(identical.path())["sources"][0]["name"], "same");
+
+    let explicit = sandbox();
+    cli(explicit.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            "not-created-yet",
+            "--name=explicit",
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        read_config(explicit.path())["sources"][0]["name"],
+        "explicit"
+    );
+}
+
+#[test]
+fn source_add_recognizes_github_references_before_existing_directories() {
+    for reference in ["owner/repository", "https://github.com/owner/repository"] {
+        for github_first in [false, true] {
+            let home = sandbox();
+            fs::create_dir_all(home.path().join("team")).expect("create competing directory");
+            let operands = if github_first {
+                [reference, "team"]
+            } else {
+                ["team", reference]
+            };
+            cli(home.path())
+                .args(["--json", "source", "add", operands[0], operands[1]])
+                .assert()
+                .success();
+
+            let source = read_config(home.path())["sources"][0].clone();
+            assert_eq!(source["name"], "team", "{reference} in {operands:?}");
+            assert_eq!(source["type"], "github", "{reference} in {operands:?}");
+            assert_eq!(source["owner"], "owner", "{reference} in {operands:?}");
+            assert_eq!(source["repo"], "repository", "{reference} in {operands:?}");
+        }
+    }
+}
+
+#[test]
+fn source_add_keeps_explicit_local_spelling_local_in_every_operand_form() {
+    for arguments in [
+        vec!["foo", "./bar/"],
+        vec!["./bar/", "foo"],
+        vec!["./bar/", "--name=foo"],
+    ] {
+        let home = sandbox();
+        fs::create_dir_all(home.path().join("bar")).expect("create explicit local source");
+        cli(home.path())
+            .args(["--json", "source", "add"])
+            .args(&arguments)
+            .assert()
+            .success();
+
+        let source = read_config(home.path())["sources"][0].clone();
+        assert_eq!(source["name"], "foo", "{arguments:?}");
+        assert_eq!(source["type"], "local", "{arguments:?}");
+        assert_eq!(
+            source["path"],
+            portable_canonicalize(home.path().join("bar"))
+                .expect("canonical explicit local source")
+                .to_string_lossy()
+                .as_ref(),
+            "{arguments:?}"
+        );
+    }
+}
+
+#[test]
+fn source_add_chooses_an_existing_internal_local_path_over_github_classification() {
+    let home = sandbox();
+    let local = home.path().join("owner/local");
+    fs::create_dir_all(home.path().join("owner/repo")).expect("create traversed local directory");
+    fs::create_dir_all(&local).expect("create normalized local source");
+
+    cli(home.path())
+        .args([
+            "--json",
+            "source",
+            "add",
+            "local-source",
+            "owner/repo/../local",
+        ])
+        .assert()
+        .success();
+
+    let source = read_config(home.path())["sources"][0].clone();
+    assert_eq!(source["name"], "local-source");
+    assert_eq!(source["type"], "local");
+    assert_eq!(
+        source["path"],
+        portable_canonicalize(local)
+            .expect("canonical local source")
+            .to_string_lossy()
+            .as_ref()
+    );
+}
+
+#[test]
+fn source_add_prompts_for_ambiguous_roles_and_rejects_noninteractive_guessing() {
+    let interactive = sandbox();
+    cli(interactive.path())
+        .args([
+            "source",
+            "add",
+            "chosen-name",
+            "missing-source",
+            "--label",
+            "Chosen",
+        ])
+        .write_stdin("\n2\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "source add plan — argument roles unresolved",
+        ))
+        .stderr(predicate::str::contains("Warning: source.add"))
+        .stderr(predicate::str::contains(
+            "Select argument roles [1-2, c to cancel]",
+        ))
+        .stderr(predicate::str::contains("Enter 1, 2, or c."));
+    assert_eq!(
+        read_config(interactive.path())["sources"][0]["name"],
+        "chosen-name"
+    );
+
+    let two_directories = sandbox();
+    fs::create_dir_all(two_directories.path().join("first")).expect("create first directory");
+    fs::create_dir_all(two_directories.path().join("second")).expect("create second directory");
+    cli(two_directories.path())
+        .args(["source", "add", "first", "second", "--label", "Second"])
+        .write_stdin("1\n")
+        .assert()
+        .success();
+    assert_eq!(
+        read_config(two_directories.path())["sources"][0]["name"],
+        "second"
+    );
+
+    for flag in ["--no-input", "--yes"] {
+        let home = sandbox();
+        cli(home.path())
+            .args(["source", "add", "first", "second", "--label", "Test", flag])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("pass SOURCE --name=NAME"));
+    }
+
+    let machine = sandbox();
+    let output = cli(machine.path())
+        .args(["--json", "source", "add", "first", "second"])
+        .output()
+        .expect("run ambiguous machine source add");
+    assert!(!output.status.success());
+    let events = String::from_utf8(output.stdout)
+        .expect("UTF-8 events")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("NDJSON event"))
+        .collect::<Vec<_>>();
+    assert_eq!(events[0]["event"], "diagnostic");
+    assert_eq!(events[0]["data"]["kind"], "ambiguous-argument-roles");
+    assert_eq!(
+        events[0]["data"]["mappings"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(events[0]["data"]["resolution"], "pass SOURCE --name=NAME");
+    assert!(events.iter().all(|event| event["event"] != "plan"));
+    assert_eq!(
+        events.last().map(|event| &event["event"]),
+        Some(&json!("command.failed"))
+    );
+    assert!(events.last().is_some_and(|event| {
+        event["data"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("pass SOURCE --name=NAME"))
+    }));
+    assert!(!machine.path().join(".skill-manager/config.json").exists());
+}
+
+#[test]
 fn source_list_machine_and_empty_cases() {
     let home = sandbox();
     cli(home.path())
@@ -284,7 +515,7 @@ fn source_list_machine_and_empty_cases() {
 fn target_lifecycle_enforces_builtin_and_custom_semantics() {
     let home = sandbox();
     cli(home.path())
-        .args(["--json", "target", "add", "custom", "first-target"])
+        .args(["--json", "target", "add", "first-target", "--name=custom"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"event\":\"target.added\""));
@@ -318,7 +549,7 @@ fn target_lifecycle_enforces_builtin_and_custom_semantics() {
     assert!(read_config(home.path())["targets"]["custom"].is_null());
 
     cli(home.path())
-        .args(["--json", "target", "add", "claude", "somewhere"])
+        .args(["--json", "target", "add", "somewhere", "--name=claude"])
         .assert()
         .failure()
         .stdout(predicate::str::contains("\"event\":\"command.failed\""));
@@ -331,6 +562,63 @@ fn target_lifecycle_enforces_builtin_and_custom_semantics() {
         read_config(home.path())["builtins"]["claude"]["enabled"],
         false
     );
+}
+
+#[test]
+fn target_add_infers_existing_paths_and_prompts_for_ambiguous_roles() {
+    let normal = sandbox();
+    let normal_path = normal.path().join("target-root");
+    fs::create_dir_all(&normal_path).expect("create target path");
+    cli(normal.path())
+        .args(["--json", "target", "add", "custom", "target-root"])
+        .assert()
+        .success();
+    assert!(read_config(normal.path())["targets"]["custom"].is_object());
+
+    let reversed = sandbox();
+    let reversed_path = reversed.path().join("target-root");
+    fs::create_dir_all(&reversed_path).expect("create reversed target path");
+    cli(reversed.path())
+        .args(["--json", "target", "add", "target-root", "custom"])
+        .assert()
+        .success();
+    assert!(read_config(reversed.path())["targets"]["custom"].is_object());
+
+    let interactive = sandbox();
+    cli(interactive.path())
+        .args(["target", "add", "custom", "missing-target"])
+        .write_stdin("2\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "target add plan — argument roles unresolved",
+        ))
+        .stderr(predicate::str::contains("Warning: target.add"));
+    assert!(read_config(interactive.path())["targets"]["custom"].is_object());
+
+    let identical = sandbox();
+    cli(identical.path())
+        .args(["--json", "target", "add", "same", "same"])
+        .assert()
+        .success();
+    assert!(read_config(identical.path())["targets"]["same"].is_object());
+
+    let ambiguous = sandbox();
+    cli(ambiguous.path())
+        .args(["--json", "target", "add", "first", "second"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("pass PATH --name=NAME"));
+    assert!(!ambiguous.path().join(".skill-manager/config.json").exists());
+
+    let cancelled = sandbox();
+    cli(cancelled.path())
+        .args(["target", "add", "first", "second"])
+        .write_stdin("c\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Cancelled."));
+    assert!(!cancelled.path().join(".skill-manager/config.json").exists());
 }
 
 #[test]
@@ -455,12 +743,12 @@ fn copy_load_update_status_and_remove_mutate_expected_trees() {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
     cli(home.path())
-        .args(["--json", "target", "add", "test-target", "managed"])
+        .args(["--json", "target", "add", "managed", "--name=test-target"])
         .assert()
         .success();
 
@@ -541,12 +829,12 @@ fn skill_action_events_preserve_loaded_overwritten_updated_copied_and_removed_pr
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
     cli(home.path())
-        .args(["--json", "target", "add", "custom", "target"])
+        .args(["--json", "target", "add", "target", "--name=custom"])
         .assert()
         .success();
 
@@ -630,10 +918,10 @@ fn status_filter_sorting_and_target_scoping_are_deterministic() {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "primary",
             "--label",
             "Primary Label",
         ])
+        .arg("--name=primary")
         .assert()
         .success();
     for (name, path) in [("one", &target_one), ("two", &target_two)] {
@@ -642,11 +930,11 @@ fn status_filter_sorting_and_target_scoping_are_deterministic() {
                 "--json",
                 "target",
                 "add",
-                name,
                 path.file_name()
                     .and_then(|value| value.to_str())
                     .expect("utf8 path"),
             ])
+            .arg(format!("--name={name}"))
             .assert()
             .success();
     }
@@ -712,14 +1000,14 @@ fn status_json_preserves_stable_and_human_source_provenance() {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "source-name",
+            "--name=source-name",
             "--label",
             "Source Label",
         ])
         .assert()
         .success();
     cli(home.path())
-        .args(["--json", "target", "add", "custom", "target"])
+        .args(["--json", "target", "add", "target", "--name=custom"])
         .assert()
         .success();
     let source_id = read_config(home.path())["sources"][0]["id"]
@@ -764,7 +1052,7 @@ fn human_status_renders_compact_source_legend_table_and_plain_summary() {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "primary",
+            "--name=primary",
             "--label",
             "Primary Label",
         ])
@@ -776,14 +1064,14 @@ fn human_status_renders_compact_source_legend_table_and_plain_summary() {
             "source",
             "add",
             second_source.to_str().expect("utf8 path"),
-            "very-long-source-alias",
+            "--name=very-long-source-alias",
             "--label",
             "Other Label",
         ])
         .assert()
         .success();
     cli(home.path())
-        .args(["--json", "target", "add", "custom", "target"])
+        .args(["--json", "target", "add", "target", "--name=custom"])
         .assert()
         .success();
 
@@ -825,8 +1113,8 @@ fn human_status_renders_compact_source_legend_table_and_plain_summary() {
             "source",
             "add",
             empty_source.to_str().expect("utf8 path"),
-            "empty",
         ])
+        .arg("--name=empty")
         .assert()
         .success();
     cli(empty_home.path())
@@ -863,7 +1151,7 @@ fn dry_run_never_writes_deployments_or_configuration() {
     create_skill(&source, "alpha", "# Alpha");
 
     cli(home.path())
-        .args(["--json", "target", "add", "custom", "target"])
+        .args(["--json", "target", "add", "target", "--name=custom"])
         .assert()
         .success();
     cli(home.path())
@@ -872,7 +1160,7 @@ fn dry_run_never_writes_deployments_or_configuration() {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -912,12 +1200,12 @@ fn cwd_source_selectors_change_discovery_without_reordering_configured_sources()
             "source",
             "add",
             configured.to_str().expect("utf8 path"),
-            "configured",
         ])
+        .arg("--name=configured")
         .assert()
         .success();
     cli(home.path())
-        .args(["--json", "target", "add", "custom", "target"])
+        .args(["--json", "target", "add", "target", "--name=custom"])
         .assert()
         .success();
 
@@ -987,12 +1275,12 @@ fn filters_update_only_and_remove_confirmation_preserve_unselected_content() {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
     cli(home.path())
-        .args(["--json", "target", "add", "custom", "managed"])
+        .args(["--json", "target", "add", "managed", "--name=custom"])
         .assert()
         .success();
 
@@ -1116,7 +1404,7 @@ fn strict_recipe_modes_resolve_paths_and_cli_values_win() {
             "source",
             "add",
             recipe_source.to_str().expect("utf8 recipe source"),
-            "relative-source",
+            "--name=relative-source",
         ])
         .assert()
         .success();
@@ -1316,7 +1604,7 @@ fn completion_and_man_generation_hooks_produce_installable_assets() {
 fn human_output_honors_color_policy_and_diagnostic_streams() {
     let home = sandbox();
     cli(home.path())
-        .args(["--json", "target", "add", "custom", "target"])
+        .args(["--json", "target", "add", "target", "--name=custom"])
         .assert()
         .success();
 
@@ -1337,7 +1625,7 @@ fn human_output_honors_color_policy_and_diagnostic_streams() {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -1404,11 +1692,11 @@ fn later_target_failure_preserves_prior_commits_and_orders_failure_last() {
                 "--json",
                 "target",
                 "add",
-                name,
                 path.file_name()
                     .and_then(|value| value.to_str())
                     .expect("utf8 path"),
             ])
+            .arg(format!("--name={name}"))
             .assert()
             .success();
     }
@@ -1578,13 +1866,8 @@ fn collisions_are_first_source_wins_and_resolve_persists_exclude() {
 
     for (path, name) in [(&first, "first"), (&second, "second")] {
         cli(home.path())
-            .args([
-                "--json",
-                "source",
-                "add",
-                path.to_str().expect("utf8 path"),
-                name,
-            ])
+            .args(["--json", "source", "add", path.to_str().expect("utf8 path")])
+            .arg(format!("--name={name}"))
             .assert()
             .success();
     }
@@ -1636,13 +1919,8 @@ fn resolve_literal_skill_name_resolves_only_that_collision_leaving_the_other_unr
 
     for (path, name) in [(&first, "first"), (&second, "second")] {
         cli(home.path())
-            .args([
-                "--json",
-                "source",
-                "add",
-                path.to_str().expect("utf8 path"),
-                name,
-            ])
+            .args(["--json", "source", "add", path.to_str().expect("utf8 path")])
+            .arg(format!("--name={name}"))
             .assert()
             .success();
     }
@@ -1697,13 +1975,8 @@ fn resolve_with_no_operands_resolves_every_collision() {
 
     for (path, name) in [(&first, "first"), (&second, "second")] {
         cli(home.path())
-            .args([
-                "--json",
-                "source",
-                "add",
-                path.to_str().expect("utf8 path"),
-                name,
-            ])
+            .args(["--json", "source", "add", path.to_str().expect("utf8 path")])
+            .arg(format!("--name={name}"))
             .assert()
             .success();
     }
@@ -1794,7 +2067,13 @@ fn human_prompts_cover_text_confirmation_cancellation_and_invalid_answers() {
 
     let target = home.path().join("prompt-target");
     cli(home.path())
-        .args(["--json", "target", "add", "prompt-target", "prompt-target"])
+        .args([
+            "--json",
+            "target",
+            "add",
+            "prompt-target",
+            "--name=prompt-target",
+        ])
         .assert()
         .success();
     cli(home.path())
@@ -1845,16 +2124,16 @@ fn remove_literal_skill_name_does_not_touch_other_deployed_skills() {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
     cli(home.path())
-        .args(["--json", "target", "add", "target-a", "target-a"])
+        .args(["--json", "target", "add", "target-a", "--name=target-a"])
         .assert()
         .success();
     cli(home.path())
-        .args(["--json", "target", "add", "target-b", "target-b"])
+        .args(["--json", "target", "add", "target-b", "--name=target-b"])
         .assert()
         .success();
 
@@ -1904,13 +2183,8 @@ fn interactive_collision_choice_selects_the_requested_winner() {
     create_skill(&second, "common", "# Second");
     for (path, name) in [(&first, "first"), (&second, "second")] {
         cli(home.path())
-            .args([
-                "--json",
-                "source",
-                "add",
-                path.to_str().expect("utf8 path"),
-                name,
-            ])
+            .args(["--json", "source", "add", path.to_str().expect("utf8 path")])
+            .arg(format!("--name={name}"))
             .assert()
             .success();
     }
@@ -1969,7 +2243,7 @@ fn no_work_paths_succeed_without_creating_destination_content() {
     assert!(!destination.exists());
 
     cli(home.path())
-        .args(["--json", "target", "add", "managed", "managed"])
+        .args(["--json", "target", "add", "managed", "--name=managed"])
         .assert()
         .success();
     cli(home.path())
@@ -1996,7 +2270,7 @@ fn source_validation_rejects_duplicates_unknowns_and_invalid_values() {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -2006,7 +2280,7 @@ fn source_validation_rejects_duplicates_unknowns_and_invalid_values() {
             "source",
             "add",
             second_source.to_str().expect("utf8 path"),
-            "secondary",
+            "--name=secondary",
         ])
         .assert()
         .success();
@@ -2016,14 +2290,14 @@ fn source_validation_rejects_duplicates_unknowns_and_invalid_values() {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "other",
+            "--name=other",
         ],
         vec![
             "--json",
             "source",
             "add",
             home.path().to_str().expect("utf8 path"),
-            "PRIMARY",
+            "--name=PRIMARY",
         ],
     ] {
         cli(home.path())
@@ -2057,7 +2331,7 @@ fn source_validation_rejects_duplicates_unknowns_and_invalid_values() {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "ttl",
+            "--name=ttl",
             "--cache-ttl-hours=-1",
         ],
     ] {
@@ -2073,11 +2347,11 @@ fn source_validation_rejects_duplicates_unknowns_and_invalid_values() {
 fn target_validation_rejects_duplicates_and_unknown_lifecycle_references() {
     let home = sandbox();
     cli(home.path())
-        .args(["--json", "target", "add", "custom", "target"])
+        .args(["--json", "target", "add", "target", "--name=custom"])
         .assert()
         .success();
     cli(home.path())
-        .args(["--json", "target", "add", "custom", "duplicate"])
+        .args(["--json", "target", "add", "duplicate", "--name=custom"])
         .assert()
         .failure()
         .stdout(predicate::str::contains("already exists"));
@@ -2146,7 +2420,7 @@ fn project_scope_overrides_global_and_update_remove_infer_existing_scope() {
     create_skill(&source, "alpha", "# Global");
 
     cli(home.path())
-        .args(["--json", "target", "add", "custom", ".custom/skills"])
+        .args(["--json", "target", "add", ".custom/skills", "--name=custom"])
         .assert()
         .success();
     cli(home.path())
@@ -2300,7 +2574,7 @@ fn load_scope_inference_uses_exact_cwd_vendor_directory_as_its_default() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -2340,7 +2614,7 @@ fn positional_fnmatch_and_config_recovery_contracts_are_end_to_end() {
     create_skill(&source, "grill-two", "# Two");
     create_skill(&source, "other", "# Other");
     cli(home.path())
-        .args(["--json", "target", "add", "custom", ".custom/skills"])
+        .args(["--json", "target", "add", ".custom/skills", "--name=custom"])
         .assert()
         .success();
     cli(home.path())
@@ -2540,7 +2814,7 @@ fn import_ambiguous_fixture() -> (TempDir, PathBuf) {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -3416,7 +3690,7 @@ fn import_reports_nothing_to_import_when_every_deployment_matches_the_source() {
 fn import_into_a_github_source_requires_a_local_alternate() {
     let home = sandbox();
     cli(home.path())
-        .args(["--json", "source", "add", "acme/skills", "remote"])
+        .args(["--json", "source", "add", "acme/skills", "--name=remote"])
         .assert()
         .success();
     seed_github_cache(home.path(), "teach", "# teach remote\n");
@@ -3463,7 +3737,7 @@ fn import_into_a_github_source_requires_a_local_alternate() {
 fn import_writes_to_a_configured_github_local_alternate_after_review() {
     let home = sandbox();
     cli(home.path())
-        .args(["--json", "source", "add", "acme/skills", "remote"])
+        .args(["--json", "source", "add", "acme/skills", "--name=remote"])
         .assert()
         .success();
     seed_github_cache(home.path(), "teach", "# teach remote\n");
@@ -3926,7 +4200,7 @@ fn import_degenerate_fixture() -> TempDir {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -3959,7 +4233,7 @@ fn import_identical_candidates_fixture() -> TempDir {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -4026,7 +4300,7 @@ fn import_identical_bystander_fixture() -> TempDir {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -4493,7 +4767,7 @@ fn update_confirms_a_rendered_plan_before_deploying() {
             "source",
             "add",
             source.to_str().expect("utf8 path"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -4597,7 +4871,7 @@ fn home_directory_is_global_only_across_scoped_commands_and_configs() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -4697,7 +4971,7 @@ fn symlinked_home_spelling_is_still_global_only_when_supported() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -4766,7 +5040,7 @@ fn grouped_update_plan_uses_target_columns_both_scopes_and_up_alias() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -4952,7 +5226,7 @@ fn grouped_update_plan_preserves_each_divergent_target_delta() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -4985,12 +5259,18 @@ fn explicit_disabled_update_uses_selected_target_wording() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
     cli(home.path())
-        .args(["--json", "target", "add", "offline", ".offline/skills"])
+        .args([
+            "--json",
+            "target",
+            "add",
+            ".offline/skills",
+            "--name=offline",
+        ])
         .assert()
         .success();
     cli(home.path())
@@ -5024,7 +5304,7 @@ fn update_sections_have_one_blank_line_before_results_in_every_confirmation_mode
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -5096,7 +5376,7 @@ fn update_review_fixture() -> (TempDir, PathBuf) {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -5389,8 +5669,8 @@ fn update_reviews_and_applies_in_discovery_order_when_nothing_was_named() {
                 "source",
                 "add",
                 path.to_str().expect("utf8 source"),
-                name,
             ])
+            .arg(format!("--name={name}"))
             .assert()
             .success();
     }
@@ -5602,7 +5882,7 @@ fn load_review_fixture() -> (TempDir, PathBuf) {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -6689,12 +6969,18 @@ fn machine_and_recipe_updates_implicitly_use_only_enabled_installed_targets() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
     cli(home.path())
-        .args(["--json", "target", "add", "offline", ".offline/skills"])
+        .args([
+            "--json",
+            "target",
+            "add",
+            ".offline/skills",
+            "--name=offline",
+        ])
         .assert()
         .success();
     cli(home.path())
@@ -6767,7 +7053,7 @@ fn configs_human_output_is_layered_and_raw_output_remains_exact() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
             "--label",
             "Primary Skills",
         ])
@@ -6921,7 +7207,7 @@ fn load_bare_skill_name_resolves_from_an_unrelated_cwd() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "sernst-skills",
+            "--name=sernst-skills",
         ])
         .assert()
         .success();
@@ -6953,7 +7239,7 @@ fn install_uppercase_skill_name_folds_case() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -7022,7 +7308,7 @@ fn ambiguous_bare_word_prefers_the_skill_and_warns() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -7110,7 +7396,7 @@ fn bare_configured_source_name_and_label_still_resolve_as_sources() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
             "--label",
             "Primary Label",
         ])
@@ -7159,13 +7445,8 @@ fn collision_diagnostic_is_emitted_exactly_once_across_a_second_discovery_pass()
     create_skill(&second, "common", "# Second");
     for (path, name) in [(&first, "first"), (&second, "second")] {
         cli(home.path())
-            .args([
-                "--json",
-                "source",
-                "add",
-                path.to_str().expect("utf8 path"),
-                name,
-            ])
+            .args(["--json", "source", "add", path.to_str().expect("utf8 path")])
+            .arg(format!("--name={name}"))
             .assert()
             .success();
     }
@@ -7329,13 +7610,8 @@ fn provisional_word_resolution_does_not_trigger_a_third_discovery_pass() {
     create_skill(&second, "shared-name", "# Second");
     for (path, name) in [(&first, "first"), (&second, "second")] {
         cli(home.path())
-            .args([
-                "--json",
-                "source",
-                "add",
-                path.to_str().expect("utf8 path"),
-                name,
-            ])
+            .args(["--json", "source", "add", path.to_str().expect("utf8 path")])
+            .arg(format!("--name={name}"))
             .assert()
             .success();
     }
@@ -7398,7 +7674,7 @@ fn update_bare_skill_name_selects_only_that_skill() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -7444,7 +7720,7 @@ fn mixed_source_and_skill_operands_narrow_to_both() {
             "source",
             "add",
             source_a.to_str().expect("utf8 source a"),
-            "alpha-source",
+            "--name=alpha-source",
             "--label",
             "Alpha Source",
         ])
@@ -7456,7 +7732,7 @@ fn mixed_source_and_skill_operands_narrow_to_both() {
             "source",
             "add",
             source_b.to_str().expect("utf8 source b"),
-            "beta-source",
+            "--name=beta-source",
         ])
         .assert()
         .success();
@@ -7497,7 +7773,7 @@ fn glob_patterns_are_unaffected_by_literal_skill_name_resolution() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -7542,7 +7818,7 @@ fn literal_skill_name_with_an_unmatched_glob_still_succeeds_and_only_deploys_the
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -7623,7 +7899,7 @@ fn unresolvable_literal_with_a_matching_glob_is_still_a_hard_error() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -7667,7 +7943,7 @@ fn recipe_literal_skill_name_resolution_matches_the_cli() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -7715,7 +7991,7 @@ fn load_with_no_positional_operands_still_deploys_everything() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -7760,7 +8036,7 @@ fn remove_ambiguous_fixture() -> (TempDir, PathBuf) {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -8157,7 +8433,7 @@ fn remove_cancel_teaches_inferred_target_and_scope_hints() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -8213,7 +8489,7 @@ fn remove_originating_scenario_fixture() -> (TempDir, PathBuf) {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -8374,7 +8650,7 @@ fn remove_reviews_and_applies_skills_in_the_order_they_were_requested() {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();
@@ -8603,7 +8879,7 @@ fn remove_divergent_deployments_fixture() -> (TempDir, PathBuf) {
             "source",
             "add",
             source.to_str().expect("utf8 source"),
-            "primary",
+            "--name=primary",
         ])
         .assert()
         .success();

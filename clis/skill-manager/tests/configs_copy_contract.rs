@@ -188,7 +188,7 @@ fn seed_real_home_with_claude_skill(scratch: &TempDir, home: &Path, skill_name: 
             "source",
             "add",
             collection.to_str().expect("utf8 collection path"),
-            "collection",
+            "--name=collection",
         ])
         .assert()
         .success();
@@ -339,7 +339,7 @@ fn target_discovery_prefers_froms_own_configuration_over_the_active_home() {
     // configuration has no knowledge of, proving discovery reads `from`'s
     // configuration rather than falling back.
     cli(scratch.path(), &from)
-        .args(["target", "add", "custom-target", "custom-dir"])
+        .args(["target", "add", "custom-dir", "--name=custom-target"])
         .assert()
         .success();
     write_file(
@@ -351,7 +351,7 @@ fn target_discovery_prefers_froms_own_configuration_over_the_active_home() {
     // fallback path (if it were mistakenly used) would resolve nothing at
     // `custom-dir`.
     cli(scratch.path(), &active_home)
-        .args(["target", "add", "unrelated-target", "unrelated-dir"])
+        .args(["target", "add", "unrelated-dir", "--name=unrelated-target"])
         .assert()
         .success();
 
@@ -389,7 +389,7 @@ fn target_discovery_falls_back_to_the_active_home_configuration_when_from_has_no
     // `.skill-manager` at all, only a directory that happens to match that
     // custom target's path, so only the active-home fallback can discover it.
     cli(scratch.path(), &active_home)
-        .args(["target", "add", "special", "special-dir"])
+        .args(["target", "add", "special-dir", "--name=special"])
         .assert()
         .success();
     write_file(
@@ -1352,7 +1352,7 @@ fn a_target_configured_inside_the_cache_is_still_excluded() {
     // Configure a custom target whose path resolves inside the reserved cache
     // directory, then plant a secret there.
     cli(scratch.path(), &from)
-        .args(["target", "add", "cachey", ".skill-manager/cache"])
+        .args(["target", "add", ".skill-manager/cache", "--name=cachey"])
         .assert()
         .success();
     write_file(

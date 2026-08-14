@@ -33,6 +33,10 @@ Use this file to construct strict, single-invocation JSON objects for
   command accepts `both`.
 - `no_input` is a boolean accepted by every recipe. Recipe carriers are already
   non-interactive.
+- Argument-role inference is direct-argv-only. For automation, use
+  `SOURCE --name=NAME` with `source add` and `PATH --name=NAME` with
+  `target add`; recipes instead require explicit `source`/`name` or
+  `path`/`name` fields and never prompt or infer roles.
 
 Field notation below uses `string`, `bool`, `integer`, and `string|string[]`.
 Alternatives separated by `/` are aliases; prefer the first listed canonical
@@ -184,8 +188,11 @@ user explicitly wants the command to prompt—which recipes cannot do.
 Add a local path, GitHub tree URL, or `owner/repo[:ref][/path]`. Fields:
 `source`/`directory` (`string`), `name`/`source_name` (`string`), `label`
 (`string`), `exclude` (`string|string[]`), `mode` (`"collection"|"single"`),
-`cache_ttl_hours` (`integer`), and `no_input`. Machine/non-interactive use
-requires an explicit nonblank `name` or `source_name`; do not rely on a prompt.
+`cache_ttl_hours` (`integer`), and `no_input`.
+Machine/non-interactive use
+requires an explicit nonblank `name` or `source_name`; recipe fields never
+use the interactive positional-order inference or ambiguity prompt, so `yes`
+is not accepted.
 Omitted `source` means CWD, but agents should normally make it explicit.
 
 ```json
@@ -259,7 +266,9 @@ and `~user` are rejected. Built-ins are `claude`, `shared`, and `antigravity`.
 <!-- recipe-command: target.add fields: command,name,no_input,path -->
 ### `target.add`
 
-Add and enable a custom target. Required strings: `name`, `path`.
+Add and enable a custom target. Required strings: `name`, `path`. Optional:
+`no_input`. Recipe fields are explicit; they never use positional-order
+inference or an ambiguity prompt, so `yes` is not accepted.
 
 ```json
 {"command":"target.add","name":"my-agent","path":".my-agent/skills"}

@@ -1,6 +1,7 @@
 //! Application service and command orchestration.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
@@ -10,18 +11,19 @@ use crate::authorize::selection_range;
 use crate::authorize::{Authorization, Authorizer, SelectionOption};
 use crate::cache::{GitHubTransport, materialize_source};
 use crate::cli::{
-    Command, ConfigsAction, ConfigsArgs, ConfigsCopyArgs, CopyArgs, ImportArgs, RemoveArgs,
-    ResolveArgs, ScopeSelection, SourceAction, SourceAddArgs, SourceAlternateArgs,
-    SourceLocateArgs, SourceModeArg, SourceSelection, SourceSwapArgs, SourceUpdateArgs, StatusArgs,
-    SyncArgs, TargetAction, TargetSelection,
+    Command, ConfigsAction, ConfigsArgs, ConfigsCopyArgs, CopyArgs, DescribeAction, DescribeArgs,
+    DescribeSelection, ImportArgs, RemoveArgs, ResolveArgs, ScopeSelection, SourceAction,
+    SourceAddArgs, SourceAlternateArgs, SourceLocateArgs, SourceModeArg, SourceSelection,
+    SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction, TargetSelection,
 };
 use crate::config::{
     CONFIG_SCHEMA_VERSION, Config, ConfigBackup, ConfigRepository, FileConfigRepository,
     derive_salted_source_id, expand_home, find_source_index, fold, is_builtin_name,
-    location_from_reference, location_identity, location_reference, locations_equal, manager_home,
-    normalize_config_targets, normalize_target_template, paths_equal, portable_canonicalize,
-    portable_path, resolved_targets, resolved_targets_for_scope, set_source_location,
-    source_from_reference, source_location, source_reference,
+    is_github_reference, location_from_reference, location_identity, location_reference,
+    locations_equal, manager_home, normalize_config_targets, normalize_target_template,
+    paths_equal, portable_canonicalize, portable_path, resolved_targets,
+    resolved_targets_for_scope, set_source_location, source_from_reference, source_location,
+    source_reference,
 };
 use crate::domain::{
     ResolvedSource, Scope, ScopedTarget, SkillCandidate, SkillDiscovery, SourceEntry,
@@ -92,6 +94,43 @@ struct ImportDeployment {
 struct ScopeContext {
     project_root: PathBuf,
     project_available: bool,
+}
+
+/// Normalized selection shared by the three `describe` entry points.
+#[allow(clippy::struct_excessive_bools)]
+struct DescribeRequest {
+    selectors: Vec<String>,
+    source_selectors: Vec<String>,
+    skills: bool,
+    sources: bool,
+    all_skills: bool,
+    all_sources: bool,
+    installed: bool,
+    outdated: bool,
+    not_installed: bool,
+}
+
+/// One physical skill copy and its resolver relationship to other copies.
+#[derive(Clone)]
+struct DescribedSkill {
+    candidate: SkillCandidate,
+    resolver_status: &'static str,
+    resolver_detail: Option<String>,
+}
+
+/// Installation observations used both for filtering and structured output.
+struct DescribeInstallation {
+    installed: bool,
+    outdated: bool,
+    deployments: Vec<Value>,
+}
+
+/// Bounded source-file excerpt embedded in a description.
+struct DescribeExcerpt {
+    kind: &'static str,
+    lines: Vec<String>,
+    total_lines: usize,
+    truncated: bool,
 }
 
 /// One target's inspected scopes for one `remove` skill: the resolved target
@@ -272,6 +311,9 @@ where
             }
             Command::Status(args) => {
                 self.run_status(&config, &args)?;
+            }
+            Command::Describe(args) => {
+                self.run_describe(&config, args)?;
             }
             Command::Resolve(args) => {
                 self.run_resolve(&mut config, &loaded.active_path, &args)?;
@@ -1227,13 +1269,12 @@ where
                 "cache TTL must be zero or positive".into(),
             ));
         }
-        let reference = args.source.map_or_else(
-            || {
-                std::env::current_dir()
-                    .map(|path| path.display().to_string())
-                    .map_err(|error| SkillManagerError::io(".", error))
-            },
-            Ok,
+        let noninteractive = self.no_input || args.yes;
+        let (reference, supplied_name) = self.resolve_source_add_operands(
+            args.source,
+            args.source_name,
+            args.name,
+            noninteractive,
         )?;
         let mode = args.mode.map(|mode| match mode {
             SourceModeArg::Collection => SourceMode::Collection,
@@ -1257,16 +1298,17 @@ where
                 }
             }
         }
-        source.name = match args.name.or(args.source_name) {
+        source.name = match supplied_name {
             Some(name) if !name.trim().is_empty() => name,
             Some(_) => {
                 return Err(SkillManagerError::InvalidInput(
                     "source name must not be blank".into(),
                 ));
             }
-            None if self.no_input => {
+            None if noninteractive => {
                 return Err(SkillManagerError::InteractionRequired(
-                    "source name is required in noninteractive mode; pass NAME or --name".into(),
+                    "source name is required in noninteractive mode; pass SOURCE --name=NAME"
+                        .into(),
                 ));
             }
             None => self
@@ -1286,7 +1328,7 @@ where
         let default_label = title_case(&source.name);
         source.label = match args.label {
             Some(label) if !label.trim().is_empty() => label,
-            Some(_) | None if self.no_input => default_label,
+            Some(_) | None if noninteractive => default_label,
             Some(_) | None => self.prompt.text("Source Label", Some(&default_label))?,
         };
         source.exclude = normalized_patterns(args.exclude);
@@ -1300,6 +1342,158 @@ where
         ))?;
         self.reporter
             .event("source.added", Level::Info, source_data(&source))
+    }
+
+    fn resolve_source_add_operands(
+        &mut self,
+        source: Option<String>,
+        positional_name: Option<String>,
+        explicit_name: Option<String>,
+        noninteractive: bool,
+    ) -> Result<(String, Option<String>)> {
+        if explicit_name.is_some() && positional_name.is_some() {
+            return Err(SkillManagerError::InvalidInput(
+                "source add accepts either a second positional argument or --name, not both".into(),
+            ));
+        }
+        match (source, positional_name, explicit_name) {
+            (Some(reference), None, name) => Ok((reference, name)),
+            (Some(first), Some(second), None) => {
+                let (reference, name) = self.resolve_add_argument_roles(
+                    "source.add",
+                    "Source",
+                    &first,
+                    &second,
+                    true,
+                    noninteractive,
+                )?;
+                Ok((reference, Some(name)))
+            }
+            (None, None, name) => Ok((
+                std::env::current_dir()
+                    .map(|path| path.display().to_string())
+                    .map_err(|error| SkillManagerError::io(".", error))?,
+                name,
+            )),
+            (None, Some(_), _) => Err(SkillManagerError::InvalidInput(
+                "source add received a second positional argument without a first".into(),
+            )),
+            (Some(_), Some(_), Some(_)) => unreachable!("validated above"),
+        }
+    }
+
+    /// Resolve the one genuinely ambiguous dimension shared by `source add`
+    /// and `target add`: which positional operand names the location.
+    fn resolve_add_argument_roles(
+        &mut self,
+        command: &str,
+        location_label: &str,
+        first: &str,
+        second: &str,
+        recognize_github: bool,
+        noninteractive: bool,
+    ) -> Result<(String, String)> {
+        if first == second {
+            return Ok((first.to_owned(), second.to_owned()));
+        }
+
+        // A canonical GitHub reference is conclusive before filesystem
+        // probing. In particular, pairing one with an existing directory must
+        // not cause the directory to steal the source-location role. Reuse the
+        // normal source parser so shorthand recognition cannot drift from the
+        // references `source add` actually accepts.
+        let both_are_github = if recognize_github {
+            let first_is_github = is_github_reference(first);
+            let second_is_github = is_github_reference(second);
+            match (first_is_github, second_is_github) {
+                (true, false) => return Ok((first.to_owned(), second.to_owned())),
+                (false, true) => return Ok((second.to_owned(), first.to_owned())),
+                (true, true) => true,
+                (false, false) => false,
+            }
+        } else {
+            false
+        };
+
+        if !both_are_github {
+            let first_is_directory = operand_is_existing_directory(first, &self.home)?;
+            let second_is_directory = operand_is_existing_directory(second, &self.home)?;
+            match (first_is_directory, second_is_directory) {
+                (true, false) => return Ok((first.to_owned(), second.to_owned())),
+                (false, true) => return Ok((second.to_owned(), first.to_owned())),
+                (true, true) | (false, false) => {}
+            }
+        }
+
+        let options = [
+            SelectionOption::numbered(
+                0,
+                format!("{location_label} {first} · Name {second}"),
+                false,
+            ),
+            SelectionOption::numbered(
+                1,
+                format!("{location_label} {second} · Name {first}"),
+                false,
+            ),
+        ];
+        let message = format!(
+            "{command} cannot determine which argument is the {} and which is the name",
+            location_label.to_ascii_lowercase()
+        );
+        self.reporter.event(
+            "diagnostic",
+            Level::Warning,
+            json!({
+                "message": message,
+                "command": command,
+                "kind": "ambiguous-argument-roles",
+                "operands": [first, second],
+                "mappings": [
+                    {
+                        "token": options[0].token,
+                        "location": first,
+                        "name": second,
+                    },
+                    {
+                        "token": options[1].token,
+                        "location": second,
+                        "name": first,
+                    },
+                ],
+                "resolution": format!(
+                    "pass {} --name=NAME",
+                    location_label.to_ascii_uppercase()
+                ),
+            }),
+        )?;
+        self.reporter.diagnostic(&format!("Warning: {message}."))?;
+        self.reporter.human(&format!(
+            "{} plan — argument roles unresolved",
+            command.replace('.', " ")
+        ))?;
+        self.reporter.human("")?;
+        for option in &options {
+            self.reporter
+                .human(&format!("  {}  {}", option.token, option.label))?;
+        }
+
+        if noninteractive {
+            return Err(SkillManagerError::InteractionRequired(format!(
+                "{command} arguments are ambiguous in noninteractive mode; pass {location} --name=NAME",
+                location = location_label.to_ascii_uppercase()
+            )));
+        }
+        let question = format!("Select argument roles [{}]", selection_range(&options));
+        match Authorizer::new(self.prompt).select(&question, &options)? {
+            Authorization::Approved(0) => Ok((first.to_owned(), second.to_owned())),
+            Authorization::Approved(1) => Ok((second.to_owned(), first.to_owned())),
+            Authorization::Approved(_) => unreachable!("two argument-role options"),
+            Authorization::Cancelled => {
+                self.report_cancelled(command)?;
+                Err(SkillManagerError::Cancelled)
+            }
+        }
     }
 
     fn source_update(
@@ -1559,27 +1753,52 @@ where
                 Ok(())
             }
             TargetAction::Add(args) => {
-                if is_builtin_name(&args.name) {
+                let (path, name) = if let Some(name) = args.name {
+                    if args.second.is_some() {
+                        return Err(SkillManagerError::InvalidInput(
+                            "target add accepts either a second positional argument or --name, not both"
+                                .into(),
+                        ));
+                    }
+                    (args.first, name)
+                } else {
+                    let second = args.second.ok_or_else(|| {
+                        SkillManagerError::InvalidInput(
+                            "target add requires NAME and PATH, or PATH --name=NAME".into(),
+                        )
+                    })?;
+                    self.resolve_add_argument_roles(
+                        "target.add",
+                        "Path",
+                        &args.first,
+                        &second,
+                        false,
+                        self.no_input || args.yes,
+                    )?
+                };
+                if name.trim().is_empty() {
+                    return Err(SkillManagerError::InvalidInput(
+                        "target name must not be blank".into(),
+                    ));
+                }
+                if is_builtin_name(&name) {
                     return Err(SkillManagerError::InvalidInput(format!(
-                        "custom target name is reserved: {}",
-                        args.name
+                        "custom target name is reserved: {name}"
                     )));
                 }
                 if config
                     .targets
                     .keys()
-                    .any(|name| fold(name) == fold(&args.name))
+                    .any(|entry| fold(entry) == fold(&name))
                 {
                     return Err(SkillManagerError::InvalidInput(format!(
-                        "target already exists: {}",
-                        args.name
+                        "target already exists: {name}"
                     )));
                 }
-                let name = args.name;
                 config.targets.insert(
                     name.clone(),
                     TargetEntry {
-                        path: normalize_target_template(&args.path.to_string_lossy())?,
+                        path: normalize_target_template(&path)?,
                         label: title_case(&name),
                         enabled: true,
                         extra: IndexMap::new(),
@@ -3959,6 +4178,386 @@ where
         self.reporter.human("No deployed skills matched.")
     }
 
+    /// Resolve, filter, and render human-readable skill/source descriptions.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Description selection, physical-copy resolution, and dual-channel rendering are one read-only operation."
+    )]
+    fn run_describe(&mut self, config: &Config, args: DescribeArgs) -> Result<()> {
+        let request = normalize_describe_request(args);
+        let mut requested_source_indices = BTreeSet::new();
+        let mut source_selector_misses = Vec::new();
+        for selector in &request.source_selectors {
+            match find_source_index(config, selector, &self.home)? {
+                Some(index) => {
+                    requested_source_indices.insert(index);
+                }
+                None => source_selector_misses.push(selector.clone()),
+            }
+        }
+        let scoped_to_sources = !request.source_selectors.is_empty();
+
+        // Describe deliberately uses normal cache semantics: an existing remote
+        // cache is reused, while an absent one may be materialized. One broken
+        // source must not hide useful descriptions from every other source.
+        let mut resolved = Vec::new();
+        let mut materialization_misses = Vec::new();
+        for source in &config.sources {
+            match materialize_source(self.repository, self.github, source, false, false) {
+                Ok(value) => resolved.push(value),
+                Err(error) => materialization_misses.push(format!(
+                    "could not inspect source '{}': {error}",
+                    source.name
+                )),
+            }
+        }
+
+        let mut physical = Vec::<DescribedSkill>::new();
+        let mut winner_by_name = IndexMap::<String, String>::new();
+        for source in &resolved {
+            let paths = match detect_skill_dirs(source) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    materialization_misses.push(format!(
+                        "could not inspect skills in source '{}': {error}",
+                        source.entry.name
+                    ));
+                    continue;
+                }
+            };
+            for path in paths {
+                let name = skill_name(&path)?;
+                let identity = fold(&name);
+                let globally_excluded =
+                    !config.exclude.is_empty() && matches_patterns(&name, &config.exclude)?;
+                let locally_excluded = !source.entry.exclude.is_empty()
+                    && matches_patterns(&name, &source.entry.exclude)?;
+                let (resolver_status, resolver_detail) = if globally_excluded || locally_excluded {
+                    let scope = match (globally_excluded, locally_excluded) {
+                        (true, true) => "global and source exclusions",
+                        (true, false) => "a global exclusion",
+                        (false, true) => "a source exclusion",
+                        (false, false) => unreachable!(),
+                    };
+                    ("excluded", Some(format!("matched {scope}")))
+                } else if let Some(winner_source) = winner_by_name.get(&identity) {
+                    (
+                        "shadowed",
+                        Some(format!("effective copy is from {winner_source}")),
+                    )
+                } else {
+                    winner_by_name.insert(identity, source.entry.name.clone());
+                    ("effective", None)
+                };
+                physical.push(DescribedSkill {
+                    candidate: SkillCandidate {
+                        name,
+                        path,
+                        source: source.clone(),
+                    },
+                    resolver_status,
+                    resolver_detail,
+                });
+            }
+        }
+
+        let mut selected_skill_keys = BTreeSet::<String>::new();
+        let mut selected_source_indices = BTreeSet::<usize>::new();
+        let mut unmatched = Vec::<String>::new();
+
+        if request.skills && request.all_skills {
+            for skill in &physical {
+                let in_scope = !scoped_to_sources
+                    || requested_source_indices.iter().any(|index| {
+                        config
+                            .sources
+                            .get(*index)
+                            .is_some_and(|source| source.id == skill.candidate.source.entry.id)
+                    });
+                if in_scope && (scoped_to_sources || skill.resolver_status == "effective") {
+                    selected_skill_keys.insert(described_skill_key(skill));
+                }
+            }
+        }
+        if request.sources && request.all_sources {
+            selected_source_indices.extend(0..config.sources.len());
+        }
+
+        for selector in &request.selectors {
+            let mut matched = false;
+            if request.skills {
+                let qualified = describe_qualified_selector(config, selector, &self.home)?;
+                for skill in &physical {
+                    let source_in_flag_scope = !scoped_to_sources
+                        || requested_source_indices.iter().any(|index| {
+                            config
+                                .sources
+                                .get(*index)
+                                .is_some_and(|source| source.id == skill.candidate.source.entry.id)
+                        });
+                    if !source_in_flag_scope {
+                        continue;
+                    }
+                    let (source_index, pattern) = qualified
+                        .as_ref()
+                        .map_or((None, selector.as_str()), |(index, pattern)| {
+                            (Some(*index), pattern.as_str())
+                        });
+                    if source_index.is_some_and(|index| {
+                        config
+                            .sources
+                            .get(index)
+                            .is_none_or(|source| source.id != skill.candidate.source.entry.id)
+                    }) {
+                        continue;
+                    }
+                    if qualified.is_none()
+                        && !scoped_to_sources
+                        && skill.resolver_status != "effective"
+                    {
+                        continue;
+                    }
+                    if matches_patterns(&skill.candidate.name, &[pattern.to_owned()])? {
+                        selected_skill_keys.insert(described_skill_key(skill));
+                        matched = true;
+                    }
+                }
+            }
+            // A positional operand falls back to source matching only when it
+            // matched no skill at all. `--source` is a skill scope and disables
+            // this fallback, exactly like spelling SOURCE:PATTERN.
+            if !matched && request.sources && !scoped_to_sources {
+                for (index, source) in config.sources.iter().enumerate() {
+                    if describe_source_matches(source, selector)? {
+                        selected_source_indices.insert(index);
+                        matched = true;
+                    }
+                }
+            }
+            if !matched {
+                unmatched.push(selector.clone());
+            }
+        }
+
+        for selector in source_selector_misses {
+            unmatched.push(format!("--source={selector}"));
+        }
+
+        let mut selected_skills = Vec::new();
+        for skill in &physical {
+            if !selected_skill_keys.contains(&described_skill_key(skill)) {
+                continue;
+            }
+            let installation = describe_installation(config, &self.home, skill)?;
+            if describe_state_matches(&request, &installation) {
+                selected_skills.push((skill.clone(), installation));
+            }
+        }
+
+        for message in &materialization_misses {
+            self.emit_message_diagnostic(message)?;
+        }
+
+        if selected_skills.is_empty() && selected_source_indices.is_empty() {
+            return Err(SkillManagerError::NotFound {
+                kind: "skill or source description",
+                reference: if request.selectors.is_empty() {
+                    "requested filters".into()
+                } else {
+                    request.selectors.join(", ")
+                },
+            });
+        }
+
+        for selector in &unmatched {
+            self.emit_pattern_diagnostic(
+                &format!("describe selector matched nothing: {selector}"),
+                selector,
+            )?;
+        }
+
+        let mut first = true;
+        for (skill, installation) in &selected_skills {
+            if !first {
+                self.reporter.human(&"-".repeat(72))?;
+            }
+            first = false;
+            self.render_described_skill(skill, installation)?;
+        }
+        for index in &selected_source_indices {
+            let Some(source) = config.sources.get(*index) else {
+                continue;
+            };
+            if !first {
+                self.reporter.human(&"-".repeat(72))?;
+            }
+            first = false;
+            let source_skills = physical
+                .iter()
+                .filter(|skill| skill.candidate.source.entry.id == source.id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let source_root = resolved
+                .iter()
+                .find(|item| item.entry.id == source.id)
+                .map(|item| item.path.as_path());
+            self.render_described_source(source, source_root, &source_skills)?;
+        }
+        self.reporter.event(
+            "summary",
+            Level::Info,
+            json!({
+                "action": "describe",
+                "skills": selected_skills.len(),
+                "sources": selected_source_indices.len(),
+            }),
+        )
+    }
+
+    fn render_described_skill(
+        &mut self,
+        skill: &DescribedSkill,
+        installation: &DescribeInstallation,
+    ) -> Result<()> {
+        let trigger = skill_trigger(&skill.candidate.path.join("SKILL.md"))?;
+        let excerpt = skill_excerpt(&skill.candidate.path)?;
+        let color = self.reporter.color_enabled();
+        self.reporter
+            .human(&heading(&format!("Skill: {}", skill.candidate.name), color))?;
+        self.reporter.human("")?;
+        self.reporter
+            .human(&describe_field("Trigger", &trigger, color))?;
+        self.reporter.human(&describe_field(
+            "Source",
+            &skill.candidate.source.entry.name,
+            color,
+        ))?;
+        let resolver = skill.resolver_detail.as_ref().map_or_else(
+            || skill.resolver_status.to_owned(),
+            |detail| format!("{} ({detail})", skill.resolver_status),
+        );
+        self.reporter
+            .human(&describe_field("Resolver", &resolver, color))?;
+        let installed = match (installation.installed, installation.outdated) {
+            (true, true) => "installed; needs update",
+            (true, false) => "installed; up to date",
+            (false, _) => "not installed",
+        };
+        self.reporter
+            .human(&describe_field("Installation", installed, color))?;
+        self.reporter.human("")?;
+        let content_heading = if excerpt.kind == "readme" {
+            "README.md"
+        } else {
+            "SKILL.md excerpt"
+        };
+        self.reporter.human(&heading(content_heading, color))?;
+        self.reporter.human("")?;
+        for line in &excerpt.lines {
+            self.reporter.human(line)?;
+        }
+        if excerpt.truncated {
+            self.reporter.human(&describe_dimmed(
+                &format!(
+                    "… truncated after {} of {} lines",
+                    excerpt.lines.len(),
+                    excerpt.total_lines
+                ),
+                color,
+            ))?;
+        }
+        let mut data = json!({
+            "skill": skill.candidate.name,
+            "source": source_data(&skill.candidate.source.entry),
+            "trigger": trigger,
+            "resolver_status": skill.resolver_status,
+            "installation": {
+                "installed": installation.installed,
+                "outdated": installation.outdated,
+                "deployments": installation.deployments,
+            },
+            "content": excerpt_data(&excerpt),
+        });
+        if let (Some(object), Some(detail)) = (data.as_object_mut(), &skill.resolver_detail) {
+            object.insert("resolver_detail".into(), json!(detail));
+        }
+        self.reporter.event("describe.skill", Level::Info, data)
+    }
+
+    fn render_described_source(
+        &mut self,
+        source: &SourceEntry,
+        root: Option<&Path>,
+        skills: &[DescribedSkill],
+    ) -> Result<()> {
+        let color = self.reporter.color_enabled();
+        self.reporter
+            .human(&heading(&format!("Source: {}", source.name), color))?;
+        self.reporter.human("")?;
+        for (key, value) in describe_source_fields(source) {
+            self.reporter.human(&describe_field(&key, &value, color))?;
+        }
+        let excerpt = root.and_then(source_excerpt).transpose()?;
+        if let Some(excerpt) = &excerpt {
+            self.reporter.human("")?;
+            self.reporter.human(&heading("README.md", color))?;
+            self.reporter.human("")?;
+            for line in &excerpt.lines {
+                self.reporter.human(line)?;
+            }
+            if excerpt.truncated {
+                self.reporter.human(&describe_dimmed(
+                    &format!(
+                        "… truncated after {} of {} lines",
+                        excerpt.lines.len(),
+                        excerpt.total_lines
+                    ),
+                    color,
+                ))?;
+            }
+        }
+        self.reporter.human("")?;
+        self.reporter.human(&heading("Available skills", color))?;
+        if skills.is_empty() {
+            self.reporter.human("  None")?;
+        } else {
+            for skill in skills {
+                let trigger = skill_trigger(&skill.candidate.path.join("SKILL.md"))?;
+                let status = skill.resolver_detail.as_ref().map_or_else(
+                    || skill.resolver_status.to_owned(),
+                    |detail| format!("{}; {detail}", skill.resolver_status),
+                );
+                self.reporter.human(&format!(
+                    "  {}  [{}]\n    {}",
+                    skill.candidate.name, status, trigger
+                ))?;
+            }
+        }
+        let nested_skills = skills
+            .iter()
+            .map(|skill| {
+                let mut data = json!({
+                    "skill": skill.candidate.name,
+                    "trigger": skill_trigger(&skill.candidate.path.join("SKILL.md"))?,
+                    "resolver_status": skill.resolver_status,
+                });
+                if let (Some(object), Some(detail)) = (data.as_object_mut(), &skill.resolver_detail)
+                {
+                    object.insert("resolver_detail".into(), json!(detail));
+                }
+                Ok(data)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut data = json!({
+            "source": describe_source_data(source),
+            "skills": nested_skills,
+        });
+        if let (Some(object), Some(excerpt)) = (data.as_object_mut(), excerpt.as_ref()) {
+            object.insert("content".into(), excerpt_data(excerpt));
+        }
+        self.reporter.event("describe.source", Level::Info, data)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "Status discovery, deterministic row rendering, and aggregate counts form one cohesive read-only operation."
@@ -4620,6 +5219,310 @@ where
         }
         Ok(())
     }
+}
+
+fn normalize_describe_request(args: DescribeArgs) -> DescribeRequest {
+    match args.action {
+        Some(DescribeAction::Skill(args)) => {
+            let implied_all = args.selectors.is_empty()
+                && (args.all
+                    || !args.sources.is_empty()
+                    || args.installed
+                    || args.outdated
+                    || args.not_installed);
+            DescribeRequest {
+                selectors: args.selectors,
+                source_selectors: args.sources,
+                skills: true,
+                sources: false,
+                all_skills: args.all || implied_all,
+                all_sources: false,
+                installed: args.installed,
+                outdated: args.outdated,
+                not_installed: args.not_installed,
+            }
+        }
+        Some(DescribeAction::Source(args)) => DescribeRequest {
+            all_sources: args.all,
+            selectors: args.selectors,
+            source_selectors: Vec::new(),
+            skills: false,
+            sources: true,
+            all_skills: false,
+            installed: false,
+            outdated: false,
+            not_installed: false,
+        },
+        None => normalize_describe_selection(args.selection),
+    }
+}
+
+fn normalize_describe_selection(args: DescribeSelection) -> DescribeRequest {
+    let skills = !args.sources_only;
+    let sources = !args.skills;
+    let implied_skills = skills
+        && args.selectors.is_empty()
+        && (args.skills
+            || !args.sources.is_empty()
+            || args.installed
+            || args.outdated
+            || args.not_installed);
+    let implied_sources = sources && args.selectors.is_empty() && args.sources_only;
+    DescribeRequest {
+        selectors: args.selectors,
+        source_selectors: args.sources,
+        skills,
+        sources,
+        all_skills: args.all || args.all_skills || implied_skills,
+        all_sources: args.all || args.all_sources || implied_sources,
+        installed: args.installed,
+        outdated: args.outdated,
+        not_installed: args.not_installed,
+    }
+}
+
+fn described_skill_key(skill: &DescribedSkill) -> String {
+    format!(
+        "{}\u{0}{}",
+        skill.candidate.source.entry.id,
+        fold(&skill.candidate.name)
+    )
+}
+
+fn describe_qualified_selector(
+    config: &Config,
+    selector: &str,
+    home: &Path,
+) -> Result<Option<(usize, String)>> {
+    let Some((source, pattern)) = selector.split_once(':') else {
+        return Ok(None);
+    };
+    if pattern.is_empty() {
+        return Ok(None);
+    }
+    Ok(find_source_index(config, source, home)?.map(|index| (index, pattern.to_owned())))
+}
+
+fn describe_source_matches(source: &SourceEntry, selector: &str) -> Result<bool> {
+    let pattern = [selector.to_owned()];
+    let reference = source_reference(source);
+    for candidate in [
+        source.id.as_str(),
+        source.name.as_str(),
+        source.label.as_str(),
+        reference.as_str(),
+    ] {
+        if matches_patterns(candidate, &pattern)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn describe_state_matches(request: &DescribeRequest, installation: &DescribeInstallation) -> bool {
+    if !request.installed && !request.outdated && !request.not_installed {
+        return true;
+    }
+    request.installed && installation.installed
+        || request.outdated && installation.outdated
+        || request.not_installed && !installation.installed
+}
+
+fn describe_installation(
+    config: &Config,
+    home: &Path,
+    skill: &DescribedSkill,
+) -> Result<DescribeInstallation> {
+    let project_root = current_project_root()?;
+    let scopes = if project_scope_available(home, &project_root) {
+        vec![Scope::Global, Scope::Project]
+    } else {
+        vec![Scope::Global]
+    };
+    let mut installed = false;
+    let mut outdated = false;
+    let mut deployments = Vec::new();
+    for scope in scopes {
+        for target in resolved_targets_for_scope(config, home, &project_root, scope).values() {
+            let path = target.target.path.join(&skill.candidate.name);
+            if !path.is_dir() {
+                continue;
+            }
+            installed = true;
+            let needs_update = !directories_equal(&skill.candidate.path, &path)?;
+            outdated |= needs_update;
+            deployments.push(json!({
+                "target": target.target.name,
+                "scope": scope,
+                "path": path,
+                "enabled": target.target.enabled,
+                "state": if needs_update { "needs-update" } else { "up-to-date" },
+            }));
+        }
+    }
+    Ok(DescribeInstallation {
+        installed,
+        outdated,
+        deployments,
+    })
+}
+
+fn skill_trigger(path: &Path) -> Result<String> {
+    let contents = fs::read_to_string(path).map_err(|error| SkillManagerError::io(path, error))?;
+    let mut lines = contents.lines();
+    if lines.next().is_none_or(|line| line.trim() != "---") {
+        return Ok(String::new());
+    }
+    let frontmatter = lines
+        .take_while(|line| line.trim() != "---")
+        .collect::<Vec<_>>();
+    for (index, line) in frontmatter.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let Some(raw) = trimmed.strip_prefix("description:") else {
+            continue;
+        };
+        let scalar = raw.trim();
+        if !scalar.is_empty() && !matches!(scalar, "|" | ">" | "|-" | ">-") {
+            return Ok(unquote_yaml_scalar(scalar));
+        }
+        let indentation = line.len() - trimmed.len();
+        let mut continuation = Vec::new();
+        for continued in frontmatter.iter().skip(index + 1) {
+            if continued.trim().is_empty() {
+                continue;
+            }
+            let continued_indent = continued.len() - continued.trim_start().len();
+            if continued_indent <= indentation {
+                break;
+            }
+            continuation.push(continued.trim().to_owned());
+        }
+        return Ok(continuation.join(" "));
+    }
+    Ok(String::new())
+}
+
+fn unquote_yaml_scalar(value: &str) -> String {
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        value[1..value.len() - 1].to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
+fn skill_excerpt(root: &Path) -> Result<DescribeExcerpt> {
+    let readme = root.join("README.md");
+    if readme.is_file() {
+        return read_excerpt(&readme, "readme", 100);
+    }
+    read_excerpt(&root.join("SKILL.md"), "skill", 20)
+}
+
+fn source_excerpt(root: &Path) -> Option<Result<DescribeExcerpt>> {
+    let path = root.join("README.md");
+    path.is_file().then(|| read_excerpt(&path, "readme", 100))
+}
+
+fn read_excerpt(path: &Path, kind: &'static str, limit: usize) -> Result<DescribeExcerpt> {
+    let contents = fs::read_to_string(path).map_err(|error| SkillManagerError::io(path, error))?;
+    let all_lines = contents.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
+    let total_lines = all_lines.len();
+    let lines = all_lines.into_iter().take(limit).collect::<Vec<_>>();
+    Ok(DescribeExcerpt {
+        kind,
+        truncated: total_lines > lines.len(),
+        total_lines,
+        lines,
+    })
+}
+
+fn excerpt_data(excerpt: &DescribeExcerpt) -> Value {
+    json!({
+        "kind": excerpt.kind,
+        "lines": excerpt.lines,
+        "truncated": excerpt.truncated,
+        "total_lines": excerpt.total_lines,
+    })
+}
+
+fn describe_field(key: &str, value: &str, color: bool) -> String {
+    format!("{}  {value}", colored(key, Some(36), color))
+}
+
+fn describe_dimmed(value: &str, color: bool) -> String {
+    if color {
+        format!("\u{1b}[2m{value}\u{1b}[0m")
+    } else {
+        value.to_owned()
+    }
+}
+
+fn describe_source_fields(source: &SourceEntry) -> Vec<(String, String)> {
+    let mut fields = vec![
+        ("ID".into(), source.id.clone()),
+        ("Name".into(), source.name.clone()),
+        ("Label".into(), source.label.clone()),
+        (
+            "Type".into(),
+            serde_json::to_value(source.source_type)
+                .ok()
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                .unwrap_or_else(|| "unknown".into()),
+        ),
+        (
+            "Mode".into(),
+            serde_json::to_value(source.mode)
+                .ok()
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                .unwrap_or_else(|| "unknown".into()),
+        ),
+        ("Location".into(), source_reference(source)),
+        (
+            "Alternate".into(),
+            source
+                .alternate
+                .as_ref()
+                .map_or_else(|| "—".into(), location_reference),
+        ),
+        (
+            "Exclusions".into(),
+            if source.exclude.is_empty() {
+                "—".into()
+            } else {
+                source.exclude.join(", ")
+            },
+        ),
+        (
+            "Cache TTL hours".into(),
+            source
+                .cache_ttl_hours
+                .map_or_else(|| "default".into(), |ttl| ttl.to_string()),
+        ),
+    ];
+    fields.extend(source.extra.iter().map(|(key, value)| {
+        (
+            format!("Extra.{key}"),
+            serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".into()),
+        )
+    }));
+    fields
+}
+
+fn describe_source_data(source: &SourceEntry) -> Value {
+    let mut value = serde_json::to_value(source).unwrap_or_else(|_| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert("location".into(), json!(source_reference(source)));
+        if let Some(alternate) = source.alternate.as_ref() {
+            object.insert(
+                "alternate_location".into(),
+                json!(location_reference(alternate)),
+            );
+        }
+    }
+    value
 }
 
 fn command_dry_run(command: &Command) -> bool {
@@ -7706,6 +8609,18 @@ fn find_named_mut<'a, T>(entries: &'a mut IndexMap<String, T>, name: &str) -> Op
     entries.get_mut(&key)
 }
 
+fn operand_is_existing_directory(operand: &str, home: &Path) -> Result<bool> {
+    let expanded = expand_home(operand, home);
+    let path = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .map_err(|error| SkillManagerError::io(".", error))?
+            .join(expanded)
+    };
+    Ok(path.is_dir())
+}
+
 fn normalized_patterns(patterns: Vec<String>) -> Vec<String> {
     let mut result = Vec::new();
     for pattern in patterns {
@@ -7863,9 +8778,10 @@ mod tests {
     };
     use crate::cache::GitHubTransport;
     use crate::cli::{
-        Command, CopyArgs, ImportArgs, LoadArgs, RemoveArgs, SourceAction, SourceAddArgs,
-        SourceArgs, SourceModeArg, SourceRemoveArgs, SourceUpdateArgs, StatusArgs, SyncArgs,
-        TargetAction, TargetArgs, TargetNameArgs, TargetPathArgs, UpdateArgs,
+        Command, CopyArgs, DescribeArgs, DescribeSelection, ImportArgs, LoadArgs, RemoveArgs,
+        SourceAction, SourceAddArgs, SourceArgs, SourceModeArg, SourceRemoveArgs, SourceUpdateArgs,
+        StatusArgs, SyncArgs, TargetAction, TargetAddArgs, TargetArgs, TargetNameArgs,
+        TargetPathArgs, UpdateArgs,
     };
     use crate::config::{
         Config, FileConfigRepository, portable_canonicalize, resolved_targets,
@@ -7998,13 +8914,15 @@ mod tests {
     #[derive(Default)]
     struct RecordingReporter {
         events: Vec<String>,
+        event_data: Vec<serde_json::Value>,
         human: Vec<String>,
         diagnostics: Vec<String>,
     }
 
     impl Reporter for RecordingReporter {
-        fn event(&mut self, event: &str, _level: Level, _data: serde_json::Value) -> Result<()> {
+        fn event(&mut self, event: &str, _level: Level, data: serde_json::Value) -> Result<()> {
             self.events.push(event.into());
+            self.event_data.push(data);
             Ok(())
         }
 
@@ -8313,6 +9231,7 @@ mod tests {
                     exclude: vec!["draft-*".into(), "draft-*".into(), String::new()],
                     mode: Some(SourceModeArg::Collection),
                     cache_ttl_hours: Some(0),
+                    yes: false,
                 }),
             }))
             .unwrap_or_else(|error| unreachable!("{error}"));
@@ -8328,6 +9247,7 @@ mod tests {
                 exclude: Vec::new(),
                 mode: None,
                 cache_ttl_hours: None,
+                yes: false,
             }),
         }))
         .unwrap_or_else(|error| unreachable!("{error}"));
@@ -8341,6 +9261,7 @@ mod tests {
                     exclude: Vec::new(),
                     mode: None,
                     cache_ttl_hours: None,
+                    yes: false,
                 }),
             }))
             .is_err()
@@ -8402,6 +9323,56 @@ mod tests {
                 }),
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn describe_preserves_remote_materialization_failure_as_a_diagnostic_before_erroring() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+        let network = NoNetwork;
+        let hook = NoopTransactionHook;
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let mut app = Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            true,
+            home.path().to_path_buf(),
+        );
+        let source = source_from_reference("owner/repository:main", None, home.path())
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let config = Config {
+            sources: vec![source],
+            ..Config::default()
+        };
+
+        let result = app.run_describe(
+            &config,
+            DescribeArgs {
+                selection: DescribeSelection {
+                    selectors: vec!["missing".into()],
+                    ..DescribeSelection::default()
+                },
+                action: None,
+            },
+        );
+
+        assert!(matches!(result, Err(SkillManagerError::NotFound { .. })));
+        assert_eq!(app.reporter.events, ["diagnostic"]);
+        let message = app.reporter.event_data[0]["message"]
+            .as_str()
+            .unwrap_or_else(|| unreachable!("diagnostic message"));
+        assert!(message.contains("could not inspect source 'repository'"));
+        assert!(message.contains("network must not be used"));
+        assert!(
+            app.reporter
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("network must not be used"))
         );
     }
 
@@ -8551,25 +9522,37 @@ mod tests {
         );
         assert!(
             app.run(Command::Target(TargetArgs {
-                action: TargetAction::Add(TargetPathArgs {
-                    name: "claude".into(),
-                    path: home.path().join("reserved"),
+                action: TargetAction::Add(TargetAddArgs {
+                    first: home.path().join("reserved").to_string_lossy().into_owned(),
+                    second: None,
+                    name: Some("claude".into()),
+                    yes: false,
                 }),
             }))
             .is_err()
         );
         app.run(Command::Target(TargetArgs {
-            action: TargetAction::Add(TargetPathArgs {
-                name: "custom-target".into(),
-                path: PathBuf::from(".custom").join("skills"),
+            action: TargetAction::Add(TargetAddArgs {
+                first: PathBuf::from(".custom")
+                    .join("skills")
+                    .to_string_lossy()
+                    .into_owned(),
+                second: None,
+                name: Some("custom-target".into()),
+                yes: false,
             }),
         }))
         .unwrap_or_else(|error| unreachable!("{error}"));
         assert!(
             app.run(Command::Target(TargetArgs {
-                action: TargetAction::Add(TargetPathArgs {
-                    name: "CUSTOM-TARGET".into(),
-                    path: PathBuf::from(".duplicate").join("skills"),
+                action: TargetAction::Add(TargetAddArgs {
+                    first: PathBuf::from(".duplicate")
+                        .join("skills")
+                        .to_string_lossy()
+                        .into_owned(),
+                    second: None,
+                    name: Some("CUSTOM-TARGET".into()),
+                    yes: false,
                 }),
             }))
             .is_err()
@@ -8652,6 +9635,7 @@ mod tests {
                         exclude: Vec::new(),
                         mode: None,
                         cache_ttl_hours: ttl,
+                        yes: false,
                     }),
                 }))
                 .is_err()

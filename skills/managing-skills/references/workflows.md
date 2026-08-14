@@ -17,8 +17,29 @@ is a separate `skill-manager --json-input` invocation.
 
 ## Discover and inspect
 
-On a fresh or unknown configuration, establish stored context before applying a
-narrow filter:
+Use `describe` as the primary inspection interface. It gives triggers and
+bounded README/SKILL.md excerpts without requiring agents to open source files:
+
+```console
+skill-manager describe teach
+skill-manager describe personal:grill-me
+skill-manager describe --source personal --installed
+skill-manager describe --all-sources
+skill-manager describe --skills --outdated --json
+```
+
+`--source NAME` narrows positional skills to that source; without a positional
+selector it means `NAME:*`. Use a source-qualified positional selector only
+when the user needs a particular excluded or shadowed copy. `--installed`
+(`--loaded`), `--outdated`, and `--not-installed` (`--available`) are skill
+state filters. `--skills` and `--sources` are mutually exclusive; their
+subcommand forms expose only relevant flags. A partially matching request
+warns for unmatched selectors and succeeds with matches; no final result is an
+error. Use `--json`, not a recipe carrier, when a program needs description
+records.
+
+When source configuration or the full deployment matrix is needed, establish
+stored context before applying a narrow status filter:
 
 ```json
 {"command":"source.list"}

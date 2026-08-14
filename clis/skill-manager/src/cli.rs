@@ -101,6 +101,8 @@ pub enum Command {
     /// Display source/deployment status.
     #[command(alias = "ls", alias = "list")]
     Status(StatusArgs),
+    /// Explain skills and configured sources.
+    Describe(DescribeArgs),
     /// Resolve source collisions by persisting exclusions.
     Resolve(ResolveArgs),
     /// Manage stored sources.
@@ -115,6 +117,104 @@ pub enum Command {
     /// Generate the manual page.
     #[command(hide = true)]
     GenerateMan(GenerateManArgs),
+}
+
+/// Arguments for the polymorphic `describe` command.
+#[derive(Clone, Debug, Args)]
+#[command(
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true,
+    arg_required_else_help = true
+)]
+pub struct DescribeArgs {
+    /// Skill/source selectors and filters.
+    #[command(flatten)]
+    pub selection: DescribeSelection,
+    /// Restrict description to one kind.
+    #[command(subcommand)]
+    pub action: Option<DescribeAction>,
+}
+
+/// Type-specific `describe` entry points.
+#[derive(Clone, Debug, Subcommand)]
+pub enum DescribeAction {
+    /// Describe skills only.
+    #[command(arg_required_else_help = true)]
+    Skill(DescribeSkillArgs),
+    /// Describe configured sources only.
+    #[command(arg_required_else_help = true)]
+    Source(DescribeSourceArgs),
+}
+
+/// Selection accepted by the base `describe` command.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, Default, Args)]
+pub struct DescribeSelection {
+    /// Skill patterns or source names; skill matching is attempted first.
+    #[arg(value_name = "SKILL_OR_SOURCE")]
+    pub selectors: Vec<String>,
+    /// Describe every effective skill and every configured source.
+    #[arg(long)]
+    pub all: bool,
+    /// Describe every effective skill.
+    #[arg(long)]
+    pub all_skills: bool,
+    /// Describe every configured source.
+    #[arg(long)]
+    pub all_sources: bool,
+    /// Restrict skill selection to this configured source; repeatable.
+    #[arg(long = "source", value_name = "SOURCE")]
+    pub sources: Vec<String>,
+    /// Include skills deployed to at least one configured target.
+    #[arg(long, visible_alias = "loaded")]
+    pub installed: bool,
+    /// Include skills with at least one deployment needing an update.
+    #[arg(long)]
+    pub outdated: bool,
+    /// Include skills deployed to no configured target.
+    #[arg(long, visible_alias = "available")]
+    pub not_installed: bool,
+    /// Exclude sources from the result.
+    #[arg(long, conflicts_with = "sources_only")]
+    pub skills: bool,
+    /// Exclude skills from the result.
+    #[arg(long = "sources", id = "sources_only")]
+    pub sources_only: bool,
+}
+
+/// Skill-only `describe` selection.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, Default, Args)]
+pub struct DescribeSkillArgs {
+    /// Skill names or patterns.
+    #[arg(value_name = "SKILL_OR_PATTERN")]
+    pub selectors: Vec<String>,
+    /// Describe every effective skill.
+    #[arg(long, alias = "all-skills")]
+    pub all: bool,
+    /// Restrict selection to this configured source; repeatable.
+    #[arg(long = "source", value_name = "SOURCE")]
+    pub sources: Vec<String>,
+    /// Include skills deployed to at least one configured target.
+    #[arg(long, visible_alias = "loaded")]
+    pub installed: bool,
+    /// Include skills with at least one deployment needing an update.
+    #[arg(long)]
+    pub outdated: bool,
+    /// Include skills deployed to no configured target.
+    #[arg(long, visible_alias = "available")]
+    pub not_installed: bool,
+}
+
+/// Source-only `describe` selection.
+#[derive(Clone, Debug, Default, Args)]
+pub struct DescribeSourceArgs {
+    /// Source names, IDs, labels, locations, or patterns.
+    #[arg(value_name = "SOURCE_OR_PATTERN")]
+    pub selectors: Vec<String>,
+    /// Describe every configured source.
+    #[arg(long, alias = "all-sources")]
+    pub all: bool,
 }
 
 /// Source selection shared by discovery commands.
@@ -409,13 +509,13 @@ pub enum SourceAction {
 /// Arguments for `source add`.
 #[derive(Clone, Debug, Args)]
 pub struct SourceAddArgs {
-    /// Local path, GitHub tree URL, or `owner/repo[:ref][/path]`.
-    #[arg(value_name = "SOURCE")]
+    /// Local path/GitHub reference, or one of an inferred SOURCE/NAME pair.
+    #[arg(value_name = "SOURCE_OR_NAME")]
     pub source: Option<String>,
-    /// Stable unique source name.
-    #[arg(value_name = "NAME")]
+    /// The other value in an inferred SOURCE/NAME pair.
+    #[arg(value_name = "SOURCE_OR_NAME")]
     pub source_name: Option<String>,
-    /// Stable unique source name.
+    /// Stable unique source name; makes the positional argument the source.
     #[arg(long = "name", conflicts_with = "source_name")]
     pub name: Option<String>,
     /// Human-readable label.
@@ -430,6 +530,9 @@ pub struct SourceAddArgs {
     /// GitHub cache lifetime.
     #[arg(long, value_name = "HOURS")]
     pub cache_ttl_hours: Option<i64>,
+    /// Do not prompt; ambiguous argument roles are rejected.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 /// Command-line spelling of source layout.
@@ -514,7 +617,7 @@ pub struct TargetArgs {
 #[derive(Clone, Debug, Subcommand)]
 pub enum TargetAction {
     /// Add a custom target.
-    Add(TargetPathArgs),
+    Add(TargetAddArgs),
     /// List built-in and custom targets.
     List,
     /// Enable a target.
@@ -525,6 +628,23 @@ pub enum TargetAction {
     Remove(TargetNameArgs),
     /// Change a custom or legacy override path.
     SetPath(TargetPathArgs),
+}
+
+/// Arguments for `target add`.
+#[derive(Clone, Debug, Args)]
+pub struct TargetAddArgs {
+    /// Target path, or one of an inferred NAME/PATH pair.
+    #[arg(value_name = "NAME_OR_PATH")]
+    pub first: String,
+    /// The other value in an inferred NAME/PATH pair.
+    #[arg(value_name = "NAME_OR_PATH")]
+    pub second: Option<String>,
+    /// Stable target name; makes the positional argument the path.
+    #[arg(long, conflicts_with = "second", required_unless_present = "second")]
+    pub name: Option<String>,
+    /// Do not prompt; ambiguous argument roles are rejected.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 /// Target name plus path.

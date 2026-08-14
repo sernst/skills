@@ -53,6 +53,10 @@ The comments in this section are machine-checked against production emit sites.
 - `configs.copy.item`: one `configs copy` item applied to the destination.
 <!-- event: diagnostic -->
 - `diagnostic`: warning message, sometimes with an unmatched `pattern`.
+<!-- event: describe.skill -->
+- `describe.skill`: one inspected skill with trigger, resolver state, and bounded documentation.
+<!-- event: describe.source -->
+- `describe.source`: one inspected source with configuration, documentation, and skill listing.
 <!-- event: plan -->
 - `plan`: revision `0` of a reviewable change plan, emitted before any prompt.
 <!-- event: plan.updated -->
@@ -271,16 +275,43 @@ deployed skill directory for that target/scope; append only `SKILL.md` to read
 the installed skill. The row-level `source` is the exact flattened source
 object described above, or `null` for a deployed-only skill.
 
+<!-- payload: describe-skill fields: content,installation,resolver_detail,resolver_status,skill,source,trigger -->
+<!-- payload: describe-source fields: content,skills,source -->
+`describe.skill` is a read-only record for one selected skill. It contains the
+skill name, nested `source` metadata, `trigger`, `resolver_status`, optional
+`resolver_detail`, `installation`, and `content`. Resolver status is
+`effective`, `excluded`, or `shadowed`; detail explains an exclusion or winning
+source. `installation` contains `installed`, `outdated`, and deployments.
+`content` is `{kind,lines,truncated,total_lines}`. `kind` is `readme` for a
+README excerpt (at most 100 lines) or `skill` for the SKILL.md fallback (at
+most 20); `lines` are verbatim and must not be rendered or parsed as CLI
+formatting.
+
+`describe.source` contains a source-configuration object, optional README
+`content`, and `skills`. The source object gives the persisted identifiers,
+names, labels, active and alternate locations, source type/mode, exclusions,
+and cache settings. Each physical source `skills[]` entry gives `skill`,
+`trigger`, `resolver_status`, and optional `resolver_detail`, even when it is
+excluded or shadowed. `describe` warns with a `diagnostic` event for selectors
+that match nothing while other results remain; its successful `summary` is
+`{action:"describe",skills,sources}`.
+
 `collision.detected` is `{skill,winner,candidates}`; `winner` is one source
 object and `candidates` is an array of source objects in the exact flattened
 source shape above. `collision.resolved` is `{skill,preferred_source}`, where
-`preferred_source` is one such source object. `diagnostic` contains `message`
-and may also contain `pattern`.
+`preferred_source` is one such source object. `diagnostic` normally contains
+`message` and may also contain `pattern`. An add-command argument-role
+ambiguity instead has `{message,command,kind,operands,mappings,resolution}`:
+`kind` is `ambiguous-argument-roles`; `operands` preserves the two supplied
+tokens; `mappings` contains the two selectable `{token,location,name}` role
+mappings; and `resolution` gives the required unambiguous `LOCATION --name=NAME`
+form.
 
 <!-- payload: collision-detected fields: candidates,skill,winner -->
 <!-- payload: collision-resolved fields: preferred_source,skill -->
 <!-- payload: diagnostic-message fields: message -->
 <!-- payload: diagnostic-pattern fields: message,pattern -->
+<!-- payload: diagnostic-ambiguous-argument-roles fields: command,kind,location,mappings,message,name,operands,resolution,token -->
 
 <!-- payload: config-shown fields: backups,config,home,path,persisted,project_root,storage_root,targets -->
 <!-- payload: config-target fields: builtin,enabled,global_path,label,legacy_override,name,project_path,template -->
@@ -330,6 +361,7 @@ command, such as `remove`, `update`, `import`, `configs.reset`, or
 <!-- payload: summary-remove fields: action,dry_run,removed -->
 <!-- payload: summary-status fields: action,skills -->
 <!-- payload: summary-resolve fields: action,resolved -->
+<!-- payload: summary-describe fields: action,skills,sources -->
 <!-- payload: summary-configs-copy fields: action,dry_run,items,merged,new,skipped,skipped_linked -->
 `summary.data` has one of these exact shapes:
 
@@ -340,6 +372,7 @@ command, such as `remove`, `update`, `import`, `configs.reset`, or
 - `remove`: `{action,removed,dry_run}`;
 - `status`: `{action,skills}`;
 - `resolve`: `{action,resolved}`;
+- `describe`: `{action,skills,sources}`;
 - `configs.copy`: `{action,items,new,merged,skipped,skipped_linked,dry_run}`,
   always `"action": "configs.copy"` and always all seven fields,
   `new`/`merged`/`skipped`/`skipped_linked` included even when `0` unlike

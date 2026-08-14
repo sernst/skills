@@ -11,8 +11,10 @@ use crate::cli::{
     ConfigsRestoreArgs, CopyArgs, ImportArgs, LoadArgs, RemoveArgs, ResolveArgs, ScopeSelection,
     SourceAction, SourceAddArgs, SourceAlternateArgs, SourceArgs, SourceLocateArgs, SourceModeArg,
     SourceRemoveArgs, SourceSelection, SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs,
-    TargetAction, TargetArgs, TargetNameArgs, TargetPathArgs, TargetSelection, UpdateArgs,
+    TargetAction, TargetAddArgs, TargetArgs, TargetNameArgs, TargetPathArgs, TargetSelection,
+    UpdateArgs,
 };
+use crate::config::is_github_reference;
 use crate::error::{Result, SkillManagerError};
 use crate::skills::is_fnmatch_operand;
 
@@ -99,6 +101,10 @@ fn overlay_command(command: &mut Command, object: &Map<String, Value>, base: &Pa
         Command::Copy(args) => overlay_copy(args, object, base),
         Command::Remove(args) => overlay_remove(args, object, base),
         Command::Status(args) => overlay_status(args, object),
+        Command::Describe(_) => Err(SkillManagerError::InvalidInput(
+            "describe does not accept recipe input; pass selectors and flags on argv with --json"
+                .into(),
+        )),
         Command::Resolve(args) => overlay_resolve(args, object),
         Command::Source(args) => overlay_source(&mut args.action, object, base),
         Command::Target(args) => overlay_target(&mut args.action, object, base),
@@ -395,7 +401,10 @@ fn overlay_source(
                     .map(|value| rebase_reference(&value, base, true));
             }
             if args.source_name.is_none() && args.name.is_none() {
-                args.source_name = first_string(object, &["source_name", "name"])?;
+                // Recipes use named fields and bypass human-oriented positional
+                // role inference. Store the recipe name in the explicit flag
+                // slot so application execution remains deterministic.
+                args.name = first_string(object, &["source_name", "name"])?;
             }
             if args.label.is_none() {
                 args.label = first_string(object, &["label"])?;
@@ -520,7 +529,21 @@ fn overlay_target(
 ) -> Result<()> {
     match action {
         TargetAction::List => reject_unknown(object, &["command", "no_input"]),
-        TargetAction::Add(args) | TargetAction::SetPath(args) => {
+        TargetAction::Add(args) => {
+            reject_unknown(object, &["command", "no_input", "name", "path"])?;
+            if args.name.is_none() {
+                args.name = first_string(object, &["name"])?;
+            }
+            if args.first.is_empty()
+                && let Some(path) = object.get("path")
+            {
+                // Target paths are scope-relative templates, never paths relative
+                // to the recipe carrier file.
+                strict_string(path)?.clone_into(&mut args.first);
+            }
+            Ok(())
+        }
+        TargetAction::SetPath(args) => {
             reject_unknown(object, &["command", "no_input", "name", "path"])?;
             if args.name.is_empty() {
                 args.name = first_string(object, &["name"])?.unwrap_or_default();
@@ -800,6 +823,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Copy(_) => "copy",
         Command::Remove(_) => "remove",
         Command::Status(_) => "status",
+        Command::Describe(_) => "describe",
         Command::Resolve(_) => "resolve",
         Command::Source(args) => match args.action {
             SourceAction::Add(_) => "source.add",
@@ -890,6 +914,7 @@ fn default_command(name: &str) -> Result<Command> {
                 exclude: Vec::new(),
                 mode: None,
                 cache_ttl_hours: None,
+                yes: false,
             }),
         })),
         "source.remove" => Ok(Command::Source(SourceArgs {
@@ -925,6 +950,12 @@ fn validate_required(command: &Command) -> Result<()> {
             ..
         }) if args.to.is_empty() => Some("configs.copy.to"),
         Command::Source(SourceArgs {
+            action: SourceAction::Add(args),
+        }) if args.source.as_ref().is_none_or(String::is_empty) => Some("source.add.source"),
+        Command::Source(SourceArgs {
+            action: SourceAction::Add(args),
+        }) if args.name.as_ref().is_none_or(String::is_empty) => Some("source.add.name"),
+        Command::Source(SourceArgs {
             action: SourceAction::Update(args),
         }) if args.source.is_empty() => Some("source.update.source"),
         Command::Source(SourceArgs {
@@ -947,10 +978,16 @@ fn validate_required(command: &Command) -> Result<()> {
             action: SourceAction::Swap(args),
         }) if args.source.is_empty() => Some("source.swap.source"),
         Command::Target(TargetArgs {
-            action: TargetAction::Add(args) | TargetAction::SetPath(args),
+            action: TargetAction::Add(args),
+        }) if args.name.as_ref().is_none_or(String::is_empty) => Some("target.name"),
+        Command::Target(TargetArgs {
+            action: TargetAction::Add(args),
+        }) if args.first.is_empty() => Some("target.path"),
+        Command::Target(TargetArgs {
+            action: TargetAction::SetPath(args),
         }) if args.name.is_empty() => Some("target.name"),
         Command::Target(TargetArgs {
-            action: TargetAction::Add(args) | TargetAction::SetPath(args),
+            action: TargetAction::SetPath(args),
         }) if args.path.as_os_str().is_empty() => Some("target.path"),
         Command::Target(TargetArgs {
             action:
@@ -1019,9 +1056,11 @@ fn build_required_command(name: &str) -> Result<Command> {
         })),
         "target.add" | "target.set-path" => Ok(Command::Target(TargetArgs {
             action: if name == "target.add" {
-                TargetAction::Add(TargetPathArgs {
-                    name: String::new(),
-                    path: PathBuf::new(),
+                TargetAction::Add(TargetAddArgs {
+                    first: String::new(),
+                    second: None,
+                    name: None,
+                    yes: false,
                 })
             } else {
                 TargetAction::SetPath(TargetPathArgs {
@@ -1075,6 +1114,9 @@ fn resolve_path(path: &Path, base: &Path) -> PathBuf {
 
 fn rebase_reference(reference: &str, base: &Path, source_add: bool) -> String {
     let path = Path::new(reference);
+    if source_add && is_github_reference(reference) {
+        return reference.to_owned();
+    }
     if path.is_absolute()
         || reference == "~"
         || reference.starts_with("~/")
@@ -1086,7 +1128,7 @@ fn rebase_reference(reference: &str, base: &Path, source_add: bool) -> String {
     let relative_path = reference.starts_with('.')
         || reference.contains('\\')
         || base.join(path).exists()
-        || source_add && !looks_like_github_shorthand(reference);
+        || source_add;
     if relative_path {
         resolve_path(path, base).to_string_lossy().into_owned()
     } else {
@@ -1094,39 +1136,16 @@ fn rebase_reference(reference: &str, base: &Path, source_add: bool) -> String {
     }
 }
 
-fn looks_like_github_shorthand(reference: &str) -> bool {
-    let Some((owner, remainder)) = reference.split_once('/') else {
-        return false;
-    };
-    let repo = remainder
-        .split('/')
-        .next()
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default();
-    valid_github_segment(owner) && valid_github_segment(repo)
-}
-
-fn valid_github_segment(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "_.-".contains(character))
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::path::PathBuf;
 
     use clap::Parser;
     use serde_json::{Value, json};
 
     use super::{
-        apply_recipe, canonical_command, default_command, looks_like_github_shorthand,
-        rebase_reference, resolve_path, strict_bool, strict_i64, strict_string, strict_strings,
-        validate_required,
+        apply_recipe, canonical_command, default_command, rebase_reference, resolve_path,
+        strict_bool, strict_i64, strict_string, strict_strings, validate_required,
     };
     use crate::cli::{Cli, Command, ConfigsAction, SourceAction, TargetAction};
 
@@ -1348,7 +1367,7 @@ mod tests {
             unreachable!("source add");
         };
         assert!(args.source.is_some());
-        assert_eq!(args.source_name.as_deref(), Some("local"));
+        assert_eq!(args.name.as_deref(), Some("local"));
         assert_eq!(args.label.as_deref(), Some("Local"));
         assert_eq!(args.exclude, ["draft-*"]);
         assert_eq!(args.cache_ttl_hours, Some(0));
@@ -1403,7 +1422,11 @@ mod tests {
                 unreachable!("target command");
             };
             match target.action {
-                TargetAction::Add(args) | TargetAction::SetPath(args) => {
+                TargetAction::Add(args) => {
+                    assert_eq!(args.name.as_deref(), Some("custom"));
+                    assert!(!args.first.is_empty());
+                }
+                TargetAction::SetPath(args) => {
                     assert_eq!(args.name, "custom");
                     assert!(!args.path.as_os_str().is_empty());
                 }
@@ -1436,7 +1459,7 @@ mod tests {
         let TargetAction::Add(args) = target.action else {
             unreachable!("target add");
         };
-        assert_eq!(args.path, PathBuf::from("./target"));
+        assert_eq!(args.first, "./target");
 
         let reset = inline_recipe(&json!({"command": "configs.reset", "yes": true}));
         assert!(matches!(
@@ -1615,6 +1638,27 @@ mod tests {
             base.join("two")
         );
         assert_eq!(rebase_reference("owner/repo", base, false), "owner/repo");
+        for reference in [
+            "owner/repo",
+            "owner/repo/subdir",
+            "owner/repo:main/subdir",
+            "https://github.com/owner/repo/tree/main/subdir",
+        ] {
+            assert_eq!(rebase_reference(reference, base, true), reference);
+        }
+        for reference in [
+            "owner/repo/../local",
+            "owner/repo:../local",
+            "owner/./repo",
+            "owner/repo//local",
+            r"owner\repo\local",
+        ] {
+            assert_eq!(
+                Path::new(&rebase_reference(reference, base, true)),
+                resolve_path(Path::new(reference), base),
+                "{reference}"
+            );
+        }
         assert_eq!(
             Path::new(&rebase_reference("local", base, true)),
             resolve_path(Path::new("local"), base)
@@ -1622,10 +1666,6 @@ mod tests {
         for reference in ["~", "~/skills", "https://example.test/repo"] {
             assert_eq!(rebase_reference(reference, base, true), reference);
         }
-        assert!(looks_like_github_shorthand("owner/repo"));
-        assert!(!looks_like_github_shorthand("single"));
-        assert!(!looks_like_github_shorthand("bad owner/repo"));
-
         let mutually_exclusive = "--json={\"command\":\"load\",\"cd\":true,\"cd_only\":true}";
         let mut cli = Cli::try_parse_from(["skill-manager", mutually_exclusive])
             .unwrap_or_else(|error| unreachable!("{error}"));

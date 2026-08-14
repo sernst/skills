@@ -52,6 +52,7 @@ fn add_local(home: &Path, location: &Path, name: &str) -> Value {
             "source",
             "add",
             location.to_str().expect("utf8 path"),
+            "--name",
             name,
             "--label",
             "Personal Skills",
@@ -464,11 +465,11 @@ fn every_new_or_replaced_slot_rejects_other_active_and_alternate_collisions() {
     for (description, mutation, collision) in cases {
         let home = TempDir::new().expect("temporary home");
         cli(home.path())
-            .args(["source", "add", "owner/first", "first"])
+            .args(["source", "add", "owner/first", "--name=first"])
             .assert()
             .success();
         cli(home.path())
-            .args(["source", "add", "owner/second", "second"])
+            .args(["source", "add", "owner/second", "--name=second"])
             .assert()
             .success();
         cli(home.path())
@@ -483,7 +484,7 @@ fn every_new_or_replaced_slot_rejects_other_active_and_alternate_collisions() {
         let mut command = cli(home.path());
         match mutation {
             Mutation::Add => {
-                command.args(["source", "add", collision, "third"]);
+                command.args(["source", "add", collision, "--name=third"]);
             }
             Mutation::Locate => {
                 command.args(["source", "locate", "first", collision]);

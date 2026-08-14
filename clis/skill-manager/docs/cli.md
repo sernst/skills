@@ -20,6 +20,9 @@ path against the current directory before any derived path is built. See
 | `copy SOURCE DEST` | Copy discovered skills to an arbitrary destination, after one plan confirmation. |
 | `remove [SKILL_OR_PATTERN...]` | Remove selected or auto-detected deployments. |
 | `status [FILTER...]` | Show source-relative deployment state; aliases: `ls`, `list`. |
+| `describe [SELECTOR...]` | Explain matching skills and sources, including bounded source documentation. |
+| `describe skill [SELECTOR...]` | Explain only skills. |
+| `describe source [SELECTOR...]` | Explain only sources. |
 | `resolve [SKILL_OR_PATTERN...]` | Persist a collision preference. |
 | `configs [--raw]` | Display the active configuration and available backups. |
 | `configs reset [--yes]` | Archive and replace the configuration with an empty v2 configuration. |
@@ -240,9 +243,22 @@ like any other source, with the alternate as the ordinary `Into` destination.
 ## Source and target lifecycle
 
 `source add` accepts a local path, GitHub URL, or GitHub shorthand and optional
-name, label, source mode, excludes, and cache TTL. Names, labels, and the active
-location are updated atomically with `source update`; `--location LOCATION` can
-be combined with metadata flags. IDs do not change when a source moves.
+name, label, source mode, excludes, and cache TTL. `target add` likewise takes
+a root-relative target path and a name. With both location/path and name given
+as two positionals, either order is accepted. For `source add`, an explicit
+GitHub URL or valid `owner/repo` shorthand is the location. Explicit local
+spellings (`./`, `../`, `.\`, `..\`, rooted/absolute paths, and supported
+`~` forms) are always local, never shorthand. Otherwise the command checks
+both operands as folders: exactly one existing folder is the location. If both
+or neither are folders, the roles are ambiguous and interactive use renders a
+two-mapping plan (plus cancel) with no default; it never falls back to legacy
+ordering. Identical operands are allowed, using one as each role. In
+`--yes`, `--no-input`, or any JSON mode ambiguity fails before mutation; use
+the unambiguous `LOCATION --name NAME` form. Recipes always use explicit
+`source`/`path` and `name` fields and never infer or prompt. Names, labels,
+and the active location are updated atomically with `source update`;
+`--location LOCATION` can be combined with metadata flags. IDs do not change
+when a source moves.
 
 `source locate SOURCE LOCATION` is the location-only spelling, with aliases
 `relocate`, `move`, and `mv`. `source alternate SOURCE LOCATION` saves or
@@ -266,6 +282,58 @@ destinations); see [configuration](configuration.md). Built-ins are `claude`,
 `shared`, and `antigravity`. `target remove` deletes custom targets and instead
 disables an unoverridden built-in. Legacy built-in overrides remain explicit
 legacy overrides until updated or removed.
+
+## Describe skills and sources
+
+`describe` is a read-only, resolver-aware inspection command. With no
+positional selector, no selector flag, and no type-only flag, it shows help.
+`describe skill` and `describe source` are equivalent to `describe --skills`
+and `describe --sources`, respectively, and expose only flags that apply to
+their type.
+
+Positional selectors are case-folded fnmatch patterns. An unqualified pattern
+matches the effective resolver-visible skill set; `describe teach` therefore
+shows the winning `teach`. Prefix a selector with `SOURCE:` to inspect a
+specific physical source copy, including a copy that is excluded or shadowed:
+`describe personal:slack-to-todoist` and `describe personal:*`. Qualified
+results label their resolver status and, when applicable, the exclusion reason
+or winning source. If a positional selector matches no skill, it is tried as a
+source selector, so `describe personal` describes source `personal`.
+
+The following selectors add or narrow candidates:
+
+| Selector | Behavior |
+| --- | --- |
+| `--all` | All effective skills and all configured sources. |
+| `--all-skills` / `--all-sources` | All effective skills / all configured sources. |
+| `--skills` / `--sources` | Final type restriction; with no other selectors, all effective skills / all sources. They are mutually exclusive. |
+| `--source SOURCE` | Restricts positional skill selectors to one or more sources. With no positional selector it means `SOURCE:*`; multiple values widen that source scope only. |
+| `--installed`, `--loaded` | Skills deployed to at least one configured target. |
+| `--outdated` | Skills with at least one deployed copy needing an update. |
+| `--not-installed`, `--available` | Skills deployed to no configured target. |
+
+State flags OR together, then intersect the selected skills; an outdated skill
+can therefore match both `--installed` and `--outdated`. Used without another
+skill selector, state flags begin with all effective skills. `--source` is a
+narrowing scope, not an additional union: `describe grill-me --source personal
+--installed` selects installed `personal:grill-me`, while `describe --source
+personal --installed` selects every installed skill in `personal`. Sources do
+not have deployment state, so source-only invocations do not expose state or
+source-scope flags.
+
+Selector families that produce at least one result succeed and warn for each
+unmatched selector. If no final result remains — including after state/type
+filters — the command fails. Remote sources may be materialized through the
+normal cache to inspect them, but `describe` never refreshes a materialized
+source or changes configuration, deployments, exclusions, or target contents.
+
+Human output separates every result after the first, then gives a colored
+title and structured content. A skill result shows trigger text from its
+`SKILL.md` frontmatter plus up to 100 lines of `README.md`, or the first 20
+raw `SKILL.md` lines when no README exists. A source result shows line-by-line
+configuration (IDs, labels, names, and locations), the same optional README
+excerpt, and each available skill with trigger text. Excerpts preserve source
+text and show a truncation notice when needed.
 
 ## Skill selection and patterns
 

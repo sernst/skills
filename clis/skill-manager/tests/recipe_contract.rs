@@ -27,6 +27,44 @@ fn recipe_error(value: &serde_json::Value) -> String {
 }
 
 #[test]
+fn source_recipe_rebases_noncanonical_internal_paths_to_the_recipe_directory() {
+    let root = tempfile::tempdir().expect("create recipe root");
+    let recipe_dir = root.path().join("recipes");
+    std::fs::create_dir_all(&recipe_dir).expect("create recipe directory");
+    let recipe_path = recipe_dir.join("source-add.json");
+    std::fs::write(
+        &recipe_path,
+        serde_json::json!({
+            "command": "source.add",
+            "source": "owner/repo/../local",
+            "name": "local"
+        })
+        .to_string(),
+    )
+    .expect("write source recipe");
+
+    let mut cli = Cli::try_parse_from([
+        "skill-manager",
+        "--input",
+        recipe_path.to_str().expect("UTF-8 recipe path"),
+    ])
+    .expect("parse recipe carrier");
+    apply_recipe(&mut cli).expect("apply source recipe");
+    let Some(Command::Source(source)) = cli.command else {
+        unreachable!("source command")
+    };
+    let SourceAction::Add(args) = source.action else {
+        unreachable!("source add")
+    };
+    let expected = recipe_dir.join("owner/local");
+    assert_eq!(
+        args.source.as_deref().map(std::path::Path::new),
+        Some(expected.as_path())
+    );
+    assert_eq!(args.name.as_deref(), Some("local"));
+}
+
+#[test]
 fn recipe_overlay_covers_transfer_command_shapes() {
     let load = recipe(&serde_json::json!({
         "command": "load",
@@ -282,7 +320,7 @@ fn recipe_overlay_covers_source_and_target_lifecycle_shapes() {
     let SourceAction::Add(args) = source.action else {
         unreachable!("source add")
     };
-    assert_eq!(args.source_name.as_deref(), Some("local"));
+    assert_eq!(args.name.as_deref(), Some("local"));
     assert_eq!(args.exclude, ["draft-*"]);
     assert_eq!(args.cache_ttl_hours, Some(0));
 
@@ -327,10 +365,15 @@ fn recipe_overlay_covers_source_and_target_lifecycle_shapes() {
         "name": "custom",
         "path": "target"
     }));
-    assert!(matches!(
-        target_add.command,
-        Some(Command::Target(target)) if matches!(target.action, TargetAction::Add(_))
-    ));
+    let Some(Command::Target(target)) = target_add.command else {
+        unreachable!("target command")
+    };
+    let TargetAction::Add(args) = target.action else {
+        unreachable!("target add")
+    };
+    assert_eq!(args.name.as_deref(), Some("custom"));
+    assert_eq!(args.first, "target");
+    assert!(args.second.is_none());
     let target_set = recipe(&serde_json::json!({
         "command": "target.set-path",
         "name": "custom",
@@ -434,6 +477,14 @@ fn recipe_strictness_rejects_all_invalid_carrier_shapes() {
             "requires field target.path",
         ),
         (
+            serde_json::json!({"command": "source.add", "name": "local"}),
+            "requires field source.add.source",
+        ),
+        (
+            serde_json::json!({"command": "source.add", "source": "."}),
+            "requires field source.add.name",
+        ),
+        (
             serde_json::json!({"command": "target.enable"}),
             "requires field target.name",
         ),
@@ -448,6 +499,24 @@ fn recipe_strictness_rejects_all_invalid_carrier_shapes() {
         (
             serde_json::json!({"command": "source.add", "cache_ttl_hours": 1.5}),
             "must be an integer",
+        ),
+        (
+            serde_json::json!({
+                "command": "source.add",
+                "source": ".",
+                "name": "local",
+                "yes": true
+            }),
+            "unknown JSON invocation field",
+        ),
+        (
+            serde_json::json!({
+                "command": "target.add",
+                "name": "custom",
+                "path": "target",
+                "yes": true
+            }),
+            "unknown JSON invocation field",
         ),
         (
             serde_json::json!({"command": "unknown"}),

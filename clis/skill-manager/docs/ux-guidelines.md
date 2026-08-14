@@ -116,6 +116,63 @@ Good: infer, show, and only explain on cancel
   change this plan.
 ```
 
+### Ambiguous add operands
+
+`source add` and `target add` accept a path/location and a name. When two
+bare operands leave their roles genuinely unresolved, the command MUST not
+guess from legacy argument order. `source add` first recognizes an explicit
+GitHub URL or GitHub shorthand through the canonical source parser, before
+testing either operand as a folder location. Otherwise, exactly one existing
+folder determines the path.
+Identical operands are the documented exception: one is used as the location
+and one as the name.
+
+When both operands are folders, or neither is a folder after the explicit
+source-reference rule, the command MUST show an ambiguity warning and a
+complete two-alternative add plan before one numbered selection prompt. The
+two mappings and `c` to cancel are the only choices; there is no default and
+the chosen mapping immediately applies. This is a genuine branch, not a
+preference that legacy ordering can safely infer.
+
+```text
+Ambiguous source add operands: `alpha` and `beta` could each be the name or location.
+
+Source add plan
+  1  Name alpha; location beta
+  2  Name beta; location alpha
+Select mapping [1-2, c to cancel]:
+```
+
+`--yes`, `--no-input`, JSON output, and recipe carriers cannot make that
+choice. They MUST fail before mutation and name the canonical unambiguous
+form: one location operand plus `--name NAME`. Recipes remain explicit fields
+and never prompt or infer roles. Ambiguity is a structured `diagnostic`
+warning in NDJSON, carrying both mappings and the explicit-form resolution;
+it MUST NOT synthesize a `plan` event outside the stable plan schema.
+
+## Read-only result rendering
+
+Read-only commands do not need a plan or authorization prompt, but their
+output is still a user interface and MUST follow significance gating. A
+multi-result inspection uses a clear separator before every result after the
+first, a cyan-bold title, labeled metadata, and blank lines only where they
+separate distinct information. Semantic labels and states may be colored;
+embedded user-authored Markdown and code MUST remain verbatim and uncolored.
+
+`describe` is the reference shape. A skill result shows its name, trigger
+text, and a bounded source excerpt. A source result shows its name,
+line-by-line configuration, an optional bounded README excerpt, then the
+source's skills and their trigger text. A missing README falls back to the
+first 20 raw `SKILL.md` lines; a README is limited to 100 logical lines. A
+truncated excerpt has one separate dimmed notice. Human output MUST make
+resolver status (effective, excluded, or shadowed) visible when it is
+relevant, while ordinary unqualified inspection stays focused on effective
+skills.
+
+Unmatched selectors are warnings when other results survive. A wholly empty
+result is a nonzero, actionable error rather than a blank success. NDJSON
+uses structured warning/result/summary events and never contains ANSI codes.
+
 ## Significance gating (invariant — considered essential)
 
 Only significant information is displayed. Columns, legend/key entries,

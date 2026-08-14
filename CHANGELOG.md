@@ -2,6 +2,20 @@
 
 All notable changes to the downloadable CLIs are documented here.
 
+## 0.1.4 - 2026-08-14
+
+- Adds `describe` (plus `describe skill` and `describe source`) for concise,
+  resolver-aware inspection of skills and sources. It supports fnmatch
+  selectors, source qualification and narrowing, installed/outdated/available
+  state filters, bounded README/SKILL.md excerpts, source configuration and
+  skill listings, partial-match warnings, and a structured NDJSON stream for
+  automation.
+- Makes `source add` and `target add` accept the name and path/location in
+  either positional order when exactly one is an existing directory (or a
+  source location is an explicit GitHub reference). Both-or-neither directory
+  operands now show an explicit interactive mapping choice rather than relying
+  on legacy ordering; unattended callers use `LOCATION --name NAME`.
+
 ## 0.1.3 - 2026-08-10
 
 - Adds `install.sh` and `install.ps1` release installers so the README documents one install-or-upgrade command per platform instead of manual download steps; both verify the download against `SHA256SUMS`, report the installed and incoming versions, replace the binary only after the download is proven to run, and can add the install directory to `PATH`.

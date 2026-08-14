@@ -67,7 +67,7 @@ remain valid projects.
 
 | Goal | Command |
 | --- | --- |
-| Add this repository's skills | `skill-manager source add sernst/skills/skills sernst-skills --label "sernst skills"` |
+| Add this repository's skills | `skill-manager source add sernst/skills/skills --name sernst-skills --label "sernst skills"` |
 | List sources | `skill-manager source list` |
 | Preview one global shared skill | `skill-manager load sernst-skills --filter managing-skills --shared --global --dry-run --no-input` |
 | Deploy it | `skill-manager load sernst-skills --filter managing-skills --shared --global --yes --no-input` |
@@ -262,7 +262,7 @@ label, or active location. Inactive alternate locations are not selectors.
 
 | Command | Options and behavior |
 | --- | --- |
-| `source add [SOURCE] [NAME]` | `--name NAME` (conflicts with positional name), `--label TEXT`, repeatable `--exclude PATTERN`, `--mode collection\|single`, `--cache-ttl-hours HOURS`. |
+| `source add [SOURCE] [NAME]` | `--name NAME` (conflicts with positional name), `--label TEXT`, repeatable `--exclude PATTERN`, `--mode collection\|single`, `--cache-ttl-hours HOURS`, `--yes`. |
 | `source remove [SOURCE]` | Remove by active path/reference, name, or ID. |
 | `source list` | List stored sources and inactive alternates. |
 | `source update SOURCE` | `--name NAME`, `--location LOCATION`, `--label TEXT`, repeatable `--exclude PATTERN`, `--clear-exclude`, `--cache-ttl-hours HOURS`. |
@@ -273,13 +273,14 @@ label, or active location. Inactive alternate locations are not selectors.
 `collection` means immediate child directories are skills; `single` means the
 source root is one skill. IDs survive relocation. Active and alternate
 identities must differ and cannot collide with any location slot on another
-source. Machine/non-interactive `source add` requires an explicit nonblank
-positional `NAME` or `--name NAME`; it never invents one.
+source. Machine/non-interactive `source add` should use the canonical
+`SOURCE --name NAME` form; `--yes` rejects rather than prompts for ambiguous
+two-positional roles. Recipes use explicit `source` and `name` fields.
 
 ## Target commands
 
 ```text
-skill-manager target add NAME PATH
+skill-manager target add PATH --name NAME
 skill-manager target list
 skill-manager target enable NAME
 skill-manager target disable NAME
@@ -292,6 +293,10 @@ New target paths are root-relative templates. Empty paths, absolute paths,
 creates an enabled custom target. `set-path` applies to custom targets and
 legacy built-in overrides. Removing a normal built-in disables it; removing a
 custom target or legacy override deletes that definition.
+
+Machine/non-interactive `target add` should use the canonical
+`PATH --name NAME` form; `--yes` rejects rather than prompts for ambiguous
+two-positional roles. Recipes use explicit `path` and `name` fields.
 
 ## Configuration commands
 

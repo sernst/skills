@@ -181,16 +181,20 @@ fn source_recipe_fields(source: &str) -> BTreeMap<String, BTreeSet<String>> {
         "TargetAction::List",
         Some("TargetAction::Add"),
     ));
-    let target_path = allowed_fields(arm_block(
+    let target_add = allowed_fields(arm_block(
         target_block,
         "TargetAction::Add",
+        Some("TargetAction::SetPath"),
+    ));
+    let target_path = allowed_fields(arm_block(
+        target_block,
+        "TargetAction::SetPath",
         Some("TargetAction::Enable"),
     ));
     let target_name = allowed_fields(arm_block(target_block, "TargetAction::Enable", None));
     recipes.insert("target.list".into(), target_list);
-    for name in ["target.add", "target.set-path"] {
-        recipes.insert(name.into(), target_path.clone());
-    }
+    recipes.insert("target.add".into(), target_add);
+    recipes.insert("target.set-path".into(), target_path);
     for name in ["target.enable", "target.disable", "target.remove"] {
         recipes.insert(name.into(), target_name.clone());
     }
@@ -244,6 +248,7 @@ fn is_event_name(value: &str) -> bool {
             "command.",
             "config.",
             "configs.copy.",
+            "describe.",
             "plan.",
             "skill.",
             "source.",
@@ -548,7 +553,7 @@ fn config_and_summary_payload_references_match_production_emit_sites() {
     );
 
     let summaries = event_json_payloads(app, "summary");
-    assert_eq!(summaries.len(), 8, "production summary emit-site count");
+    assert_eq!(summaries.len(), 9, "production summary emit-site count");
     let summary_fields = summaries
         .iter()
         .map(|payload| object_fields(payload))
@@ -561,6 +566,7 @@ fn config_and_summary_payload_references_match_production_emit_sites() {
         ("summary-remove", 1),
         ("summary-status", 1),
         ("summary-resolve", 1),
+        ("summary-describe", 1),
         ("summary-configs-copy", 1),
     ] {
         let expected = documented
@@ -674,7 +680,7 @@ fn every_production_event_has_a_source_derived_payload_family() {
         }
     }
     let diagnostics = event_json_payloads(app, "diagnostic");
-    assert_eq!(diagnostics.len(), 2, "diagnostic variants");
+    assert_eq!(diagnostics.len(), 3, "diagnostic variants");
     let diagnostic_fields = diagnostics
         .iter()
         .map(|payload| object_fields(payload))
@@ -684,6 +690,7 @@ fn every_production_event_has_a_source_derived_payload_family() {
         BTreeSet::from([
             documented["diagnostic-message"].clone(),
             documented["diagnostic-pattern"].clone(),
+            documented["diagnostic-ambiguous-argument-roles"].clone(),
         ])
     );
     let failures = event_json_payloads(&main, "command.failed");
@@ -704,6 +711,8 @@ fn every_production_event_has_a_source_derived_payload_family() {
         ("config.shown", "config-shown"),
         ("configs.copy.item", "configs-copy-item"),
         ("diagnostic", "diagnostic-message"),
+        ("describe.skill", "describe-skill"),
+        ("describe.source", "describe-source"),
         ("plan", "plan"),
         ("plan.updated", "plan"),
         ("skill.copied", "skill-action"),
@@ -1220,16 +1229,56 @@ fn windows_installer_resolves_destination_spellings_without_side_effects() {
 fn managing_skill_has_required_metadata_and_current_storage_claims() {
     let root = repository_root();
     let skill = read(&root.join("skills/managing-skills/SKILL.md"));
+    let bundled_installer = root.join("skills/managing-skills/references/install.skill-manager.md");
+    let deployed_relative_installer = root
+        .join("skills/managing-skills")
+        .join("references/install.skill-manager.md");
     assert!(skill.starts_with("---\nname: managing-skills\ndescription: "));
     assert!(!skill.contains("TODO"));
     for bootstrap_guardrail in [
-        "Establish initial context with `source.list` and `target.list`",
+        "Run `skill-manager --version`.",
+        "installer with an explicit user-writable directory and PATH modification",
+        "Verify the\n   recorded executable with `--version`",
+        "but never modify persistent shell PATH.",
+        "If installation or verification fails, stop and report the exact failure.",
+    ] {
+        assert!(
+            skill.contains(bootstrap_guardrail),
+            "missing bootstrap/install/verify guardrail: {bootstrap_guardrail}"
+        );
+    }
+    assert!(
+        bundled_installer.is_file(),
+        "the deployable managing-skills copy must include its installer reference"
+    );
+    assert_eq!(
+        deployed_relative_installer, bundled_installer,
+        "the installer link must resolve relative to the deployed skill directory"
+    );
+    assert_eq!(
+        read(&bundled_installer),
+        read(&root.join("install.skill-manager.md")),
+        "the bundled installer reference must remain synchronized with the canonical installer instructions"
+    );
+    for bootstrap_contract in [
+        "[references/install.skill-manager.md](references/install.skill-manager.md)",
+        "record the installed binary's absolute path",
+        "Invoke that exact path\n   for every remaining `skill-manager` call",
+        "do not rely on a one-off PATH change",
+        "Verify the\n   recorded executable with `--version`, then establish the needed source and\n   target context and continue with this workflow.",
+    ] {
+        assert!(
+            skill.contains(bootstrap_contract),
+            "missing deployable bootstrap contract: {bootstrap_contract}"
+        );
+    }
+    for failure_guardrail in [
         "Treat that as an expected absence signal only when the parsed",
         "Every other exit-1 message",
     ] {
         assert!(
-            skill.contains(bootstrap_guardrail),
-            "missing bootstrap failure guardrail: {bootstrap_guardrail}"
+            skill.contains(failure_guardrail),
+            "missing failure guardrail: {failure_guardrail}"
         );
     }
     let metadata = read(&root.join("skills/managing-skills/agents/openai.yaml"));
@@ -1264,7 +1313,9 @@ fn machine_requirements_and_all_target_semantics_match_production() {
     let app = read(&root.join("clis/skill-manager/src/app.rs"));
     for production_contract in [
         "selection.all_targets && target.target.enabled",
-        "source name is required in noninteractive mode; pass NAME or --name",
+        "source name is required in noninteractive mode; pass SOURCE --name=NAME",
+        "arguments are ambiguous in noninteractive mode; pass {location} --name=NAME",
+        "target add requires NAME and PATH, or PATH --name=NAME",
         "target '{requested}' is disabled; use --target {requested} to override",
     ] {
         assert!(
@@ -1279,6 +1330,8 @@ fn machine_requirements_and_all_target_semantics_match_production() {
     for required in [
         "Without explicit scope or target selection,\n`load` infers project-vs-global scope and enabled targets silently",
         "Machine/non-interactive use\nrequires an explicit nonblank `name`",
+        "`SOURCE --name=NAME`",
+        "`PATH --name=NAME`",
         "`all_targets:true` selects enabled\n  configured targets only",
         "A disabled target requires explicit selection",
     ] {
@@ -1291,7 +1344,8 @@ fn machine_requirements_and_all_target_semantics_match_production() {
         "`load` and `update` render\ntheir whole plan and then auto-authorize the apply step",
         "Both use enabled targets when none are\nselected, and `load` also infers project-vs-global scope silently",
         "`all_targets:true` selects\nenabled configured targets only",
-        "A machine `source.add` must include a\nnonblank `name`",
+        "machine use should pass\n`SOURCE --name=NAME`",
+        "`PATH --name=NAME` to `target.add`",
     ] {
         assert!(
             skill.contains(required),
@@ -1300,7 +1354,8 @@ fn machine_requirements_and_all_target_semantics_match_production() {
     }
     for required in [
         "`load` in\nnon-interactive mode infers enabled targets silently, exactly like `update`",
-        "Machine/non-interactive `source add` requires an explicit nonblank",
+        "`SOURCE --name NAME`",
+        "`PATH --name NAME`",
         "`--all` never opts into a disabled\ntarget",
     ] {
         assert!(
