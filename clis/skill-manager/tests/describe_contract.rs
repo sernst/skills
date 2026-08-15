@@ -13,6 +13,10 @@ use predicates::prelude::*;
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod support;
+
+use support::portable_canonicalize;
+
 fn sandbox() -> TempDir {
     tempfile::tempdir().expect("create isolated home")
 }
@@ -336,6 +340,7 @@ fn source_fallback_and_type_specific_commands_emit_full_source_records() {
     create_skill(&source, "alpha", "Alpha trigger.");
     fs::write(source.join("README.md"), "Collection README\n").expect("write source README");
     add_source(home.path(), &source, "personal", &[]);
+    let expected_source = portable_canonicalize(&source).expect("canonical source path");
 
     for args in [
         vec!["--json", "describe", "personal"],
@@ -353,9 +358,13 @@ fn source_fallback_and_type_specific_commands_emit_full_source_records() {
             .find(|event| event["event"] == "describe.source")
             .expect("source event");
         assert_eq!(source_event["data"]["source"]["name"], "personal");
+        let reported_source = source_event["data"]["source"]["location"]
+            .as_str()
+            .map(PathBuf::from)
+            .expect("source location");
         assert_eq!(
-            source_event["data"]["source"]["location"],
-            source.to_string_lossy().as_ref()
+            portable_canonicalize(reported_source).expect("canonical reported source path"),
+            expected_source
         );
         assert_eq!(
             source_event["data"]["content"]["lines"][0],
