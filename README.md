@@ -19,6 +19,12 @@ updates across agent harnesses.
 Draft a concise, imperative commit title and motivation-focused change bullets
 from staged or unstaged changes.
 
+### [`expecting-pr-outputs`](./skills/expecting-pr-outputs/SKILL.md)
+
+Produce CI-green PR chains as session deliverables — stacked branches under
+enforced linear history, deployment runbooks, and explicitly-gated fast-forward
+merges with pipeline monitoring between each merge.
+
 ### [`grill-me`](./skills/grill-me/SKILL.md)
 
 Explore project context, then interview the user one decision at a time until a
@@ -36,8 +42,8 @@ patterns, security requirements, and test coverage.
 
 ### [`reviewing-my-code`](./skills/reviewing-my-code/SKILL.md)
 
-Prepare a focused branch review covering correctness, security, performance,
-and test coverage.
+Prepare a focused branch review covering correctness, security, performance, and
+test coverage.
 
 ### [`running-as-maestro`](./skills/running-as-maestro/SKILL.md)
 
@@ -102,11 +108,10 @@ $ skill-manager status managing-skills --shared --global
 ```
 
 `describe` shows trigger text and a bounded README/SKILL.md excerpt; qualify a
-skill with its source to inspect an excluded or shadowed copy. The dry run
-shows the same plan without deploying the skill. The next command shows the
-plan again and asks for authorization. Start a new agent session if
-your harness scans installed skills only at startup; you can then ask it to use
-`$managing-skills`.
+skill with its source to inspect an excluded or shadowed copy. The dry run shows
+the same plan without deploying the skill. The next command shows the plan again
+and asks for authorization. Start a new agent session if your harness scans
+installed skills only at startup; you can then ask it to use `$managing-skills`.
 
 ## Mental model and safety
 
