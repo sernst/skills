@@ -1,7 +1,7 @@
 Set-StrictMode -Version Latest
 
 $script:InvariantCulture = [System.Globalization.CultureInfo]::InvariantCulture
-$script:ForbiddenText = '(?i)(https?://|javascript:|data:|ignore\s+(all|any|previous)|system\s+prompt|<script|<iframe)'
+$script:BenchmarkParserVersion = 2
 
 function Assert-TrustedScalar {
     param(
@@ -16,7 +16,40 @@ function Assert-TrustedScalar {
     }
     if ($Value.Length -gt $MaximumLength) { throw "$Field exceeds $MaximumLength characters." }
     if ($Value -match '[\x00-\x1f\x7f]') { throw "$Field contains a control character." }
-    if ($Value -match $script:ForbiddenText) { throw "$Field contains forbidden instruction or link text." }
+    return $Value
+}
+
+function Assert-IdentifierScalar {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Value,
+        [Parameter(Mandatory = $true)] [string] $Field,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Model', 'Effort', 'Harness', 'Config', 'Version')]
+        [string] $Kind,
+        [string[]] $AllowedValues
+    )
+
+    $limits = @{ Model = 100; Effort = 24; Harness = 64; Config = 150; Version = 30 }
+    Assert-TrustedScalar $Value $Field $limits[$Kind] | Out-Null
+    if ($Value -ne $Value.Trim()) { throw "$Field has leading or trailing whitespace." }
+    if ($Value -match '(?i)(?:[a-z][a-z0-9+.-]*:)?//') { throw "$Field contains a URI-like value." }
+
+    if ($AllowedValues -and $Value -cnotin $AllowedValues) {
+        throw "$Field is not an allowlisted $($Kind.ToLowerInvariant()) value."
+    }
+
+    $valid = switch ($Kind) {
+        'Model' {
+            $Value -match '^[\p{L}\p{N}][\p{L}\p{N} ._+:/()''-]*$' -and
+            $Value -match '[0-9]' -and
+            @($Value -split '\s+').Count -le 8
+        }
+        'Effort' { $Value -match '^[A-Za-z][A-Za-z0-9]*(?:[ -][A-Za-z0-9]+)?$' }
+        'Harness' { $Value -match '^[A-Za-z0-9][A-Za-z0-9._-]*$' }
+        'Config' { $Value -match '^[A-Za-z0-9][A-Za-z0-9._+:/-]*$' }
+        'Version' { $Value -match '^[0-9]+(?:\.[0-9]+){1,3}$' }
+    }
+    if (-not $valid) { throw "$Field does not match the $($Kind.ToLowerInvariant()) identifier grammar." }
     return $Value
 }
 
@@ -54,8 +87,15 @@ function Convert-ToBoundedInteger {
 
 function Convert-ToMarkdownScalar {
     param([Parameter(Mandatory = $true)] [string] $Value)
-    $escaped = $Value.Replace('\', '\\').Replace('|', '\|').Replace('`', '\`')
-    return $escaped.Replace('*', '\*').Replace('_', '\_')
+    # Encode HTML and URI punctuation before escaping Markdown syntax. Even
+    # registry-authored values therefore remain inert if rendered as table data.
+    $escaped = $Value.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+    $escaped = $escaped.Replace('"', '&quot;').Replace("'", '&#39;')
+    $escaped = $escaped.Replace(':', '&#58;').Replace('/', '&#47;')
+    foreach ($character in @('\', '|', '`', '*', '_', '[', ']', '(', ')', '!')) {
+        $escaped = $escaped.Replace($character, "\$character")
+    }
+    return $escaped
 }
 
 function Get-Sha256Hex {
@@ -179,15 +219,13 @@ function Set-ParetoMarkers {
 }
 
 function Get-SemanticBenchmarkText {
-    param([Parameter(Mandatory = $true)] [object[]] $Benchmarks)
-    $lines = foreach ($benchmark in $Benchmarks) {
-        "$($benchmark.Id)|$($benchmark.Version)|$($benchmark.PublishedAt)|$($benchmark.ScoreLabel)|$($benchmark.TaskCount)"
-        foreach ($row in $benchmark.Rows) {
-            @($row.Model, $row.Effort, $row.Harness, $row.Config,
-                $row.Score.ToString('0.################', $script:InvariantCulture),
-                $row.Cost.ToString('0.################', $script:InvariantCulture),
-                $row.CiLow, $row.CiHigh, $row.SampleCount, $row.RunCount, $row.Pareto) -join '|'
-        }
+    param([Parameter(Mandatory = $true)] $Benchmark)
+    $lines = @("$($Benchmark.Id)|$($Benchmark.Version)|$($Benchmark.PublishedAt)|$($Benchmark.ScoreLabel)|$($Benchmark.TaskCount)")
+    foreach ($row in $Benchmark.Rows) {
+        $lines += @($row.Model, $row.Effort, $row.Harness, $row.Config,
+            $row.Score.ToString('0.################', $script:InvariantCulture),
+            $row.Cost.ToString('0.################', $script:InvariantCulture),
+            $row.CiLow, $row.CiHigh, $row.SampleCount, $row.RunCount, $row.Pareto) -join '|'
     }
     return $lines -join "`n"
 }
@@ -217,7 +255,13 @@ function New-BenchmarkSnapshot {
         [Parameter(Mandatory = $true)] [datetimeoffset] $RetrievedAt
     )
 
-    $semanticHash = Get-Sha256Hex (Get-SemanticBenchmarkText $Benchmarks)
+    $sourceHashes = @{}
+    $sourceTexts = foreach ($benchmark in $Benchmarks) {
+        $sourceText = Get-SemanticBenchmarkText $benchmark
+        $sourceHashes[$benchmark.Id] = Get-Sha256Hex $sourceText
+        $sourceText
+    }
+    $semanticHash = Get-Sha256Hex ("parser=$script:BenchmarkParserVersion`n" + ($sourceTexts -join "`n"))
     $builder = [System.Text.StringBuilder]::new()
     [void]$builder.AppendLine('# Model benchmark snapshot')
     [void]$builder.AppendLine()
@@ -226,6 +270,7 @@ function New-BenchmarkSnapshot {
     [void]$builder.AppendLine('authoritative. `★` marks the point-estimate cost/performance Pareto frontier.')
     [void]$builder.AppendLine()
     [void]$builder.AppendLine("- Retrieved after semantic change: ``$($RetrievedAt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))``")
+    [void]$builder.AppendLine("- Parser version: ``$script:BenchmarkParserVersion``")
     [void]$builder.AppendLine("- Normalized SHA-256: ``$semanticHash``")
     [void]$builder.AppendLine('- Scores and costs are source-reported; no composite or cross-source ranking is calculated.')
 
@@ -236,7 +281,7 @@ function New-BenchmarkSnapshot {
         [void]$builder.AppendLine()
         $published = if ($benchmark.PublishedAt) { " · source updated ``$($benchmark.PublishedAt)``" } else { '' }
         $tasks = if ($benchmark.TaskCount) { " · tasks ``$($benchmark.TaskCount)``" } else { '' }
-        [void]$builder.AppendLine("Source: [$($benchmark.DisplayName)]($($source.canonicalUrl)) · version ``$($benchmark.Version)``$published$tasks")
+        [void]$builder.AppendLine("Source: [$($benchmark.DisplayName)]($($source.canonicalUrl)) · version ``$($benchmark.Version)``$published$tasks · normalized SHA-256 ``$($sourceHashes[$benchmark.Id])``")
         [void]$builder.AppendLine()
         [void]$builder.AppendLine("Metric: ``$($benchmark.ScoreLabel)`` · $($source.scope) $($source.caveat)")
         [void]$builder.AppendLine()

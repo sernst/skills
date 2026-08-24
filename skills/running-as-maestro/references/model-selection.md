@@ -49,9 +49,11 @@ and synthesis dominate successful-edit averages.
 **Reviewers/judges:** benchmark evidence is also a weak tie-breaker. Defect
 recall and precision, calibration, adversarial scrutiny, and evidence quality
 matter more than patch success. The judge floor in the main skill is absolute:
-the judge must remain equal to or stronger than the executor and may not be an
-older generation of the same family. Never trade that floor for a cheaper
-benchmark row.
+the judge's model class must remain equal to or stronger than the executor and
+may not be an older generation of the same family. Size judge effort separately
+for review risk, evidence quality, and ambiguity; there is no equal-effort floor,
+but never lower effort merely because the model-class floor is met. Never trade
+the class floor for a cheaper benchmark row.
 
 The snapshot is generated from allowlisted public sources and intentionally
 contains no external narrative. Follow its provenance and caveats; if it is

@@ -18,12 +18,12 @@ function ConvertFrom-DeepSweBenchmark {
                 $Source.costField, 'ci_lo', 'ci_hi', 'n_attempted', 'n_runs')) {
             if ($field -notin $inputRow.psobject.Properties.Name) { throw "deepswe row is missing $field." }
         }
-        $model = Assert-TrustedScalar ([string]$inputRow.model) 'deepswe.model' 100
-        $harness = Assert-TrustedScalar ([string]$inputRow.harness) 'deepswe.harness' 80
+        $model = Assert-IdentifierScalar ([string]$inputRow.model) 'deepswe.model' Model
+        $harness = Assert-IdentifierScalar ([string]$inputRow.harness) 'deepswe.harness' Harness
         $effortValue = [string]$inputRow.reasoning_effort
         if ([string]::IsNullOrWhiteSpace($effortValue)) { $effortValue = 'default' }
-        $effort = Assert-TrustedScalar $effortValue 'deepswe.reasoning_effort' 40
-        $config = Assert-TrustedScalar ([string]$inputRow.config) 'deepswe.config' 150
+        $effort = Assert-IdentifierScalar $effortValue 'deepswe.reasoning_effort' Effort @($Source.effortLabels)
+        $config = Assert-IdentifierScalar ([string]$inputRow.config) 'deepswe.config' Config
         $scoreRatio = Convert-ToBoundedDecimal $inputRow.($Source.scoreField) "deepswe.$($Source.scoreField)" 0 1
         $cost = Convert-ToBoundedDecimal $inputRow.($Source.costField) "deepswe.$($Source.costField)" 0 10000
         $ciLow = Convert-ToBoundedDecimal $inputRow.ci_lo 'deepswe.ci_lo' 0 1
@@ -48,7 +48,7 @@ function ConvertFrom-DeepSweBenchmark {
     return [pscustomobject]@{
         Id = 'deepswe'
         DisplayName = 'DeepSWE'
-        Version = Assert-TrustedScalar ([string]$Source.version) 'deepswe.version' 30
+        Version = Assert-IdentifierScalar ([string]$Source.version) 'deepswe.version' Version
         PublishedAt = $publishedAt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
         TaskCount = $taskCount
         ScoreLabel = Assert-TrustedScalar ([string]$Source.scoreLabel) 'deepswe.scoreLabel' 30

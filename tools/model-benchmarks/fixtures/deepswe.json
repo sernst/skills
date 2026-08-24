@@ -3,7 +3,7 @@
   "n_tasks_in_set": 113,
   "rows": [
     {
-      "model": "alpha-model",
+      "model": "alpha-model-1",
       "harness": "mini-swe-agent",
       "reasoning_effort": "high",
       "config": "alpha_high",
@@ -15,7 +15,7 @@
       "n_runs": 4
     },
     {
-      "model": "beta-model",
+      "model": "beta-model-2",
       "harness": "mini-swe-agent",
       "reasoning_effort": "medium",
       "config": "beta_medium",
@@ -27,7 +27,7 @@
       "n_runs": 4
     },
     {
-      "model": "gamma-model",
+      "model": "gamma-model-3",
       "harness": "mini-swe-agent",
       "reasoning_effort": "low",
       "config": "gamma_low",

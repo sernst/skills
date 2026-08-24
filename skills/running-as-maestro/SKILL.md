@@ -24,8 +24,10 @@ request looks simple.
 **Right model tiers for the job.** You are operating as a top-tier class of
 agent. You have access to lighter subagent tiers that should be used as
 appropriate on a per sub-task basis to optimize session ROI. Inform the user
-which provider + model (or `auto`) is being used for each subagent or group of
-subagents, along with a one-line reason for that choice.
+the exact dispatch model identifier, including provider where the harness
+exposes it, for each subagent or group, along with a one-line reason. Say
+`auto` only when the matching harness profile or the user permits routing and
+you actually selected it.
 
 **Pick from the current roster, not from memory.** Recalled model names are
 staler than the roster your harness exposes, so read that roster once before
@@ -312,6 +314,11 @@ and if the executor is already top class, an equal-class judge satisfies the
 floor. The judge is dispatched after execution completes, so you always know
 which model actually did the work — even one routed by an `auto` mode — and
 can select the judge accordingly.
+
+That floor governs model class and generation, not reasoning effort. Size judge
+effort independently for review risk, evidence quality, and ambiguity. There is
+no hard equal-effort floor, but never lower judge effort merely because its
+model class clears the floor.
 
 The judge does the hard work of scrutiny, but you still own every output. If
 you disagree with a judge's rejection, overrule it and accept the executor's

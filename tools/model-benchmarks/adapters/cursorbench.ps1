@@ -6,7 +6,7 @@ function ConvertFrom-CursorBenchBenchmark {
 
     $versionMatch = [regex]::Match($Content, [string]$Source.versionPattern)
     if (-not $versionMatch.Success) { throw 'cursorbench version marker is missing or changed.' }
-    $version = Assert-TrustedScalar $versionMatch.Groups[1].Value 'cursorbench.version' 30
+    $version = Assert-IdentifierScalar $versionMatch.Groups[1].Value 'cursorbench.version' Version
     $dateMatch = [regex]::Match($Content, 'cursorbench-changelog-([0-9]{4}-[0-9]{2}-[0-9]{2})')
     if (-not $dateMatch.Success) { throw 'cursorbench source-update timestamp is missing or changed.' }
     try { [void][datetime]::ParseExact($dateMatch.Groups[1].Value, 'yyyy-MM-dd', $script:InvariantCulture) }
@@ -19,9 +19,29 @@ function ConvertFrom-CursorBenchBenchmark {
     $htmlRows = [regex]::Matches($uniqueTables[0], '<tr\b.*?</tr>', 'Singleline')
     if ($htmlRows.Count -lt 2) { throw 'cursorbench rendered table has no data rows.' }
     $headers = @([regex]::Matches($htmlRows[0].Value, '<th\b[^>]*>(.*?)</th>', 'Singleline') |
-        ForEach-Object { Get-HtmlCellText $_.Groups[1].Value })
-    $headerText = $headers -join '|'
-    if ($headerText -notmatch 'Model' -or $headerText -notmatch 'Score' -or $headerText -notmatch 'Cost / task') {
+        ForEach-Object {
+            # The public table repeats short mobile and full desktop labels in
+            # one cell. Validate the exact desktop metric names after removing
+            # only the explicitly hidden-on-desktop alternative.
+            $desktopHeader = [regex]::Replace(
+                $_.Groups[1].Value,
+                '<span\b[^>]*class="[^"]*\bmd:hidden\b[^"]*"[^>]*>.*?</span>',
+                '',
+                'Singleline'
+            )
+            Get-HtmlCellText $desktopHeader
+        })
+    $expectedHeaders = @($Source.expectedHeaders)
+    $headersMatch = $headers.Count -eq $expectedHeaders.Count
+    if ($headersMatch) {
+        for ($headerIndex = 0; $headerIndex -lt $headers.Count; $headerIndex++) {
+            if ($headers[$headerIndex] -cne $expectedHeaders[$headerIndex]) {
+                $headersMatch = $false
+                break
+            }
+        }
+    }
+    if (-not $headersMatch) {
         throw 'cursorbench rendered table headers changed.'
     }
 
@@ -41,8 +61,8 @@ function ConvertFrom-CursorBenchBenchmark {
                 break
             }
         }
-        $model = Assert-TrustedScalar $model "cursorbench.row[$index].model" 100
-        $effort = Assert-TrustedScalar $effort "cursorbench.row[$index].effort" 40
+        $model = Assert-IdentifierScalar $model "cursorbench.row[$index].model" Model
+        $effort = Assert-IdentifierScalar $effort "cursorbench.row[$index].effort" Effort @($Source.effortLabels + 'default')
         if ($cells[2] -notmatch '^([0-9]+(?:\.[0-9]+)?)\s*%$') { throw "cursorbench row $index score changed format." }
         $score = Convert-ToBoundedDecimal $Matches[1] "cursorbench.row[$index].score" 0 100
         if ($cells[3] -notmatch '^\$\s*([0-9]+(?:\.[0-9]+)?)$') { throw "cursorbench row $index cost changed format." }
