@@ -1,7 +1,7 @@
 Set-StrictMode -Version Latest
 
 $script:InvariantCulture = [System.Globalization.CultureInfo]::InvariantCulture
-$script:BenchmarkParserVersion = 2
+$script:BenchmarkParserVersion = 3
 
 function Assert-TrustedScalar {
     param(
@@ -24,12 +24,12 @@ function Assert-IdentifierScalar {
         [Parameter(Mandatory = $true)] [string] $Value,
         [Parameter(Mandatory = $true)] [string] $Field,
         [Parameter(Mandatory = $true)]
-        [ValidateSet('Model', 'Effort', 'Harness', 'Config', 'Version')]
+        [ValidateSet('Effort', 'Harness', 'Config', 'Version')]
         [string] $Kind,
         [string[]] $AllowedValues
     )
 
-    $limits = @{ Model = 100; Effort = 24; Harness = 64; Config = 150; Version = 30 }
+    $limits = @{ Effort = 24; Harness = 64; Config = 150; Version = 30 }
     Assert-TrustedScalar $Value $Field $limits[$Kind] | Out-Null
     if ($Value -ne $Value.Trim()) { throw "$Field has leading or trailing whitespace." }
     if ($Value -match '(?i)(?:[a-z][a-z0-9+.-]*:)?//') { throw "$Field contains a URI-like value." }
@@ -39,11 +39,6 @@ function Assert-IdentifierScalar {
     }
 
     $valid = switch ($Kind) {
-        'Model' {
-            $Value -match '^[\p{L}\p{N}][\p{L}\p{N} ._+:/()''-]*$' -and
-            $Value -match '[0-9]' -and
-            @($Value -split '\s+').Count -le 8
-        }
         'Effort' { $Value -match '^[A-Za-z][A-Za-z0-9]*(?:[ -][A-Za-z0-9]+)?$' }
         'Harness' { $Value -match '^[A-Za-z0-9][A-Za-z0-9._-]*$' }
         'Config' { $Value -match '^[A-Za-z0-9][A-Za-z0-9._+:/-]*$' }
@@ -51,6 +46,29 @@ function Assert-IdentifierScalar {
     }
     if (-not $valid) { throw "$Field does not match the $($Kind.ToLowerInvariant()) identifier grammar." }
     return $Value
+}
+
+function Assert-SourceModelScalar {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Value,
+        [Parameter(Mandatory = $true)] [string] $Field,
+        [Parameter(Mandatory = $true)] $Source
+    )
+
+    Assert-TrustedScalar $Value $Field 100 | Out-Null
+    if ($Value -ne $Value.Trim()) { throw "$Field has leading or trailing whitespace." }
+    if ($Value -match '(?i)(?:[a-z][a-z0-9+.-]*:)?//') { throw "$Field contains a URI-like value." }
+
+    foreach ($pattern in @($Source.modelPatterns)) {
+        if ([regex]::IsMatch(
+                $Value,
+                [string]$pattern,
+                [System.Text.RegularExpressions.RegexOptions]::CultureInvariant,
+                [timespan]::FromMilliseconds(100))) {
+            return $Value
+        }
+    }
+    throw "$Field is not an allowlisted model family for source $($Source.id)."
 }
 
 function Convert-ToBoundedDecimal {
@@ -157,6 +175,37 @@ function Read-BenchmarkRegistry {
         }
         Assert-TrustedScalar ([string]$source.scope) "$id.scope" 180 | Out-Null
         Assert-TrustedScalar ([string]$source.caveat) "$id.caveat" 220 | Out-Null
+
+        $modelPatterns = @($source.modelPatterns)
+        if (-not $modelPatterns.Count -or $modelPatterns.Count -gt 20) {
+            throw "Source $id must define 1..20 modelPatterns."
+        }
+        foreach ($pattern in $modelPatterns) {
+            $pattern = Assert-TrustedScalar ([string]$pattern) "$id.modelPatterns" 200
+            if (-not $pattern.StartsWith('^', [StringComparison]::Ordinal) -or
+                -not $pattern.EndsWith('$', [StringComparison]::Ordinal)) {
+                throw "Source $id modelPatterns must be anchored."
+            }
+            try {
+                [void][regex]::new(
+                    $pattern,
+                    [System.Text.RegularExpressions.RegexOptions]::CultureInvariant,
+                    [timespan]::FromMilliseconds(100))
+            } catch {
+                throw "Source $id has an invalid model pattern: $($_.Exception.Message)"
+            }
+        }
+
+        if ($source.adapter -eq 'deepswe-json') {
+            Assert-IdentifierScalar ([string]$source.harness) "$id.harness" Harness | Out-Null
+            $template = Assert-TrustedScalar ([string]$source.configTemplate) "$id.configTemplate" 100
+            if ($template -cne 'mini_swe_agent_{model}_{effort}') {
+                throw "Source $id configTemplate is not the reviewed DeepSWE structure."
+            }
+        } elseif ($source.adapter -eq 'cursorbench-html') {
+            Assert-TrustedScalar ([string]$source.harness) "$id.harness" 100 | Out-Null
+            Assert-TrustedScalar ([string]$source.config) "$id.config" 150 | Out-Null
+        }
     }
     return $registry
 }

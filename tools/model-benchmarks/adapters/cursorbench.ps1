@@ -61,7 +61,7 @@ function ConvertFrom-CursorBenchBenchmark {
                 break
             }
         }
-        $model = Assert-IdentifierScalar $model "cursorbench.row[$index].model" Model
+        $model = Assert-SourceModelScalar $model "cursorbench.row[$index].model" $Source
         $effort = Assert-IdentifierScalar $effort "cursorbench.row[$index].effort" Effort @($Source.effortLabels + 'default')
         if ($cells[2] -notmatch '^([0-9]+(?:\.[0-9]+)?)\s*%$') { throw "cursorbench row $index score changed format." }
         $score = Convert-ToBoundedDecimal $Matches[1] "cursorbench.row[$index].score" 0 100

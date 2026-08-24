@@ -18,12 +18,21 @@ function ConvertFrom-DeepSweBenchmark {
                 $Source.costField, 'ci_lo', 'ci_hi', 'n_attempted', 'n_runs')) {
             if ($field -notin $inputRow.psobject.Properties.Name) { throw "deepswe row is missing $field." }
         }
-        $model = Assert-IdentifierScalar ([string]$inputRow.model) 'deepswe.model' Model
+        $model = Assert-SourceModelScalar ([string]$inputRow.model) 'deepswe.model' $Source
         $harness = Assert-IdentifierScalar ([string]$inputRow.harness) 'deepswe.harness' Harness
+        if ($harness -cne [string]$Source.harness) {
+            throw "deepswe.harness does not match the registered harness."
+        }
         $effortValue = [string]$inputRow.reasoning_effort
         if ([string]::IsNullOrWhiteSpace($effortValue)) { $effortValue = 'default' }
         $effort = Assert-IdentifierScalar $effortValue 'deepswe.reasoning_effort' Effort @($Source.effortLabels)
         $config = Assert-IdentifierScalar ([string]$inputRow.config) 'deepswe.config' Config
+        $expectedConfig = ([string]$Source.configTemplate).
+            Replace('{model}', $model.Replace('-', '_')).
+            Replace('{effort}', $effort)
+        if ($config -cne $expectedConfig) {
+            throw 'deepswe.config does not correspond to the validated model and effort.'
+        }
         $scoreRatio = Convert-ToBoundedDecimal $inputRow.($Source.scoreField) "deepswe.$($Source.scoreField)" 0 1
         $cost = Convert-ToBoundedDecimal $inputRow.($Source.costField) "deepswe.$($Source.costField)" 0 10000
         $ciLow = Convert-ToBoundedDecimal $inputRow.ci_lo 'deepswe.ci_lo' 0 1

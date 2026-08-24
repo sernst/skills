@@ -3,10 +3,10 @@
   "n_tasks_in_set": 113,
   "rows": [
     {
-      "model": "alpha-model-1",
+      "model": "gpt-5-6-sol",
       "harness": "mini-swe-agent",
       "reasoning_effort": "high",
-      "config": "alpha_high",
+      "config": "mini_swe_agent_gpt_5_6_sol_high",
       "pass_at_1": 0.70,
       "mean_cost_usd": 2.00,
       "ci_lo": 0.66,
@@ -15,10 +15,10 @@
       "n_runs": 4
     },
     {
-      "model": "beta-model-2",
+      "model": "claude-opus-5",
       "harness": "mini-swe-agent",
       "reasoning_effort": "medium",
-      "config": "beta_medium",
+      "config": "mini_swe_agent_claude_opus_5_medium",
       "pass_at_1": 0.65,
       "mean_cost_usd": 1.00,
       "ci_lo": 0.61,
@@ -27,10 +27,10 @@
       "n_runs": 4
     },
     {
-      "model": "gamma-model-3",
+      "model": "gemini-3-7-flash",
       "harness": "mini-swe-agent",
       "reasoning_effort": "low",
-      "config": "gamma_low",
+      "config": "mini_swe_agent_gemini_3_7_flash_low",
       "pass_at_1": 0.60,
       "mean_cost_usd": 3.00,
       "ci_lo": 0.56,

@@ -4,9 +4,9 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-08-24T19:21:00Z`
-- Parser version: `2`
-- Normalized SHA-256: `f17d68e38b0c9fafbab83f189da1874bb160f7478a40dd625541b8588512f595`
+- Retrieved after semantic change: `2026-08-24T19:33:24Z`
+- Parser version: `3`
+- Normalized SHA-256: `a8e87b020b1d635ac68e44bcc8f42b86706b3b46166cb61a78b07d87b358f28b`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
