@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "snapshot": {
+    "maximumBytes": 24576,
+    "maximumRows": 200
+  },
+  "sources": [
+    {
+      "id": "deepswe",
+      "enabled": true,
+      "adapter": "deepswe-json",
+      "url": "https://deepswe.datacurve.ai/artifacts/v1.1/leaderboard-live.json",
+      "canonicalUrl": "https://deepswe.datacurve.ai/",
+      "version": "1.1",
+      "scoreLabel": "pass@1",
+      "scoreField": "pass_at_1",
+      "costField": "mean_cost_usd",
+      "minimumRows": 1,
+      "maximumRows": 120,
+      "harness": null,
+      "config": null,
+      "scope": "Autonomous software-engineering rollouts; score is attempt pass@1.",
+      "caveat": "Confidence intervals are run-to-run estimates; provider, verifier, and network errors are excluded."
+    },
+    {
+      "id": "cursorbench",
+      "enabled": true,
+      "adapter": "cursorbench-html",
+      "url": "https://cursor.com/cursorbench",
+      "canonicalUrl": "https://cursor.com/cursorbench",
+      "versionPattern": "CursorBench ([0-9]+\\.[0-9]+)",
+      "scoreLabel": "score",
+      "minimumRows": 1,
+      "maximumRows": 120,
+      "harness": "Cursor benchmark agent",
+      "config": "published CursorBench configuration",
+      "effortLabels": ["Extra High", "Medium", "High", "Low", "Max"],
+      "scope": "Ambiguous, multi-file tasks from real Cursor sessions.",
+      "caveat": "No uncertainty or sample count is published; small score differences may not be meaningful."
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "generated_at": "2026-08-20T07:48:24Z",
+  "n_tasks_in_set": 113,
+  "rows": [
+    {
+      "model": "alpha-model",
+      "harness": "mini-swe-agent",
+      "reasoning_effort": "high",
+      "config": "alpha_high",
+      "pass_at_1": 0.70,
+      "mean_cost_usd": 2.00,
+      "ci_lo": 0.66,
+      "ci_hi": 0.74,
+      "n_attempted": 452,
+      "n_runs": 4
+    },
+    {
+      "model": "beta-model",
+      "harness": "mini-swe-agent",
+      "reasoning_effort": "medium",
+      "config": "beta_medium",
+      "pass_at_1": 0.65,
+      "mean_cost_usd": 1.00,
+      "ci_lo": 0.61,
+      "ci_hi": 0.69,
+      "n_attempted": 450,
+      "n_runs": 4
+    },
+    {
+      "model": "gamma-model",
+      "harness": "mini-swe-agent",
+      "reasoning_effort": "low",
+      "config": "gamma_low",
+      "pass_at_1": 0.60,
+      "mean_cost_usd": 3.00,
+      "ci_lo": 0.56,
+      "ci_hi": 0.64,
+      "n_attempted": 448,
+      "n_runs": 4
+    }
+  ]
+}

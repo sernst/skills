@@ -197,3 +197,22 @@ jobs:
             "$smoke_stage/run-smoke" \
             "$smoke_stage/skill-manager" \
             "$smoke_source_url"
+  required:
+    name: PR required gate
+    if: always()
+    needs: [discover, quality, preflight]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every PR job to pass
+        shell: pwsh
+        env:
+          DISCOVER_RESULT: ${{ needs.discover.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+        run: |
+          $results = @($env:DISCOVER_RESULT, $env:QUALITY_RESULT, $env:PREFLIGHT_RESULT)
+          if (@($results | Where-Object { $_ -ne 'success' }).Count) {
+            throw "PR checks did not all succeed: $($results -join ', ')"
+          }
+          Write-Host 'All PR jobs succeeded.'

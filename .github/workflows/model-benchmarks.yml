@@ -1,0 +1,152 @@
+name: Refresh model benchmarks
+
+on:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: model-benchmark-refresh
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    name: Validate and propose benchmark snapshot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: app-token
+        name: Create narrowly scoped updater token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.BENCHMARK_APP_ID }}
+          private-key: ${{ secrets.BENCHMARK_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Fetch, validate, and render all allowlisted sources
+        shell: pwsh
+        run: pwsh -NoLogo -NoProfile -File tools/model-benchmarks/update-benchmarks.ps1 -Mode Refresh
+
+      - id: diff
+        name: Enforce generated-file diff allowlist
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $allowed = 'skills/running-as-maestro/references/benchmark-snapshot.md'
+          $files = @(git status --porcelain=v1 | ForEach-Object { $_.Substring(3) })
+          if (-not $files.Count) {
+            'changed=false' | Add-Content $env:GITHUB_OUTPUT
+            Write-Host 'Snapshot is current; no branch or pull request will be created.'
+            exit 0
+          }
+          if ($files.Count -ne 1 -or $files[0] -cne $allowed) {
+            throw "Refresh changed files outside the allowlist: $($files -join ', ')"
+          }
+          'changed=true' | Add-Content $env:GITHUB_OUTPUT
+
+          $old = @(git show "HEAD:$allowed" | Where-Object { $_ -match '^Source:' })
+          $new = @(Get-Content -LiteralPath $allowed | Where-Object { $_ -match '^Source:' })
+          $bodyPath = Join-Path $env:RUNNER_TEMP 'benchmark-pr-body.md'
+          @(
+            'Automated refresh of the allowlisted model benchmark snapshot.'
+            ''
+            'Only the generated snapshot is changed. Normal pull-request checks, bot approval, and squash auto-merge apply.'
+            ''
+            '## Source versions and timestamps'
+            ''
+            '**Before**'
+            $old
+            ''
+            '**After**'
+            $new
+          ) | Set-Content -LiteralPath $bodyPath
+          "body_path=$bodyPath" | Add-Content $env:GITHUB_OUTPUT
+
+      - id: pr
+        if: steps.diff.outputs.changed == 'true'
+        name: Create or update the single benchmark PR
+        shell: pwsh
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          BODY_PATH: ${{ steps.diff.outputs.body_path }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $branch = 'automation/model-benchmark-snapshot'
+          $snapshot = 'skills/running-as-maestro/references/benchmark-snapshot.md'
+          git config user.name 'benchmark-updater[bot]'
+          git config user.email 'benchmark-updater[bot]@users.noreply.github.com'
+          git switch --force-create $branch
+          git add -- $snapshot
+          git commit -m 'chore: refresh maestro model benchmarks'
+
+          git remote set-url origin "https://x-access-token:$env:APP_TOKEN@github.com/$env:GITHUB_REPOSITORY.git"
+          $remote = @(git ls-remote --heads origin "refs/heads/$branch")
+          if ($remote.Count) {
+            $expected = ($remote[0] -split "`t")[0]
+            git push "--force-with-lease=refs/heads/$branch`:$expected" origin "HEAD:refs/heads/$branch"
+          } else {
+            git push origin "HEAD:refs/heads/$branch"
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to update the automation branch safely.' }
+
+          $open = @(gh pr list --repo $env:GITHUB_REPOSITORY --state open --head $branch --json number | ConvertFrom-Json)
+          if ($open.Count) {
+            $number = [string]$open[0].number
+            gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/pulls/$number" `
+              -f title='chore: refresh maestro model benchmarks' `
+              -F "body=@$env:BODY_PATH" | Out-Null
+          } else {
+            $url = gh pr create --repo $env:GITHUB_REPOSITORY --base main --head $branch `
+              --title 'chore: refresh maestro model benchmarks' --body-file $env:BODY_PATH
+            $number = ($url -split '/')[-1]
+          }
+          "number=$number" | Add-Content $env:GITHUB_OUTPUT
+
+      - if: steps.diff.outputs.changed == 'true'
+        name: Approve as GitHub Actions
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: gh pr review $env:PR_NUMBER --repo $env:GITHUB_REPOSITORY --approve --body 'Validated generated-file-only benchmark refresh.'
+
+      - if: steps.diff.outputs.changed == 'true'
+        name: Enable squash auto-merge
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: gh pr merge $env:PR_NUMBER --repo $env:GITHUB_REPOSITORY --auto --squash --delete-branch
+
+      - if: failure()
+        name: Open or update the deduplicated failure issue
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: pwsh -NoLogo -NoProfile -File tools/model-benchmarks/manage-refresh-issue.ps1 -State Failure -Repository $env:GITHUB_REPOSITORY -RunUrl $env:RUN_URL
+
+      - if: success()
+        name: Record recovery and close any open failure issue
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: pwsh -NoLogo -NoProfile -File tools/model-benchmarks/manage-refresh-issue.ps1 -State Recovery -Repository $env:GITHUB_REPOSITORY -RunUrl $env:RUN_URL -PullRequestNumber $env:PR_NUMBER -SnapshotPath skills/running-as-maestro/references/benchmark-snapshot.md

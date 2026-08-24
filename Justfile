@@ -35,6 +35,10 @@ deny:
 
 check:
     pwsh -File tools/run-registered.ps1 -Recipe check
+    pwsh -File tools/model-benchmarks/test-benchmarks.ps1
+
+benchmark-test:
+    pwsh -File tools/model-benchmarks/test-benchmarks.ps1
 
 metadata:
     pwsh -File tools/run-registered.ps1 -Recipe metadata

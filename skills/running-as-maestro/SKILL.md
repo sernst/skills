@@ -41,6 +41,13 @@ generation's equivalent before dispatching. Where a harness picks tiers
 natively, as the Claude-family profile does, there is no roster and this reduces
 to trusting that selection.
 
+**Use benchmark evidence selectively.** Before the first model/effort decision,
+read [references/model-selection.md](references/model-selection.md). For a
+substantive executor choice where several pairings are plausible or cost
+materially affects ROI, also read the current benchmark snapshot it routes to.
+Do not load the snapshot for every dispatch; for researchers and judges, consult
+it only to break a genuine tie after role-specific reasoning.
+
 **Identify your harness once, then apply exactly one of the profiles below.**
 Determine which harness you are running in and apply only the matching
 profile — entirely ignore the other four; rules written for a profile that
