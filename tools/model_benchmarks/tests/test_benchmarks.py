@@ -3,11 +3,13 @@ from __future__ import annotations
 import copy
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -355,32 +357,135 @@ class CliTests(BenchmarkTestCase):
 
 
 class IssueLifecycleTests(unittest.TestCase):
+    def test_find_issue_uses_encoded_repository_scoped_search_and_exact_match(self) -> None:
+        client = cli.GitHubIssues("sernst/skills", "token")
+        requests = []
+        # Search is already scoped, so this covers a match that a noisy first
+        # page from the general repository issues endpoint would not contain.
+        responses = iter([
+            {
+                "total_count": 3,
+                "incomplete_results": False,
+                "items": [
+                    {"number": 99, "title": "unrelated issue", "state": "open"},
+                    {"number": 12, "title": f"{cli.ISSUE_TITLE} (old)", "state": "open"},
+                    {"number": 7, "title": cli.ISSUE_TITLE, "state": "open"},
+                ],
+            },
+            {
+                "total_count": 2,
+                "incomplete_results": False,
+                "items": [
+                    {"number": 3, "title": cli.ISSUE_TITLE, "state": "closed", "pull_request": {}},
+                    {"number": 8, "title": cli.ISSUE_TITLE, "state": "closed"},
+                ],
+            },
+        ])
+        client.request = lambda method, path, body=None: (requests.append((method, path, body)), next(responses))[1]  # type: ignore[method-assign]
+
+        issue = client.find_issue()
+
+        self.assertEqual(7, issue["number"])
+        self.assertEqual(2, len(requests))
+        for request, state in zip(requests, ("open", "closed"), strict=True):
+            method, path, body = request
+            self.assertEqual("GET", method)
+            self.assertIsNone(body)
+            self.assertTrue(path.startswith("/search/issues?"))
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+            self.assertEqual([f'repo:sernst/skills is:issue state:{state} in:title "{cli.ISSUE_TITLE}"'], query["q"])
+            self.assertEqual(["100"], query["per_page"])
+            self.assertEqual(["created"], query["sort"])
+            self.assertEqual(["asc"], query["order"])
+
+    def test_failure_creates_once_when_search_returns_no_exact_issue(self) -> None:
+        client = cli.GitHubIssues("sernst/skills", "token")
+        requests = []
+        responses = iter([{"total_count": 0, "items": []}, {"total_count": 0, "items": []}, {"number": 11}])
+        client.request = lambda method, path, body=None: (requests.append((method, path, body)), next(responses))[1]  # type: ignore[method-assign]
+
+        with redirect_stdout(io.StringIO()):
+            client.record_failure("https://example.test/run/0")
+
+        self.assertEqual(["GET", "GET", "POST"], [request[0] for request in requests])
+        self.assertEqual("/repos/sernst/skills/issues", requests[2][1])
+        self.assertEqual(cli.ISSUE_TITLE, requests[2][2]["title"])
+
     def test_failure_mentions_sernst_and_reopens_deduplicated_issue(self) -> None:
         client = cli.GitHubIssues("sernst/skills", "token")
         requests = []
         responses = iter([
-            [{"number": 7, "title": cli.ISSUE_TITLE, "state": "closed"}], {}, {},
+            {"total_count": 0, "items": []},
+            {"total_count": 1, "items": [{"number": 7, "title": cli.ISSUE_TITLE, "state": "closed"}]},
+            {}, {},
         ])
         client.request = lambda method, path, body=None: (requests.append((method, path, body)), next(responses))[1]  # type: ignore[method-assign]
         with redirect_stdout(io.StringIO()):
             client.record_failure("https://example.test/run/1")
-        self.assertEqual("open", requests[1][2]["state"])
-        self.assertIn("@sernst", requests[2][2]["body"])
+        self.assertEqual("open", requests[2][2]["state"])
+        self.assertIn("@sernst", requests[3][2]["body"])
         self.assertEqual(1, sum("/comments" in request[1] for request in requests))
 
     def test_recovery_comments_with_provenance_and_closes(self) -> None:
         client = cli.GitHubIssues("sernst/skills", "token")
         requests = []
-        responses = iter([[{"number": 7, "title": cli.ISSUE_TITLE, "state": "open"}], {}, {}])
+        responses = iter([
+            {"total_count": 1, "items": [{"number": 7, "title": cli.ISSUE_TITLE, "state": "open"}]},
+            {"total_count": 0, "items": []},
+            {}, {},
+        ])
         client.request = lambda method, path, body=None: (requests.append((method, path, body)), next(responses))[1]  # type: ignore[method-assign]
         with tempfile.TemporaryDirectory() as temporary:
             snapshot = Path(temporary) / "snapshot.md"
             snapshot.write_text("Source: DeepSWE provenance\n", encoding="utf-8")
             with redirect_stdout(io.StringIO()):
                 client.record_recovery("https://example.test/run/2", snapshot, "42")
-        self.assertIn("Update PR: #42", requests[1][2]["body"])
-        self.assertIn("Source: DeepSWE provenance", requests[1][2]["body"])
-        self.assertEqual({"state": "closed"}, requests[2][2])
+        self.assertIn("Update PR: #42", requests[2][2]["body"])
+        self.assertIn("Source: DeepSWE provenance", requests[2][2]["body"])
+        self.assertEqual({"state": "closed"}, requests[3][2])
+
+    def test_closed_exact_issue_is_found_for_recovery_but_not_closed_again(self) -> None:
+        client = cli.GitHubIssues("sernst/skills", "token")
+        requests = []
+        responses = iter([
+            {"total_count": 0, "items": []},
+            {"total_count": 1, "items": [{"number": 7, "title": cli.ISSUE_TITLE, "state": "closed"}]},
+        ])
+        client.request = lambda method, path, body=None: (requests.append((method, path, body)), next(responses))[1]  # type: ignore[method-assign]
+
+        with redirect_stdout(io.StringIO()):
+            client.record_recovery("https://example.test/run/3", None, None)
+
+        self.assertEqual(2, len(requests))
+        self.assertTrue(requests[0][1].startswith("/search/issues?"))
+
+    def test_search_failure_exits_fail_closed_without_issue_mutation(self) -> None:
+        requests = []
+        def fail_request(method: str, path: str, body: object = None) -> object:
+            requests.append((method, path, body))
+            raise BenchmarkError("synthetic search failure")
+
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_TOKEN": "token"}, clear=False),
+            mock.patch.object(cli.GitHubIssues, "request", side_effect=fail_request),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
+            exit_code = cli.main([
+                "issue", "failure", "--repository", "sernst/skills", "--run-url", "https://example.test/run/4",
+            ])
+        self.assertEqual(1, exit_code)
+        self.assertEqual(["GET"], [request[0] for request in requests])
+
+    def test_incomplete_search_results_fail_closed_before_issue_mutation(self) -> None:
+        client = cli.GitHubIssues("sernst/skills", "token")
+        requests = []
+        client.request = lambda method, path, body=None: (requests.append((method, path, body)), {"items": [], "incomplete_results": True})[1]  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(BenchmarkError, "incomplete results"):
+            client.record_failure("https://example.test/run/5")
+
+        self.assertEqual(["GET"], [request[0] for request in requests])
 
 
 if __name__ == "__main__":

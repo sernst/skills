@@ -74,14 +74,38 @@ class GitHubIssues:
         return json.loads(content) if content else None
 
     def find_issue(self) -> Mapping[str, Any] | None:
-        query = urllib.parse.urlencode({"state": "all", "per_page": "100"})
-        issues = self.request("GET", f"/repos/{self.repository}/issues?{query}")
-        if not isinstance(issues, list):
-            raise BenchmarkError("GitHub issues response was not an array.")
-        return next(
-            (issue for issue in issues if isinstance(issue, Mapping) and issue.get("title") == ISSUE_TITLE and "pull_request" not in issue),
-            None,
-        )
+        # Search is deliberately title- and repository-scoped.  Listing issues only
+        # inspects one page, so an older deduplication issue can disappear behind
+        # unrelated repository activity.  GitHub search has distinct open and
+        # closed state qualifiers, so query both explicitly; is:issue keeps pull
+        # requests out server-side.
+        matches: list[Mapping[str, Any]] = []
+        for state in ("open", "closed"):
+            query = urllib.parse.urlencode(
+                {
+                    "q": f'repo:{self.repository} is:issue state:{state} in:title "{ISSUE_TITLE}"',
+                    "per_page": "100",
+                    "sort": "created",
+                    "order": "asc",
+                }
+            )
+            response = self.request("GET", f"/search/issues?{query}")
+            if not isinstance(response, Mapping) or not isinstance(response.get("items"), list):
+                raise BenchmarkError("GitHub issue search response did not contain an items array.")
+            if response.get("incomplete_results") is True:
+                raise BenchmarkError("GitHub issue search returned incomplete results.")
+            matches.extend(
+                issue
+                for issue in response["items"]
+                if isinstance(issue, Mapping)
+                and issue.get("title") == ISSUE_TITLE
+                and "pull_request" not in issue
+                and isinstance(issue.get("number"), int)
+                and not isinstance(issue.get("number"), bool)
+            )
+        # Exact-title duplicates should not exist, but choosing the lowest issue
+        # number makes recovery deterministic and prevents a new duplicate.
+        return min(matches, key=lambda issue: issue["number"]) if matches else None
 
     def record_failure(self, run_url: str) -> None:
         issue = self.find_issue()
