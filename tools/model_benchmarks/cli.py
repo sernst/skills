@@ -90,10 +90,22 @@ class GitHubIssues:
                 }
             )
             response = self.request("GET", f"/search/issues?{query}")
-            if not isinstance(response, Mapping) or not isinstance(response.get("items"), list):
+            if not isinstance(response, Mapping):
+                raise BenchmarkError("GitHub issue search response was not an object.")
+            total_count = response.get("total_count")
+            if (
+                "total_count" not in response
+                or not isinstance(total_count, int)
+                or isinstance(total_count, bool)
+                or total_count < 0
+            ):
+                raise BenchmarkError("GitHub issue search response did not contain a valid total_count.")
+            if not isinstance(response.get("items"), list):
                 raise BenchmarkError("GitHub issue search response did not contain an items array.")
-            if response.get("incomplete_results") is True:
+            if response.get("incomplete_results") is not False:
                 raise BenchmarkError("GitHub issue search returned incomplete results.")
+            if total_count != len(response["items"]):
+                raise BenchmarkError("GitHub issue search total_count did not match returned items.")
             matches.extend(
                 issue
                 for issue in response["items"]

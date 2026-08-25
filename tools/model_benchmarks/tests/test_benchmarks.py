@@ -401,7 +401,11 @@ class IssueLifecycleTests(unittest.TestCase):
     def test_failure_creates_once_when_search_returns_no_exact_issue(self) -> None:
         client = cli.GitHubIssues("sernst/skills", "token")
         requests = []
-        responses = iter([{"total_count": 0, "items": []}, {"total_count": 0, "items": []}, {"number": 11}])
+        responses = iter([
+            {"total_count": 0, "incomplete_results": False, "items": []},
+            {"total_count": 0, "incomplete_results": False, "items": []},
+            {"number": 11},
+        ])
         client.request = lambda method, path, body=None: (requests.append((method, path, body)), next(responses))[1]  # type: ignore[method-assign]
 
         with redirect_stdout(io.StringIO()):
@@ -415,8 +419,8 @@ class IssueLifecycleTests(unittest.TestCase):
         client = cli.GitHubIssues("sernst/skills", "token")
         requests = []
         responses = iter([
-            {"total_count": 0, "items": []},
-            {"total_count": 1, "items": [{"number": 7, "title": cli.ISSUE_TITLE, "state": "closed"}]},
+            {"total_count": 0, "incomplete_results": False, "items": []},
+            {"total_count": 1, "incomplete_results": False, "items": [{"number": 7, "title": cli.ISSUE_TITLE, "state": "closed"}]},
             {}, {},
         ])
         client.request = lambda method, path, body=None: (requests.append((method, path, body)), next(responses))[1]  # type: ignore[method-assign]
@@ -430,8 +434,8 @@ class IssueLifecycleTests(unittest.TestCase):
         client = cli.GitHubIssues("sernst/skills", "token")
         requests = []
         responses = iter([
-            {"total_count": 1, "items": [{"number": 7, "title": cli.ISSUE_TITLE, "state": "open"}]},
-            {"total_count": 0, "items": []},
+            {"total_count": 1, "incomplete_results": False, "items": [{"number": 7, "title": cli.ISSUE_TITLE, "state": "open"}]},
+            {"total_count": 0, "incomplete_results": False, "items": []},
             {}, {},
         ])
         client.request = lambda method, path, body=None: (requests.append((method, path, body)), next(responses))[1]  # type: ignore[method-assign]
@@ -448,8 +452,8 @@ class IssueLifecycleTests(unittest.TestCase):
         client = cli.GitHubIssues("sernst/skills", "token")
         requests = []
         responses = iter([
-            {"total_count": 0, "items": []},
-            {"total_count": 1, "items": [{"number": 7, "title": cli.ISSUE_TITLE, "state": "closed"}]},
+            {"total_count": 0, "incomplete_results": False, "items": []},
+            {"total_count": 1, "incomplete_results": False, "items": [{"number": 7, "title": cli.ISSUE_TITLE, "state": "closed"}]},
         ])
         client.request = lambda method, path, body=None: (requests.append((method, path, body)), next(responses))[1]  # type: ignore[method-assign]
 
@@ -480,12 +484,31 @@ class IssueLifecycleTests(unittest.TestCase):
     def test_incomplete_search_results_fail_closed_before_issue_mutation(self) -> None:
         client = cli.GitHubIssues("sernst/skills", "token")
         requests = []
-        client.request = lambda method, path, body=None: (requests.append((method, path, body)), {"items": [], "incomplete_results": True})[1]  # type: ignore[method-assign]
+        client.request = lambda method, path, body=None: (requests.append((method, path, body)), {"total_count": 0, "items": [], "incomplete_results": True})[1]  # type: ignore[method-assign]
 
         with self.assertRaisesRegex(BenchmarkError, "incomplete results"):
             client.record_failure("https://example.test/run/5")
 
         self.assertEqual(["GET"], [request[0] for request in requests])
+
+    def test_invalid_search_counts_fail_closed_before_issue_mutation(self) -> None:
+        invalid_responses = {
+            "missing": {"incomplete_results": False, "items": []},
+            "boolean": {"total_count": False, "incomplete_results": False, "items": []},
+            "negative": {"total_count": -1, "incomplete_results": False, "items": []},
+            "non_integer": {"total_count": "0", "incomplete_results": False, "items": []},
+            "inconsistent": {"total_count": 1, "incomplete_results": False, "items": []},
+        }
+        for name, response in invalid_responses.items():
+            with self.subTest(name=name):
+                client = cli.GitHubIssues("sernst/skills", "token")
+                requests = []
+                client.request = lambda method, path, body=None, response=response, requests=requests: (requests.append((method, path, body)), response)[1]  # type: ignore[method-assign]
+
+                with self.assertRaisesRegex(BenchmarkError, "valid total_count|total_count did not match"):
+                    client.record_failure("https://example.test/run/6")
+
+                self.assertEqual(["GET"], [request[0] for request in requests])
 
 
 if __name__ == "__main__":
