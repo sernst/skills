@@ -35,10 +35,10 @@ deny:
 
 check:
     pwsh -File tools/run-registered.ps1 -Recipe check
-    pwsh -File tools/model-benchmarks/test-benchmarks.ps1
+    python -m unittest discover -s tools/model_benchmarks/tests -v
 
 benchmark-test:
-    pwsh -File tools/model-benchmarks/test-benchmarks.ps1
+    python -m unittest discover -s tools/model_benchmarks/tests -v
 
 metadata:
     pwsh -File tools/run-registered.ps1 -Recipe metadata

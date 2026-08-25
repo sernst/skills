@@ -37,9 +37,19 @@
    .github/workflows`; both must exit 0. Confirm the generated snapshot is below
    24 KiB and the human guidance below 1,200 words.
 
-For a read-only live local probe, run `pwsh -File
-tools/model-benchmarks/update-benchmarks.ps1 -Mode Check`: exit 0 means current,
-2 means an update is available, and 1 means validation failed.
+The updater is a standard-library-only Python package and is shell-neutral. It
+requires Python 3.13 or newer; no environment setup or package installation is
+needed. For a read-only live local probe, run:
+
+```text
+python -m tools.model_benchmarks check
+```
+
+Exit 0 means current, 2 means an update is available, and 1 means fetch or
+validation failed. `python -m tools.model_benchmarks refresh` performs the same
+validation and atomically replaces the snapshot only when semantic content
+changes. `python -m unittest discover -s tools/model_benchmarks/tests -v` runs
+the deterministic offline suite on any supported shell and operating system.
 
 ## Merge and automated behavior
 
@@ -47,7 +57,9 @@ Squash-merge the feature PR after its required check and review pass. There is
 no deployment, restart, or expected user disruption. On merge, the daily
 schedule and manual dispatch become available.
 
-Each refresh validates both allowlisted sources before writing. A semantic
+Each refresh validates both allowlisted sources before writing. The package
+also owns the deduplicated GitHub issue failure/recovery lifecycle so the
+workflow does not depend on shell-specific parsing. A semantic
 change updates only the generated snapshot, creates or updates one App-authored
 PR, receives an Actions-bot approval, and squash auto-merges after **PR required
 gate** succeeds. An unchanged refresh creates no branch or PR. Any fetch,

@@ -94,6 +94,24 @@ jobs:
         run: just check
       - name: Audit GitHub workflows
         run: zizmor --pedantic .github/workflows
+  benchmark-python:
+    name: Benchmark updater on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up pinned Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.13'
+      - name: Run offline benchmark updater tests
+        run: python -m unittest discover -s tools/model_benchmarks/tests -v
   preflight:
     name: Preflight ${{ matrix.cli }} for ${{ matrix.target }}
     needs: [discover, quality]
@@ -200,7 +218,7 @@ jobs:
   required:
     name: PR required gate
     if: always()
-    needs: [discover, quality, preflight]
+    needs: [discover, quality, benchmark-python, preflight]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -209,9 +227,10 @@ jobs:
         env:
           DISCOVER_RESULT: ${{ needs.discover.result }}
           QUALITY_RESULT: ${{ needs.quality.result }}
+          BENCHMARK_PYTHON_RESULT: ${{ needs.benchmark-python.result }}
           PREFLIGHT_RESULT: ${{ needs.preflight.result }}
         run: |
-          $results = @($env:DISCOVER_RESULT, $env:QUALITY_RESULT, $env:PREFLIGHT_RESULT)
+          $results = @($env:DISCOVER_RESULT, $env:QUALITY_RESULT, $env:BENCHMARK_PYTHON_RESULT, $env:PREFLIGHT_RESULT)
           if (@($results | Where-Object { $_ -ne 'success' }).Count) {
             throw "PR checks did not all succeed: $($results -join ', ')"
           }
