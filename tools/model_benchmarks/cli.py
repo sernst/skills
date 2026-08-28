@@ -23,6 +23,18 @@ DEFAULT_OUTPUT = REPOSITORY_ROOT / "skills/running-as-maestro/references/benchma
 ISSUE_TITLE = "[automation] Model benchmark refresh failed"
 
 
+def issue_token(environ: Mapping[str, str] | None = None) -> str:
+    """Return the standard Actions token, with ``gh`` CLI compatibility.
+
+    GitHub Actions conventionally exposes ``GITHUB_TOKEN``.  The GitHub CLI
+    also recognizes ``GH_TOKEN``, so accepting it as a fallback keeps the
+    issue lifecycle shell-neutral without allowing an alternate token to
+    override an explicitly supplied standard token.
+    """
+    values = os.environ if environ is None else environ
+    return values.get("GITHUB_TOKEN") or values.get("GH_TOKEN") or ""
+
+
 def _timestamp(value: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -186,7 +198,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 retrieved_at=args.retrieved_at, check=args.command == "check",
             )
             return 2 if args.command == "check" and result.changed else 0
-        issues = GitHubIssues(args.repository, os.environ.get("GITHUB_TOKEN", ""), args.api_url)
+        issues = GitHubIssues(args.repository, issue_token(), args.api_url)
         if args.issue_state == "failure":
             issues.record_failure(args.run_url)
         else:

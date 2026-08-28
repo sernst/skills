@@ -81,6 +81,21 @@ the last-known-good snapshot and opens or updates one issue mentioning
 4. Confirm `main` contains the updated snapshot and the automation branch was
    deleted.
 
+## GitHub App token HTTP 422 recovery
+
+If **Create narrowly scoped updater token** fails with HTTP 422, the installed
+GitHub App cannot satisfy the workflow's requested repository permissions. The
+App must have **Contents: read and write** and **Pull requests: read and
+write** for `sernst/skills`; do not weaken the workflow scopes or bypass App
+authentication. After changing the App's permissions, the installation owner
+must accept the updated permissions prompt, or uninstall and reinstall the App
+for the repository. Then re-run **Refresh model benchmarks** manually from the
+Actions UI.
+
+The failure handler runs independently of the App-token step and uses the
+job's `issues: write` permission with the standard `GITHUB_TOKEN`, so it can
+open or update the tagged failure issue even when App-token creation fails.
+
 ## Non-blocking punchlist
 
 - Add or remove benchmark sources only through reviewed registry, adapter,

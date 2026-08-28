@@ -357,6 +357,27 @@ class CliTests(BenchmarkTestCase):
 
 
 class IssueLifecycleTests(unittest.TestCase):
+    def test_issue_command_prefers_github_token_then_falls_back_to_gh_token(self) -> None:
+        arguments = ["issue", "failure", "--repository", "sernst/skills", "--run-url", "https://example.test/run"]
+        with mock.patch.object(cli, "GitHubIssues") as issues:
+            with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "standard", "GH_TOKEN": "fallback"}, clear=True):
+                self.assertEqual(0, cli.main(arguments))
+            issues.assert_called_once_with("sernst/skills", "standard", "https://api.github.com")
+
+        with mock.patch.object(cli, "GitHubIssues") as issues:
+            with mock.patch.dict(os.environ, {"GH_TOKEN": "fallback"}, clear=True):
+                self.assertEqual(0, cli.main(arguments))
+            issues.assert_called_once_with("sernst/skills", "fallback", "https://api.github.com")
+
+    def test_issue_command_fails_closed_when_no_token_is_available(self) -> None:
+        arguments = ["issue", "failure", "--repository", "sernst/skills", "--run-url", "https://example.test/run"]
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(1, cli.main(arguments))
+
     def test_find_issue_uses_encoded_repository_scoped_search_and_exact_match(self) -> None:
         client = cli.GitHubIssues("sernst/skills", "token")
         requests = []

@@ -131,14 +131,14 @@ jobs:
       - if: failure()
         name: Open or update the deduplicated failure issue
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python -m tools.model_benchmarks issue failure --repository "$GITHUB_REPOSITORY" --run-url "$RUN_URL"
 
       - if: success()
         name: Record recovery and close any open failure issue
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: >-
