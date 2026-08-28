@@ -39,6 +39,10 @@ fn read(path: &Path) -> String {
         .replace("\r\n", "\n")
 }
 
+fn normalized_prose(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn function_block<'a>(source: &'a str, name: &str) -> &'a str {
     let marker = format!("fn {name}(");
     let start = source
@@ -771,17 +775,189 @@ fn markdown_links(markdown: &str) -> Vec<String> {
     links
 }
 
+fn tracked_markdown_files(root: &Path) -> Vec<PathBuf> {
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(root)
+        .args(["ls-files", "-z", "--", "*.md"])
+        .output()
+        .unwrap_or_else(|error| unreachable!("run git ls-files for Markdown contract: {error}"));
+    assert!(
+        output.status.success(),
+        "git ls-files failed while collecting tracked Markdown:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let files = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            let relative = std::str::from_utf8(path).unwrap_or_else(|error| {
+                unreachable!("tracked Markdown path is not UTF-8: {error}")
+            });
+            root.join(relative)
+        })
+        // A tracked deletion remains in the index until it is staged. It is no
+        // longer repository documentation and has no worktree content to scan.
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    assert!(
+        !files.is_empty(),
+        "git ls-files returned no tracked Markdown for {}",
+        root.display()
+    );
+    files
+}
+
+#[derive(Debug)]
+struct MarkdownFence {
+    marker: char,
+    length: usize,
+    language: String,
+}
+
+fn fence_candidate(line: &str) -> Option<&str> {
+    let indentation = line
+        .chars()
+        .take_while(|character| *character == ' ')
+        .count();
+    (indentation <= 3).then(|| &line[indentation..])
+}
+
+fn opening_fence(line: &str) -> Option<MarkdownFence> {
+    let candidate = fence_candidate(line)?;
+    let marker = candidate.chars().next()?;
+    if !['`', '~'].contains(&marker) {
+        return None;
+    }
+    let length = candidate
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    if length < 3 {
+        return None;
+    }
+    let info = &candidate[length..];
+    if marker == '`' && info.contains('`') {
+        return None;
+    }
+    let language = info
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    Some(MarkdownFence {
+        marker,
+        length,
+        language,
+    })
+}
+
+fn closes_fence(line: &str, fence: &MarkdownFence) -> bool {
+    let Some(candidate) = fence_candidate(line) else {
+        return false;
+    };
+    let length = candidate
+        .chars()
+        .take_while(|character| *character == fence.marker)
+        .count();
+    length >= fence.length && candidate[length..].trim().is_empty()
+}
+
+fn command_fence_violations(markdown: &str) -> Vec<(usize, &'static str)> {
+    let mut violations = Vec::new();
+    let mut fence: Option<MarkdownFence> = None;
+    for (index, line) in markdown.lines().enumerate() {
+        if let Some(active) = &fence {
+            if closes_fence(line, active) {
+                fence = None;
+                continue;
+            }
+            let command_fence = [
+                "console",
+                "shell",
+                "sh",
+                "bash",
+                "zsh",
+                "powershell",
+                "pwsh",
+            ]
+            .contains(&active.language.as_str());
+            if command_fence && line.trim_start().starts_with("$ ") {
+                violations.push((index + 1, "leading `$ ` prompt marker"));
+            }
+            if ["powershell", "pwsh"].contains(&active.language.as_str()) {
+                let lowercase = line.trim_start().to_ascii_lowercase();
+                if [
+                    "powershell -c ",
+                    "powershell -command ",
+                    "powershell.exe -c ",
+                    "powershell.exe -command ",
+                    "pwsh -c ",
+                    "pwsh -command ",
+                    "pwsh.exe -c ",
+                    "pwsh.exe -command ",
+                ]
+                .iter()
+                .any(|prefix| lowercase.starts_with(prefix))
+                {
+                    violations.push((index + 1, "redundant PowerShell command wrapper"));
+                }
+            }
+        } else {
+            fence = opening_fence(line);
+        }
+    }
+    violations
+}
+
+#[test]
+fn markdown_command_examples_are_directly_pasteable() {
+    let root = repository_root();
+    for path in tracked_markdown_files(&root) {
+        if let Some((line, violation)) = command_fence_violations(&read(&path)).first() {
+            unreachable!("{violation} at {}:{line}", path.display());
+        }
+    }
+}
+
+#[test]
+fn markdown_command_fence_scanner_handles_commonmark_delimiters() {
+    let markdown = r#"
+````console copy=true
+```
+$ prefixed
+`````
+
+~~~~powershell title=setup
+pwsh -Command "Get-Thing"
+~~~~~
+
+    ```console
+    $ indented-code-block-is-not-a-fence
+    ```
+"#;
+    assert_eq!(
+        command_fence_violations(markdown),
+        vec![
+            (4, "leading `$ ` prompt marker"),
+            (8, "redundant PowerShell command wrapper"),
+        ]
+    );
+}
+
 #[test]
 fn onboarding_markdown_links_resolve() {
     let root = repository_root();
     for relative in [
         "README.md",
         "cheatsheet.skill-manager.md",
-        "install.skill-manager.md",
+        "docs/agent-usage.md",
         "clis/skill-manager/README.md",
         "skills/managing-skills/SKILL.md",
         "skills/managing-skills/references/recipes.md",
         "skills/managing-skills/references/events.md",
+        "skills/managing-skills/references/reporting.md",
         "skills/managing-skills/references/workflows.md",
     ] {
         let path = root.join(relative);
@@ -1229,49 +1405,53 @@ fn windows_installer_resolves_destination_spellings_without_side_effects() {
 fn managing_skill_has_required_metadata_and_current_storage_claims() {
     let root = repository_root();
     let skill = read(&root.join("skills/managing-skills/SKILL.md"));
-    let bundled_installer = root.join("skills/managing-skills/references/install.skill-manager.md");
-    let deployed_relative_installer = root
-        .join("skills/managing-skills")
-        .join("references/install.skill-manager.md");
+    let agent_guide = read(&root.join("docs/agent-usage.md"));
+    let canonical_source = "https://github.com/sernst/skills/tree/main/skills";
     assert!(skill.starts_with("---\nname: managing-skills\ndescription: "));
     assert!(!skill.contains("TODO"));
     for bootstrap_guardrail in [
         "Run `skill-manager --version`.",
-        "installer with an explicit user-writable directory and PATH modification",
-        "Verify the\n   recorded executable with `--version`",
-        "but never modify persistent shell PATH.",
-        "If installation or verification fails, stop and report the exact failure.",
+        "If it is absent, stop.",
+        "Do not run an installer, choose an install directory, or modify persistent",
+        "If verification fails, stop and report the exact failure.",
     ] {
         assert!(
             skill.contains(bootstrap_guardrail),
-            "missing bootstrap/install/verify guardrail: {bootstrap_guardrail}"
+            "missing bootstrap/verify guardrail: {bootstrap_guardrail}"
         );
     }
+    assert!(!root.join("install.skill-manager.md").exists());
     assert!(
-        bundled_installer.is_file(),
-        "the deployable managing-skills copy must include its installer reference"
+        !root
+            .join("skills/managing-skills/references/install.skill-manager.md")
+            .exists()
     );
-    assert_eq!(
-        deployed_relative_installer, bundled_installer,
-        "the installer link must resolve relative to the deployed skill directory"
+    assert!(!skill.contains("install.skill-manager.md"));
+    assert!(skill.contains("explicitly asks to \"manage skills\""));
+    assert!(skill.contains("invokes `$managing-skills`"));
+    assert!(skill.contains("without framing it as skill management"));
+    assert!(skill.contains("[references/reporting.md](references/reporting.md)"));
+    assert!(
+        skill.contains("https://github.com/sernst/skills/blob/main/docs/agent-usage.md"),
+        "the deployed skill must link to the portable human setup guide"
     );
-    assert_eq!(
-        read(&bundled_installer),
-        read(&root.join("install.skill-manager.md")),
-        "the bundled installer reference must remain synchronized with the canonical installer instructions"
+    assert!(agent_guide.contains(canonical_source));
+    let source_add = agent_guide
+        .find("skill-manager source add")
+        .unwrap_or_else(|| unreachable!("agent guide must register its source first"));
+    let preview = agent_guide
+        .find("--shared --global --dry-run")
+        .unwrap_or_else(|| unreachable!("agent guide must preview the deployment"));
+    let apply = agent_guide
+        .find("--shared --global\n")
+        .unwrap_or_else(|| unreachable!("agent guide must apply the deployment"));
+    let status = agent_guide
+        .find("skill-manager status managing-skills")
+        .unwrap_or_else(|| unreachable!("agent guide must verify the deployment"));
+    assert!(
+        source_add < preview && preview < apply && apply < status,
+        "agent quickstart must register, preview, apply, then verify"
     );
-    for bootstrap_contract in [
-        "[references/install.skill-manager.md](references/install.skill-manager.md)",
-        "record the installed binary's absolute path",
-        "Invoke that exact path\n   for every remaining `skill-manager` call",
-        "do not rely on a one-off PATH change",
-        "Verify the\n   recorded executable with `--version`, then establish the needed source and\n   target context and continue with this workflow.",
-    ] {
-        assert!(
-            skill.contains(bootstrap_contract),
-            "missing deployable bootstrap contract: {bootstrap_contract}"
-        );
-    }
     for failure_guardrail in [
         "Treat that as an expected absence signal only when the parsed",
         "Every other exit-1 message",
@@ -1286,6 +1466,7 @@ fn managing_skill_has_required_metadata_and_current_storage_claims() {
         "display_name: \"Manage Skills\"",
         "short_description: \"Manage agent skills with skill-manager\"",
         "default_prompt: \"Use $managing-skills to manage my installed agent skills.\"",
+        "allow_implicit_invocation: true",
     ] {
         assert!(
             metadata.contains(required),
@@ -1305,6 +1486,123 @@ fn managing_skill_has_required_metadata_and_current_storage_claims() {
             "stale CLI README claim remains: {stale_claim}"
         );
     }
+}
+
+fn assert_forward_activation_cases(activation: &[serde_json::Value], description: &str) {
+    let positives = activation
+        .iter()
+        .filter(|case| case["expected_activation"] == true)
+        .count();
+    let near_misses = activation
+        .iter()
+        .filter(|case| case["expected_activation"] == false)
+        .count();
+    assert!(positives >= 3, "activation cases need positive coverage");
+    assert!(near_misses >= 3, "activation cases need near-miss coverage");
+    for case in activation {
+        let prompt = case["prompt"]
+            .as_str()
+            .unwrap_or_else(|| unreachable!("activation prompt must be a string"));
+        assert!(
+            !prompt.trim().is_empty(),
+            "activation prompt must not be empty"
+        );
+        assert!(
+            case["expected_activation"].is_boolean(),
+            "activation case {prompt:?} must declare its expected decision"
+        );
+        let anchor = case["instruction_anchor"]
+            .as_str()
+            .unwrap_or_else(|| unreachable!("activation case must cite its skill instruction"));
+        assert!(
+            description.contains(&normalized_prose(anchor)),
+            "activation case {prompt:?} cites missing frontmatter guidance: {anchor:?}"
+        );
+    }
+}
+
+fn assert_forward_reporting_cases(reporting_cases: &[serde_json::Value], reporting: &str) {
+    let scenario_ids = reporting_cases
+        .iter()
+        .filter_map(|case| case["id"].as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        scenario_ids,
+        BTreeSet::from([
+            "committed-mutation-with-warning",
+            "dry-run-plan",
+            "partial-failure",
+            "read-only-comparison",
+        ]),
+        "forward review must retain inspection, preview, commit/warning, and partial-failure scenarios"
+    );
+    for case in reporting_cases {
+        let id = case["id"].as_str().unwrap_or("<missing id>");
+        for required in ["prompt", "evidence", "pass_if", "fail_if"] {
+            let populated = match &case[required] {
+                serde_json::Value::String(value) => !value.trim().is_empty(),
+                serde_json::Value::Array(values) => !values.is_empty(),
+                _ => false,
+            };
+            assert!(populated, "forward-review scenario {id} needs {required}");
+        }
+        let anchors = case["guidance_anchors"]
+            .as_array()
+            .unwrap_or_else(|| unreachable!("scenario {id} must cite reporting guidance"));
+        assert!(
+            !anchors.is_empty(),
+            "scenario {id} must cite reporting guidance"
+        );
+        for anchor in anchors {
+            let anchor = anchor
+                .as_str()
+                .unwrap_or_else(|| unreachable!("scenario {id} has a non-string anchor"));
+            assert!(
+                reporting.contains(&normalized_prose(anchor)),
+                "scenario {id} cites missing reporting guidance: {anchor:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn managing_skill_forward_review_fixture_is_instruction_aligned() {
+    let root = repository_root();
+    let fixture_path = root.join("skills/managing-skills/evals/forward-review.json");
+    let fixture: serde_json::Value = serde_json::from_str(&read(&fixture_path))
+        .unwrap_or_else(|error| unreachable!("{}: {error}", fixture_path.display()));
+    assert!(
+        fixture["purpose"]
+            .as_str()
+            .is_some_and(|purpose| purpose.contains("does not claim to execute an agent")),
+        "the fixture must state that CI does not execute these behavioral reviews"
+    );
+    assert!(
+        fixture["review_protocol"]
+            .as_array()
+            .is_some_and(|steps| steps.len() >= 4),
+        "the fixture must retain its independent forward-review protocol"
+    );
+
+    let skill = read(&root.join("skills/managing-skills/SKILL.md"));
+    let description = skill
+        .lines()
+        .find_map(|line| line.strip_prefix("description: "))
+        .map_or_else(
+            || unreachable!("managing-skills needs a frontmatter description"),
+            normalized_prose,
+        );
+    let reporting = normalized_prose(&read(
+        &root.join("skills/managing-skills/references/reporting.md"),
+    ));
+    let activation = fixture["activation"]
+        .as_array()
+        .unwrap_or_else(|| unreachable!("activation cases must be an array"));
+    let reporting_cases = fixture["reporting"]
+        .as_array()
+        .unwrap_or_else(|| unreachable!("reporting cases must be an array"));
+    assert_forward_activation_cases(activation, &description);
+    assert_forward_reporting_cases(reporting_cases, &reporting);
 }
 
 #[test]
@@ -1490,15 +1788,5 @@ fn installers_map_release_assets_to_the_canonical_matrix() {
     assert_windows_installer_release_contract(
         &read(&root.join("clis/skill-manager/install.ps1")),
         &released_targets,
-    );
-    let installer_document = read(&root.join("install.skill-manager.md"));
-    assert!(
-        installer_document.contains("install.sh") && installer_document.contains("install.ps1"),
-        "installer instructions must point agents to both hosted installer scripts"
-    );
-    assert!(
-        installer_document.contains("AI agent")
-            && installer_document.contains("Agent instructions"),
-        "installer instructions must remain agent-directed"
     );
 }

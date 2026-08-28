@@ -1,0 +1,136 @@
+{
+  "purpose": "Manual or model-reviewed forward cases. CI verifies that each rubric remains anchored to the shipped skill instructions; it does not claim to execute an agent.",
+  "review_protocol": [
+    "Use a fresh model session that has not seen the implementation discussion.",
+    "For activation cases, provide only the user prompt and the SKILL.md frontmatter description, then judge whether managing-skills should activate.",
+    "For reporting cases, load SKILL.md and references/reporting.md, provide the scenario evidence, and ask the model to draft the user-facing result.",
+    "Record pass or fail against every stated expectation and include the model output for human review."
+  ],
+  "activation": [
+    {
+      "id": "literal-management-request",
+      "prompt": "Manage my skills and show me which installed copies are outdated.",
+      "expected_activation": true,
+      "instruction_anchor": "explicitly asks to \"manage skills\""
+    },
+    {
+      "id": "clear-agent-skill-management",
+      "prompt": "Help me manage agent skills shared across Codex and Claude.",
+      "expected_activation": true,
+      "instruction_anchor": "clearly asks for help managing their agent skills"
+    },
+    {
+      "id": "explicit-skill-invocation",
+      "prompt": "Use $managing-skills to preview updates to my installed skills.",
+      "expected_activation": true,
+      "instruction_anchor": "invokes `$managing-skills`"
+    },
+    {
+      "id": "unrelated-package-install",
+      "prompt": "Install the package described in this repository.",
+      "expected_activation": false,
+      "instruction_anchor": "without framing it as skill management"
+    },
+    {
+      "id": "skill-content-inspection",
+      "prompt": "Inspect the reviewing-my-code instructions and summarize them.",
+      "expected_activation": false,
+      "instruction_anchor": "independently ask to install, inspect, update, or remove something"
+    },
+    {
+      "id": "edit-skill-source",
+      "prompt": "Update the README for the managing-skills skill.",
+      "expected_activation": false,
+      "instruction_anchor": "merely mention a skill"
+    }
+  ],
+  "reporting": [
+    {
+      "id": "read-only-comparison",
+      "prompt": "Manage my skills and show the installed copies of reviewing-my-code.",
+      "evidence": [
+        "Codex has reviewing-my-code 2.1 from sernst-skills",
+        "Claude has reviewing-my-code 2.0 from team-skills",
+        "the two source names are needed to explain the version difference"
+      ],
+      "guidance_anchors": [
+        "Lead with the outcome or answer, then the evidence needed to act on it.",
+        "Use labeled fields for one item and a compact table for two or more comparable items or significant destinations."
+      ],
+      "pass_if": [
+        "leads with the version difference",
+        "uses a compact comparison and retains source provenance"
+      ],
+      "fail_if": [
+        "dumps raw NDJSON",
+        "adds empty columns or irrelevant paths"
+      ]
+    },
+    {
+      "id": "dry-run-plan",
+      "prompt": "Manage my skills: preview loading reviewing-my-code globally, but do not apply it.",
+      "evidence": [
+        "source sernst-skills selected reviewing-my-code",
+        "shared global target would receive one new deployment with six files",
+        "the command was a dry run and made no changes"
+      ],
+      "guidance_anchors": [
+        "Before any operation requiring confirmation, present one complete plan.",
+        "distinguish dry-run from committed work explicitly."
+      ],
+      "pass_if": [
+        "states that this is a preview and no changes were made",
+        "surfaces source, skill, target, scope, and significant change together"
+      ],
+      "fail_if": [
+        "asks for confirmation",
+        "dumps raw NDJSON or terminal decoration"
+      ]
+    },
+    {
+      "id": "committed-mutation-with-warning",
+      "prompt": "Manage my skills and tell me what happened when the approved load completed.",
+      "evidence": [
+        "reviewing-my-code loaded to the shared global target",
+        "drafting-commit-message was already current",
+        "a warning says the Claude destination was disabled",
+        "one deployment changed and one was unchanged"
+      ],
+      "guidance_anchors": [
+        "Name each changed item and its action.",
+        "Surface warnings next to the affected item or decision.",
+        "End with a significance-gated summary containing only nonzero outcomes."
+      ],
+      "pass_if": [
+        "leads with completed state",
+        "names the loaded skill and places the disabled-destination warning beside its impact",
+        "omits the unchanged item unless it materially explains selection or blast radius"
+      ],
+      "fail_if": [
+        "includes empty or zero-count clauses",
+        "copies fixed terminal spacing"
+      ]
+    },
+    {
+      "id": "partial-failure",
+      "prompt": "Manage my skills and explain this failed multi-target update.",
+      "evidence": [
+        "reviewing-my-code committed successfully to Codex",
+        "the Claude write then failed with: access denied",
+        "no rollback event was emitted"
+      ],
+      "guidance_anchors": [
+        "If the process fails after actions, report committed actions first, then the exact failure and what remains incomplete.",
+        "Never imply rollback."
+      ],
+      "pass_if": [
+        "reports the committed Codex action before the exact access denied failure",
+        "identifies the Claude work as incomplete"
+      ],
+      "fail_if": [
+        "claims or implies that the Codex action rolled back",
+        "hides the exact failure"
+      ]
+    }
+  ]
+}

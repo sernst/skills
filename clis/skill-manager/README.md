@@ -7,8 +7,8 @@ interactive setup, or keep the
 [skill-manager cheatsheet](../../cheatsheet.skill-manager.md) nearby for
 goal-oriented examples. Agents can use the
 [`managing-skills` skill](../../skills/managing-skills/SKILL.md) for complete
-conversational operation; the
-[pasteable installer](../../install.skill-manager.md) installs both.
+conversational operation after following the
+[agent usage guide](../../docs/agent-usage.md).
 
 ## Install
 
@@ -20,11 +20,11 @@ the invocation directory; `~` and `~/...` resolve from the active home.
 ## Quick start
 
 ```console
-$ skill-manager source add ./my-skills team --label "Team skills"
-$ skill-manager describe team:managing-skills
-$ skill-manager load team --all --global --dry-run
-$ skill-manager load team --all --global
-$ skill-manager status
+skill-manager source add ./my-skills team --label "Team skills"
+skill-manager describe team:managing-skills
+skill-manager load team --all --global --dry-run
+skill-manager load team --all --global
+skill-manager status
 ```
 
 The dry run previews the plan; the next command renders it again and asks for
@@ -51,9 +51,9 @@ interactive ambiguity with two explicit mappings; for scripts use `LOCATION
 and switch without retyping either location:
 
 ```console
-$ skill-manager source alternate personal sernst/skills
-$ skill-manager source swap personal
-$ skill-manager source swap personal
+skill-manager source alternate personal sernst/skills
+skill-manager source swap personal
+skill-manager source swap personal
 ```
 
 `source locate` also has `relocate`, `move`, and `mv` aliases, and `source update --location` combines relocation with metadata changes. `target add|list|enable|disable|remove|set-path` manages deployment targets. See [the command reference](docs/cli.md) for the full contract.
@@ -86,15 +86,15 @@ backups, and target templates.
 Run the development CLI without a separate build from `clis/skill-manager`:
 
 ```console
-$ just run --version
-$ just run configs
+just run --version
+just run configs
 ```
 
 From the repository root, use the registered module:
 
 ```console
-$ just skill-manager run --version
-$ just skill-manager run configs
+just skill-manager run --version
+just skill-manager run configs
 ```
 
 Run `just skill-manager check` from the repository root for the same checks CI applies. `just skill-manager format` is the only recipe that rewrites formatting. The [architecture note](docs/architecture.md) and [contributor guide](docs/development.md) explain the design and release checks.

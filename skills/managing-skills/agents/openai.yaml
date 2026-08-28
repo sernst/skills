@@ -2,3 +2,5 @@ interface:
   display_name: "Manage Skills"
   short_description: "Manage agent skills with skill-manager"
   default_prompt: "Use $managing-skills to manage my installed agent skills."
+policy:
+  allow_implicit_invocation: true

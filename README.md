@@ -55,13 +55,13 @@ selects appropriate model tiers, and verifies their output.
 macOS and Linux:
 
 ```console
-$ curl -fsSL https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-powershell -c "irm https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.ps1 | iex"
+irm https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.ps1 | iex
 ```
 
 The installers prompt for a destination when interactive. Windows verifies the
@@ -77,7 +77,7 @@ resolved absolute path is shown before installation.
 On macOS and Linux, pass options through the pipe:
 
 ```console
-$ curl -fsSL https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.sh | sh -s -- --dir "./tools/bin" --yes --no-modify-path
+curl -fsSL https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.sh | sh -s -- --dir "./tools/bin" --yes --no-modify-path
 ```
 
 Because `irm | iex` cannot receive parameters, use environment variables on
@@ -85,26 +85,29 @@ Windows:
 
 ```powershell
 $env:SKILL_MANAGER_INSTALL_DIR = '.\tools\bin'
-powershell -c "irm https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.ps1 | iex"
+irm https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.ps1 | iex
 ```
 
 Both scripts also support `SKILL_MANAGER_VERSION`,
 `SKILL_MANAGER_INSTALL_YES=1`, and `SKILL_MANAGER_NO_MODIFY_PATH=1`. For a
 manual installation, use the
 [latest release](https://github.com/sernst/skills/releases/latest) and its
-`SHA256SUMS`. For agent-assisted installation, use
-[`install.skill-manager.md`](./install.skill-manager.md).
+`SHA256SUMS`.
+
+Agents must not install the CLI themselves. After a user installs it, follow
+the [agent usage guide](./docs/agent-usage.md) to make `managing-skills`
+available to agent sessions.
 
 ## Try an interactive workflow
 
 Add this repository's skill collection, preview one deployment, then apply it:
 
 ```console
-$ skill-manager source add sernst/skills/skills sernst-skills --label "sernst skills"
-$ skill-manager describe sernst-skills:managing-skills
-$ skill-manager load sernst-skills --filter managing-skills --shared --global --dry-run
-$ skill-manager load sernst-skills --filter managing-skills --shared --global
-$ skill-manager status managing-skills --shared --global
+skill-manager source add https://github.com/sernst/skills/tree/main/skills --name sernst-skills --label "sernst skills"
+skill-manager describe sernst-skills:managing-skills
+skill-manager load sernst-skills --filter managing-skills --shared --global --dry-run
+skill-manager load sernst-skills --filter managing-skills --shared --global
+skill-manager status managing-skills --shared --global
 ```
 
 `describe` shows trigger text and a bounded README/SKILL.md excerpt; qualify a
@@ -139,5 +142,6 @@ state.
 - [Human CLI reference](./clis/skill-manager/docs/cli.md)
 - [NDJSON and automation contract](./clis/skill-manager/docs/json.md)
 - [Goal-oriented cheatsheet](./cheatsheet.skill-manager.md)
+- [Using skill-manager through an agent](./docs/agent-usage.md)
 - [Architecture and development](./clis/skill-manager/docs/development.md)
 - [Contributing](./CONTRIBUTING.md) and [releases](./RELEASES.md)

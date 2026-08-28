@@ -1,6 +1,6 @@
 ---
 name: managing-skills
-description: Manage reusable agent skills with the installed skill-manager CLI. Use when a user asks an agent to find, list, inspect, install, load, update, import, copy, remove, or resolve skills; manage skill sources or deployment targets; view, reset, or restore skill-manager configuration; check global or project deployment status; or generate CLI completions or a man page.
+description: Manage reusable agent skills with the installed skill-manager CLI. Invoke only when the user explicitly asks to "manage skills" or clearly asks for help managing their agent skills, or when the user invokes `$managing-skills`. Do not invoke for requests that merely mention a skill or independently ask to install, inspect, update, or remove something without framing it as skill management.
 ---
 
 # Manage skills
@@ -12,25 +12,21 @@ report what actually happened.
 ## Bootstrap
 
 1. Run `skill-manager --version`.
-2. If it is absent, read [references/install.skill-manager.md](references/install.skill-manager.md)
-   in full. Detect the operating system, run its documented non-interactive
-   installer with an explicit user-writable directory and PATH modification
-   suppressed, and record the installed binary's absolute path (for example,
-   `C:\\...\\skill-manager.exe` or `/.../skill-manager`). Invoke that exact path
-   for every remaining `skill-manager` call in this operation; agent shell calls
-   can be separate processes, so do not rely on a one-off PATH change. When the
-   environment supports a persistent process PATH update, it may also prepend
-   the binary's directory, but never modify persistent shell PATH. Verify the
-   recorded executable with `--version`, then establish the needed source and
-   target context and continue with this workflow.
-3. If installation or verification fails, stop and report the exact failure.
+2. If it is absent, stop. Direct the user to the human-only
+   [agent usage and installation guide](https://github.com/sernst/skills/blob/main/docs/agent-usage.md).
+   Do not run an installer, choose an install directory, or modify persistent
+   `PATH`. Ask the user to install the CLI and make it visible to the agent's
+   execution environment before continuing.
+3. If verification fails, stop and report the exact failure.
 
 ## Start every operation
 
 1. Read [references/recipes.md](references/recipes.md) before constructing a
    recipe. Read [references/events.md](references/events.md) before interpreting
    output. Read [references/workflows.md](references/workflows.md) for
-   multi-command and conversational patterns.
+   multi-command and conversational patterns. Read
+   [references/reporting.md](references/reporting.md) before presenting a plan
+   or result.
 2. Start inspection with direct `skill-manager describe` calls: use exact or
    qualified selectors for a known skill, `--source NAME` to scope a source,
    and `--installed`/`--outdated`/`--not-installed` for deployment state.
@@ -138,7 +134,7 @@ ordinary filesystem changes within the user's authorized destination.
 
 ## Report the outcome
 
-Summarize the selected source/skill, target, scope, dry-run or committed state,
-warnings, and final summary. Name any partial commits and the final
-`command.failed` message. On request, show the exact recipe and the relevant
-events, with secrets and local-sensitive paths redacted.
+Follow [references/reporting.md](references/reporting.md). Mirror the CLI's
+meaning and safety cues in concise Markdown, not its terminal decoration. On
+request, show the exact recipe and relevant events with secrets and
+local-sensitive paths redacted.

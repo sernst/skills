@@ -1,7 +1,7 @@
 # Installer for skill-manager (Windows).
 #
 # Usage:
-#   powershell -c "irm https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.ps1 | iex"
+#   irm https://raw.githubusercontent.com/sernst/skills/main/clis/skill-manager/install.ps1 | iex
 #
 # Write-Host is used deliberately throughout: this is an interactive console
 # installer, not a function meant to be composed in a pipeline, so narration
