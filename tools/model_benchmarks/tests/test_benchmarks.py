@@ -69,7 +69,7 @@ class AdapterTests(BenchmarkTestCase):
         deep_models = (
             "claude-fable-5", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-4-6", "claude-sonnet-5",
             "deepseek-v4-flash", "deepseek-v4-pro", "gemini-3-1-pro-preview", "gemini-3-5-flash",
-            "gemini-3-6-flash", "gemini-3-7-flash", "glm-5-2", "glm-5-3", "gpt-5-4", "gpt-5-5",
+            "gemini-3-6-flash", "gemini-3-7-flash", "glm-5-2", "glm-5-3", "glm-5-3-flash", "gpt-5-4", "gpt-5-5",
             "gpt-5-6-luna", "gpt-5-6-sol", "gpt-5-6-terra", "grok-4-5", "grok-4-6",
             "kimi-k2-7-code", "kimi-k3", "muse-spark-1-1", "muse-spark-1-2", "qwen3-8-max",
         )
@@ -84,6 +84,11 @@ class AdapterTests(BenchmarkTestCase):
         for model in cursor_models:
             with self.subTest(source="cursor", model=model):
                 self.assertEqual(model, source_model(model, "test.model", self.cursor_source))
+
+    def test_deepswe_glm_flash_exception_does_not_allow_other_suffixes(self) -> None:
+        for model in ("glm-5-3-pro", "glm-5-4-flash"):
+            with self.subTest(model=model), self.assertRaisesRegex(BenchmarkError, "not an allowlisted model family"):
+                source_model(model, "deep.model", self.deep_source)
 
     def test_likely_future_family_versions_pass_but_unknown_families_fail(self) -> None:
         for model in ("gpt-5-7-sol", "claude-opus-5-1", "gemini-3-8-flash", "qwen3-9-max"):
