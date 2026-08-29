@@ -123,11 +123,10 @@ fn try_symlink_dir(target: &Path, link: &Path) -> bool {
 
 /// Create a REAL Windows directory junction at `link` pointing at `target`.
 ///
-/// Junctions are reparse points (`IO_REPARSE_TAG_MOUNT_POINT`). Whether a
-/// given Rust toolchain also flags them via `is_symlink()` varies by version,
-/// which is exactly why the code guards them with an explicit reparse-point
-/// attribute check (`is_reparse_point`) rather than relying on `is_symlink()`
-/// alone. Junction creation needs NO administrator privilege (unlike symlink
+/// Junctions are link-like reparse points (`IO_REPARSE_TAG_MOUNT_POINT`). The
+/// production classifier uses Windows' reparse-tag-aware file type methods so
+/// junctions are links without treating every unrelated reparse-point family
+/// as one. Junction creation needs NO administrator privilege (unlike symlink
 /// creation), so this is strictly more reliable than [`try_symlink_dir`]; it
 /// panics loudly rather than skipping if `mklink /J` fails, so a broken guard
 /// cannot pass silently.
@@ -1125,6 +1124,125 @@ fn destination_symlink_escape_is_rejected_and_leaves_the_outside_file_intact() {
     );
 }
 
+/// Windows regression for the rejected dangling-`TO` bypass: path resolution
+/// used to follow the junction first, return its missing target, and thereby
+/// erase the evidence that the caller supplied a linked destination. The
+/// command must reject the original junction before rendering a plan or
+/// creating the outside target. Junction creation is deterministic and does
+/// not depend on symlink privilege.
+#[cfg(windows)]
+#[test]
+fn a_dangling_junction_as_to_is_rejected_before_plan_or_write() {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let from = scratch.path().join("from");
+    let active_home = scratch.path().join("active-home");
+    seed_real_home_with_claude_skill(&scratch, &from, "alpha");
+
+    let outside = scratch.path().join("outside");
+    fs::create_dir_all(&outside).expect("create outside parent");
+    let missing_target = outside.join("missing-target");
+    let to = scratch.path().join("dangling-to");
+    make_junction(&missing_target, &to);
+    assert!(
+        fs::symlink_metadata(&to).is_ok() && !missing_target.exists(),
+        "fixture must be a present junction whose target is absent"
+    );
+
+    let output = cli(scratch.path(), &active_home)
+        .args([
+            "--json",
+            "configs",
+            "copy",
+            from.to_str().expect("utf8 from path"),
+            to.to_str().expect("utf8 to path"),
+            "--yes",
+        ])
+        .output()
+        .expect("run configs copy");
+    assert!(
+        !output.status.success(),
+        "a dangling junction supplied as <TO> must hard-fail"
+    );
+
+    let lines = events(output);
+    assert!(
+        !lines.iter().any(|event| event["event"] == "plan"),
+        "destination-link validation must fail before the plan"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|event| event["event"] == "configs.copy.item"),
+        "destination-link validation must fail before apply"
+    );
+    assert!(
+        lines.iter().any(|event| event["event"] == "command.failed"),
+        "the hard failure must be reported"
+    );
+    assert!(
+        !missing_target.exists(),
+        "the copy followed the dangling <TO> junction and created its outside target"
+    );
+    assert!(
+        fs::symlink_metadata(&to).is_ok(),
+        "the rejected junction fixture must remain untouched"
+    );
+}
+
+/// The strict destination walk must inspect an existing junction before a
+/// following `..` is applied. Ordinary path normalization correctly resolves
+/// `junction/../destination` against the junction target, but `configs copy`
+/// has the stronger policy that any destination-side link is a hard error.
+#[cfg(windows)]
+#[test]
+fn a_junction_component_before_parent_in_to_is_rejected_before_plan_or_write() {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let from = scratch.path().join("from");
+    let active_home = scratch.path().join("active-home");
+    seed_real_home_with_claude_skill(&scratch, &from, "alpha");
+
+    let real_root = scratch.path().join("real-root");
+    let inner = real_root.join("inner");
+    fs::create_dir_all(&inner).expect("create junction target");
+    let junction = scratch.path().join("junction");
+    make_junction(&inner, &junction);
+    let requested_to = junction.join("..").join("destination");
+    let physical_destination = real_root.join("destination");
+    let lexical_destination = scratch.path().join("destination");
+
+    let output = cli(scratch.path(), &active_home)
+        .args([
+            "--json",
+            "configs",
+            "copy",
+            from.to_str().expect("utf8 from path"),
+            requested_to.to_str().expect("utf8 destination path"),
+            "--yes",
+        ])
+        .output()
+        .expect("run configs copy");
+    assert!(
+        !output.status.success(),
+        "an existing junction component in <TO> must hard-fail"
+    );
+
+    let lines = events(output);
+    assert!(
+        !lines.iter().any(|event| event["event"] == "plan"),
+        "the original destination walk must reject the junction before the plan"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|event| event["event"] == "configs.copy.item"),
+        "the original destination walk must reject the junction before apply"
+    );
+    assert!(
+        !physical_destination.exists() && !lexical_destination.exists(),
+        "the rejected command must not write to either interpretation of the destination"
+    );
+}
+
 /// Regression for defect 4: a plan must never promise a seed it then only
 /// partially applies. With a destination path existing as a FILE where a
 /// directory is required, the command must fail during preflight — before
@@ -1858,14 +1976,10 @@ fn a_symlinked_target_root_is_not_followed_outside_from() {
 
 /// Regression for finding G on Windows specifically: a configured target ROOT
 /// that is a directory JUNCTION (an `IO_REPARSE_TAG_MOUNT_POINT` reparse
-/// point) pointing outside `<FROM>` must also be skipped. On the current
-/// toolchain a junction reports `is_symlink() == true` (attributes `0x410`),
-/// so the `is_symlink() || is_reparse_point()` guard short-circuits on
-/// `is_symlink()` and this test does NOT itself drive the `is_reparse_point`
-/// fallback (that predicate is covered directly by a dedicated unit test);
-/// what this test proves is that a real junction — the exact filesystem object
-/// a user plants with `mklink /J` — is rejected as a source root. Junction
-/// creation needs no privilege, so it always runs.
+/// point) pointing outside `<FROM>` must also be skipped. This proves the
+/// reparse-tag-aware link classifier recognizes a real junction — the exact
+/// filesystem object a user plants with `mklink /J` — as a source link.
+/// Junction creation needs no privilege, so it always runs.
 #[cfg(windows)]
 #[test]
 fn a_junctioned_target_root_is_not_followed_outside_from() {
@@ -2189,12 +2303,9 @@ fn an_empty_directory_missing_at_the_destination_is_recreated() {
 
 /// Regression for finding C on Windows specifically: the post-plan ancestor
 /// recheck must reject a real JUNCTION planted at a destination ancestor after
-/// preflight. On the current toolchain a junction reports `is_symlink() ==
-/// true`, so the reject guard short-circuits there rather than on the
-/// `is_reparse_point` fallback (covered directly by a dedicated unit test);
-/// what this proves is that the exact object a user creates with `mklink /J`
-/// is caught at apply time. Junctions need no privilege, so this is
-/// deterministic on Windows CI.
+/// preflight. This proves the exact object a user creates with `mklink /J` is
+/// classified as link-like and caught at apply time. Junctions need no
+/// privilege, so this is deterministic on Windows CI.
 #[cfg(windows)]
 #[test]
 fn a_junctioned_destination_ancestor_after_preflight_is_rejected_at_apply() {

@@ -501,7 +501,7 @@ where
         // `<FROM>` alias the active home, so the active home must never gain
         // migration markers or lock files as a side effect of this command.
         let from = self.resolve_seed_directory(&args.from)?;
-        let to = self.resolve_seed_directory(&args.to)?;
+        let to = self.resolve_seed_destination(&args.to)?;
 
         if !from.is_dir() {
             return Err(SkillManagerError::InvalidInput(format!(
@@ -789,6 +789,18 @@ where
     /// against the active `--home`, then ordinary CWD-relative resolution.
     fn resolve_seed_directory(&self, raw: &str) -> Result<PathBuf> {
         absolute_path(expand_home(raw, &self.home))
+    }
+
+    /// Resolve a `configs copy` `<TO>` argument without allowing its original
+    /// spelling to pass through a link. Unlike ordinary path operands, every
+    /// existing component of a seed destination is security-sensitive: even a
+    /// dangling junction could redirect the later `create_dir_all` outside
+    /// `<TO>`. Validate that component walk before physical normalization so
+    /// the link itself is not lost when [`absolute_path`] follows it.
+    fn resolve_seed_destination(&self, raw: &str) -> Result<PathBuf> {
+        let absolute = make_absolute(expand_home(raw, &self.home))?;
+        reject_linked_path_components(&absolute)?;
+        canonicalize_existing_ancestor(&absolute)
     }
 
     /// Discover which configuration decides `configs copy`'s target
@@ -6305,42 +6317,41 @@ fn reject_links_in_tree(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Reject `path` when it exists and is a symlink or other reparse point.
+/// Reject `path` when it exists and is a symlink, junction, or mount point.
 ///
-/// On Windows a directory junction is a reparse point; whether a given Rust
-/// toolchain also flags it via `is_symlink()` varies by version, so it is
-/// detected via the reparse-point file attribute regardless. Otherwise a
-/// junction planted at a destination ancestor could redirect a write outside
-/// `<TO>` (finding C).
+/// Windows has several unrelated reparse-point families (including cloud-file
+/// placeholders and filesystem virtualization metadata). [`is_link_like`]
+/// deliberately uses the platform's link-like file-type classification rather
+/// than treating the broad reparse-point attribute as proof that `read_link`
+/// is valid. Junctions and mount points remain link-like and are still rejected
+/// anywhere they could redirect a write outside `<TO>` (finding C).
 fn reject_link(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || is_reparse_point(&metadata) => {
-            Err(SkillManagerError::InvalidInput(format!(
-                "seed destination path must not be a link: {}",
-                path.display()
-            )))
-        }
+        Ok(metadata) if is_link_like(&metadata) => Err(SkillManagerError::InvalidInput(format!(
+            "seed destination path must not be a link: {}",
+            path.display()
+        ))),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(SkillManagerError::io(path, error)),
     }
 }
 
-/// Whether `metadata` describes a Windows reparse point (symlink, junction, or
-/// mount point). Always `false` off Windows, where `is_symlink()` already
-/// covers the link cases. On Windows this is a version-independent belt to the
-/// `is_symlink()` suspenders: it flags junctions even on toolchains whose
-/// `is_symlink()` does not.
+/// Whether `metadata` describes a filesystem link that path resolution may
+/// follow. On Windows the extension methods are backed by the reparse tag, so
+/// they include directory junctions/mount points while excluding unrelated
+/// reparse-point families such as OneDrive/Cloud Files, `ProjFS`, and `WOF`.
 #[cfg(windows)]
-fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+fn is_link_like(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::FileTypeExt;
+
+    let file_type = metadata.file_type();
+    file_type.is_symlink() || file_type.is_symlink_dir() || file_type.is_symlink_file()
 }
 
 #[cfg(not(windows))]
-const fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
-    false
+fn is_link_like(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 /// Whether `path` is a real directory that may be descended into as a copy
@@ -6360,9 +6371,7 @@ const fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
 /// symlink or reparse point ... is never descended").
 fn is_descendable_dir(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            metadata.is_dir() && !metadata.file_type().is_symlink() && !is_reparse_point(&metadata)
-        }
+        Ok(metadata) => metadata.is_dir() && !is_link_like(&metadata),
         Err(_) => false,
     }
 }
@@ -6382,9 +6391,7 @@ enum SourceRootKind {
 /// Classify a copy source root without ever following a link (findings G/K).
 fn classify_source_root(path: &Path) -> Result<SourceRootKind> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || is_reparse_point(&metadata) => {
-            Ok(SourceRootKind::Link)
-        }
+        Ok(metadata) if is_link_like(&metadata) => Ok(SourceRootKind::Link),
         Ok(metadata) if metadata.is_dir() => Ok(SourceRootKind::Directory),
         Ok(_) => Ok(SourceRootKind::Absent),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SourceRootKind::Absent),
@@ -6414,9 +6421,7 @@ fn reject_seed_conflicts(item: &SeedItem) -> Result<()> {
             current = current.join(part);
             let is_last = index + 1 == parts.len();
             match std::fs::symlink_metadata(&current) {
-                Ok(metadata)
-                    if metadata.file_type().is_symlink() || is_reparse_point(&metadata) =>
-                {
+                Ok(metadata) if is_link_like(&metadata) => {
                     return Err(SkillManagerError::InvalidInput(format!(
                         "seed destination path must not be a link: {}",
                         current.display()
@@ -6479,7 +6484,7 @@ fn seed_source_entries(root: &Path, excluded_top_level: &[&str]) -> Result<BTree
         let item = item.map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
         let metadata = std::fs::symlink_metadata(item.path())
             .map_err(|error| SkillManagerError::io(item.path(), error))?;
-        if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+        if is_link_like(&metadata) || !(metadata.is_file() || metadata.is_dir()) {
             continue;
         }
         let relative = item.path().strip_prefix(root).map_err(|error| {
@@ -6559,9 +6564,7 @@ fn read_seed_config(home: &Path) -> Result<Option<Config>> {
     }
     let path = config_root.join("config.json");
     match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || is_reparse_point(&metadata) => {
-            return Ok(None);
-        }
+        Ok(metadata) if is_link_like(&metadata) => return Ok(None),
         Ok(metadata) if !metadata.is_file() => return Ok(None),
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -6725,7 +6728,7 @@ fn merge_directory_files(
         let item = item.map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
         let metadata = std::fs::symlink_metadata(item.path())
             .map_err(|error| SkillManagerError::io(item.path(), error))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        if is_link_like(&metadata) || !metadata.is_file() {
             continue;
         }
         let relative = item.path().strip_prefix(root).map_err(|error| {
@@ -6753,7 +6756,7 @@ fn merge_copy_tree(source: &Path, destination: &Path, excluded_top_level: &[&str
     // so reaching one here means it was planted mid-flight — an error, matching
     // the apply-time destination-link recheck.
     match std::fs::symlink_metadata(source) {
-        Ok(metadata) if metadata.file_type().is_symlink() || is_reparse_point(&metadata) => {
+        Ok(metadata) if is_link_like(&metadata) => {
             return Err(SkillManagerError::InvalidInput(format!(
                 "seed source path must not be a link: {}",
                 source.display()
@@ -6784,7 +6787,7 @@ fn merge_copy_tree(source: &Path, destination: &Path, excluded_top_level: &[&str
         let item = item.map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
         let metadata = std::fs::symlink_metadata(item.path())
             .map_err(|error| SkillManagerError::io(item.path(), error))?;
-        if metadata.file_type().is_symlink() {
+        if is_link_like(&metadata) {
             continue;
         }
         let relative = item.path().strip_prefix(source).map_err(|error| {
@@ -8662,6 +8665,13 @@ fn status_matches(
 }
 
 fn absolute_path(path: PathBuf) -> Result<PathBuf> {
+    canonicalize_existing_ancestor(&make_absolute(path)?)
+}
+
+/// Make `path` absolute without following links or normalizing components.
+/// Keeping this separate lets security-sensitive callers inspect the exact
+/// component walk before ordinary physical path resolution changes it.
+fn make_absolute(path: PathBuf) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path
     } else {
@@ -8669,7 +8679,35 @@ fn absolute_path(path: PathBuf) -> Result<PathBuf> {
             .map_err(|error| SkillManagerError::io(".", error))?
             .join(path)
     };
-    canonicalize_existing_ancestor(&absolute)
+    Ok(absolute)
+}
+
+/// Reject any link-like component present in the original absolute spelling
+/// of a security-sensitive destination.
+///
+/// Components continue to be inspected after a missing entry: a later `..`
+/// can return to an existing ancestor, after which another link could still be
+/// traversed by the operating system. A link is rejected before applying a
+/// following `..`, which is the distinction lost if the path is canonicalized
+/// first.
+fn reject_linked_path_components(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                current.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                current.pop();
+            }
+            std::path::Component::Normal(name) => {
+                current.push(name);
+                reject_link(&current)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Canonicalize the longest existing ancestor of `path` component by
@@ -8721,9 +8759,7 @@ fn canonicalize_existing_ancestor_bounded(
             std::path::Component::Normal(name) => {
                 let candidate = resolved.join(name);
                 match fs::symlink_metadata(&candidate) {
-                    Ok(metadata)
-                        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) =>
-                    {
+                    Ok(metadata) if is_link_like(&metadata) => {
                         if followed_links == max_followed_links {
                             return Err(SkillManagerError::io(
                                 &candidate,
@@ -8845,6 +8881,25 @@ mod tests {
         std::os::windows::fs::symlink_dir(target, link).is_ok()
     }
 
+    /// Create a Windows directory junction without requiring symlink
+    /// privilege. The stable standard library does not yet expose junction
+    /// creation, so tests use the platform's built-in `mklink /J` command and
+    /// fail loudly if it cannot create the disposable fixture.
+    #[cfg(windows)]
+    fn create_directory_junction(target: &Path, link: &Path) {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(
+            output.status.success(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// The recursion/self-overwrite guard compares on path COMPONENT
     /// boundaries (finding N), so a sibling whose name merely shares a prefix —
     /// `.../a/bc` versus `.../a/b` — must NOT be treated as nested, while a
@@ -8871,16 +8926,13 @@ mod tests {
         }
     }
 
-    /// Directly exercises the Windows reparse-point predicate the junction
-    /// integration tests cannot reach (a junction reports `is_symlink() ==
-    /// true` on the current toolchain, so the `is_symlink() || is_reparse_point`
-    /// guard short-circuits before the fallback). A real `mklink /J` junction
-    /// must set the reparse-point attribute so `is_reparse_point` returns
-    /// `true`, and a plain directory must not. Junction creation needs no
-    /// privilege, so this is deterministic on Windows CI.
+    /// The Windows link-like predicate must classify a real junction as a link
+    /// while leaving an ordinary directory alone. This uses the reparse-tag-
+    /// aware file-type APIs, rather than the broad reparse-point attribute that
+    /// also appears on unrelated Cloud Files/ProjFS/WOF entries.
     #[cfg(windows)]
     #[test]
-    fn is_reparse_point_flags_a_real_junction_but_not_a_plain_directory() {
+    fn is_link_like_flags_a_real_junction_but_not_a_plain_directory() {
         let scratch = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
         let target = scratch.path().join("target");
         std::fs::create_dir_all(&target).unwrap_or_else(|error| unreachable!("{error}"));
@@ -8890,27 +8942,17 @@ mod tests {
         let plain_metadata =
             std::fs::symlink_metadata(&plain).unwrap_or_else(|error| unreachable!("{error}"));
         assert!(
-            !super::is_reparse_point(&plain_metadata),
-            "a plain directory is not a reparse point"
+            !super::is_link_like(&plain_metadata),
+            "a plain directory is not link-like"
         );
 
         let link = scratch.path().join("junction");
-        let output = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(&link)
-            .arg(&target)
-            .output()
-            .unwrap_or_else(|error| unreachable!("{error}"));
-        assert!(
-            output.status.success(),
-            "mklink /J failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        create_directory_junction(&target, &link);
         let junction_metadata =
             std::fs::symlink_metadata(&link).unwrap_or_else(|error| unreachable!("{error}"));
         assert!(
-            super::is_reparse_point(&junction_metadata),
-            "a real junction must be flagged as a reparse point"
+            super::is_link_like(&junction_metadata),
+            "a real junction must be classified as link-like"
         );
     }
 
@@ -9235,6 +9277,28 @@ mod tests {
         );
     }
 
+    /// Deterministic Windows coverage for the original `link/../destination`
+    /// defect. A junction exercises the same reparse-point traversal without
+    /// requiring Developer Mode or symbolic-link privilege.
+    #[cfg(windows)]
+    #[test]
+    fn absolute_path_resolves_parent_after_a_windows_junction_target() {
+        let sandbox = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let real_root = sandbox.path().join("real-root");
+        let inner = real_root.join("inner");
+        std::fs::create_dir_all(&inner).unwrap_or_else(|error| unreachable!("{error}"));
+        let alias = sandbox.path().join("junction");
+        create_directory_junction(&inner, &alias);
+
+        let resolved = absolute_path(alias.join("..").join("destination"))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            resolved,
+            portable_canonicalize(&real_root).join("destination"),
+            "a Windows junction target must be resolved before applying '..'"
+        );
+    }
+
     #[test]
     fn absolute_path_resolves_relative_and_chained_directory_symlinks() {
         let sandbox = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
@@ -9258,6 +9322,31 @@ mod tests {
             resolved,
             portable_canonicalize(&real_root).join("destination"),
             "relative and chained link targets must resolve before applying later components"
+        );
+    }
+
+    /// Deterministic Windows coverage for chained link resolution. The generic
+    /// symlink test above keeps relative-target coverage on Unix and runs on
+    /// privileged Windows hosts; junctions guarantee the chained Windows path
+    /// is always exercised.
+    #[cfg(windows)]
+    #[test]
+    fn absolute_path_resolves_chained_windows_junctions() {
+        let sandbox = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let real_root = sandbox.path().join("real-root");
+        let inner = real_root.join("inner");
+        std::fs::create_dir_all(&inner).unwrap_or_else(|error| unreachable!("{error}"));
+        let second_alias = sandbox.path().join("second-junction");
+        let first_alias = sandbox.path().join("first-junction");
+        create_directory_junction(&inner, &second_alias);
+        create_directory_junction(&second_alias, &first_alias);
+
+        let resolved = absolute_path(first_alias.join("..").join("destination"))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            resolved,
+            portable_canonicalize(&real_root).join("destination"),
+            "chained Windows junctions must resolve before later components"
         );
     }
 
@@ -9301,6 +9390,36 @@ mod tests {
                 .contains("too many levels of symbolic links"),
             "cycle failure must explain the bounded link traversal: {error}"
         );
+    }
+
+    /// Deterministic Windows cycle coverage. Build two junctions that target
+    /// one another, then verify bounded traversal reports the same explicit
+    /// link-depth failure as the Unix symlink cycle.
+    #[cfg(windows)]
+    #[test]
+    fn absolute_path_rejects_a_windows_junction_cycle() {
+        let sandbox = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let first = sandbox.path().join("first");
+        let second = sandbox.path().join("second");
+        std::fs::create_dir_all(&second).unwrap_or_else(|error| unreachable!("{error}"));
+        create_directory_junction(&second, &first);
+        std::fs::remove_dir(&second).unwrap_or_else(|error| unreachable!("{error}"));
+        create_directory_junction(&first, &second);
+
+        let error = match absolute_path(first.join("destination")) {
+            Ok(path) => unreachable!("junction cycle resolved unexpectedly to {}", path.display()),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SkillManagerError::FileSystem { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("too many levels of symbolic links"),
+            "junction cycle failure must explain the bounded link traversal: {error}"
+        );
+
+        std::fs::remove_dir(&first).unwrap_or_else(|cleanup| unreachable!("{cleanup}"));
+        std::fs::remove_dir(&second).unwrap_or_else(|cleanup| unreachable!("{cleanup}"));
     }
 
     #[test]
