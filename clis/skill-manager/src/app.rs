@@ -8724,8 +8724,15 @@ impl SeedDestination {
         Ok(Self { anchor, expression })
     }
 
-    /// Walk the destination-controlled expression without following links and
-    /// return the one normalized path the filesystem will actually reach.
+    /// Walk the destination-controlled expression without following links,
+    /// then physically resolve its deepest existing ancestor.
+    ///
+    /// The second step is necessary even though `anchor` is already canonical:
+    /// on a case-insensitive filesystem, an existing expression component may
+    /// have been addressed with different casing. Returning that literal
+    /// spelling would make later component-based recursion checks disagree with
+    /// the filesystem. Only the existing prefix is canonicalized, so names in
+    /// a missing tail retain exactly the spelling supplied by the caller.
     fn resolve(self) -> Result<PathBuf> {
         let mut effective = self.anchor.clone();
         let mut depth = 0_usize;
@@ -8758,8 +8765,74 @@ impl SeedDestination {
                 }
             }
         }
-        Ok(effective)
+        canonicalize_verified_seed_destination(&self.anchor, &effective)
     }
+}
+
+/// Canonicalize the deepest existing prefix of an already normalized and
+/// no-follow-validated seed destination, preserving a missing tail literally.
+///
+/// Unlike [`canonicalize_existing_ancestor`], this helper never accepts an
+/// observed link while locating the existing prefix: that link is rejected,
+/// including one planted between the expression walk and this physical-identity
+/// pass. The canonical prefix must remain under the physical ambient anchor as
+/// an additional race guard. Filesystem errors are surfaced rather than falling
+/// back to the caller's spelling, because doing so could reintroduce divergent
+/// recursion, plan, and write paths.
+fn canonicalize_verified_seed_destination(anchor: &Path, path: &Path) -> Result<PathBuf> {
+    let mut existing = PathBuf::new();
+    let mut missing_tail = PathBuf::new();
+    let mut found_missing = false;
+
+    for component in path.components() {
+        if found_missing {
+            missing_tail.push(component.as_os_str());
+            continue;
+        }
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                existing.push(component.as_os_str());
+            }
+            std::path::Component::Normal(name) => {
+                let candidate = existing.join(name);
+                match std::fs::symlink_metadata(&candidate) {
+                    Ok(metadata) if is_link_like(&metadata) => {
+                        return Err(SkillManagerError::InvalidInput(format!(
+                            "seed destination path must not be a link: {}",
+                            candidate.display()
+                        )));
+                    }
+                    Ok(_) => existing = candidate,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        found_missing = true;
+                        missing_tail.push(name);
+                    }
+                    Err(error) => return Err(SkillManagerError::io(&candidate, error)),
+                }
+            }
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                return Err(SkillManagerError::InvalidInput(format!(
+                    "seed destination was not normalized before physical resolution: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    let canonical_existing = existing
+        .canonicalize()
+        .map(|resolved| portable_path(&resolved))
+        .map_err(|error| SkillManagerError::io(&existing, error))?;
+    if !path_is_within(&canonical_existing, anchor) {
+        return Err(SkillManagerError::InvalidInput(format!(
+            "seed destination path changed outside its ambient anchor while resolving: {}",
+            path.display()
+        )));
+    }
+
+    let mut resolved = canonical_existing;
+    resolved.push(missing_tail);
+    Ok(resolved)
 }
 
 /// Widen a relative/home trust boundary just enough to preserve ordinary `..`
@@ -9032,7 +9105,8 @@ mod tests {
     use indexmap::IndexMap;
 
     use super::{
-        Application, RunOutcome, SeedDestination, absolute_path, command_dry_run, find_named_key,
+        Application, RunOutcome, SeedDestination, absolute_path,
+        canonicalize_verified_seed_destination, command_dry_run, find_named_key,
         normalized_patterns, path_is_within, set_target_enabled, skill_action_data, source_data,
         source_matches, status_matches, target_data, title_case,
     };
@@ -9592,6 +9666,26 @@ mod tests {
         assert!(
             error.to_string().contains("escapes its ambient anchor"),
             "anchor escape must be an actionable validation error: {error}"
+        );
+    }
+
+    #[test]
+    fn verified_seed_destination_canonicalizes_existing_prefix_and_preserves_missing_tail() {
+        let sandbox = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let anchor = portable_canonicalize(sandbox.path());
+        let existing = anchor.join("PhysicalPrefix");
+        std::fs::create_dir(&existing).unwrap_or_else(|error| unreachable!("{error}"));
+        let requested = existing.join("MissingTail").join("LiteralLeaf");
+
+        let resolved = canonicalize_verified_seed_destination(&anchor, &requested)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+
+        assert_eq!(
+            resolved,
+            portable_canonicalize(&existing)
+                .join("MissingTail")
+                .join("LiteralLeaf"),
+            "only the deepest existing ancestor should receive physical filesystem spelling"
         );
     }
 

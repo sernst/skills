@@ -1097,6 +1097,79 @@ fn macos_temp_namespace_alias_is_resolved_before_destination_validation() {
     );
 }
 
+/// Default APFS is case-insensitive but case-preserving. An existing copied
+/// target root addressed with alternate casing must therefore resolve to its
+/// physical spelling before component-based recursion checks. Case-sensitive
+/// macOS volumes are valid too, so the fixture explicitly detects that volume
+/// property and skips only this APFS-specific assertion there.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_alternate_case_copied_root_is_rejected_before_plan_or_write() {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let from = scratch.path().join("from");
+    let active_home = scratch.path().join("active-home");
+    seed_real_home_with_claude_skill(&scratch, &from, "alpha");
+
+    let copied_root = from.join(".claude").join("skills");
+    let alternate_case_to = from.join(".claude").join("SKILLS");
+    match fs::symlink_metadata(&alternate_case_to) {
+        Ok(_) => assert_eq!(
+            fs::canonicalize(&alternate_case_to).expect("canonical alternate-case target root"),
+            fs::canonicalize(&copied_root).expect("canonical copied target root"),
+            "alternate-case lookup must identify the existing copied root"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // The fixture is on a case-sensitive volume; alternate casing is a
+            // genuinely different missing path, so this APFS property does not
+            // apply. All other macOS configs-copy contracts still run.
+            return;
+        }
+        Err(error) => panic!("inspect alternate-case target root: {error}"),
+    }
+    let before = snapshot(&from);
+
+    let output = cli(scratch.path(), &active_home)
+        .args([
+            "--json",
+            "configs",
+            "copy",
+            from.to_str().expect("utf8 source path"),
+            alternate_case_to
+                .to_str()
+                .expect("utf8 alternate-case destination path"),
+            "--yes",
+        ])
+        .output()
+        .expect("run alternate-case configs copy");
+    assert!(
+        !output.status.success(),
+        "an alternate-case spelling of a copied source root must hard-fail"
+    );
+
+    let lines = events(output);
+    assert!(
+        !lines.iter().any(|event| event["event"] == "plan"),
+        "recursion validation must fail before the plan"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|event| event["event"] == "configs.copy.item"),
+        "recursion validation must fail before apply"
+    );
+    assert!(
+        lines.iter().any(|event| {
+            event["event"] == "command.failed" && event.to_string().contains("recurse")
+        }),
+        "the failure must identify the recursion hazard"
+    );
+    assert_eq!(
+        snapshot(&from),
+        before,
+        "the rejected alternate-case self-copy must not mutate its source"
+    );
+}
+
 /// Platform-neutral trust-boundary proof on Windows: an existing junction in
 /// the ambient namespace is resolved physically, while the final missing `TO`
 /// component remains strict and the plan/write path uses the junction target.
