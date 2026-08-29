@@ -8669,7 +8669,7 @@ fn absolute_path(path: PathBuf) -> Result<PathBuf> {
             .map_err(|error| SkillManagerError::io(".", error))?
             .join(path)
     };
-    Ok(canonicalize_existing_ancestor(&absolute))
+    canonicalize_existing_ancestor(&absolute)
 }
 
 /// Canonicalize the longest existing ancestor of `path` component by
@@ -8689,48 +8689,89 @@ fn absolute_path(path: PathBuf) -> Result<PathBuf> {
 /// part of turning a path into its NT form, before a reparse point later in
 /// that same string is followed, so `canonicalize("link/..")` can still
 /// return the symlink's own parent rather than its target's parent. Instead,
-/// each component is resolved in turn — a `Normal` component is joined and
-/// canonicalized (following any symlink at that step) as long as it exists,
-/// and a `..` is popped from the already-resolved path rather than folded
-/// into the string being canonicalized — so `..` is always applied after any
-/// symlink at that position has been followed. Once a component does not
-/// exist, resolution stops and the remaining tail — which by definition
-/// contains no symlinks, because nothing there exists yet — is appended
-/// unresolved.
-fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
-    if let Ok(canonical) = path.canonicalize() {
-        return portable_path(&canonical);
-    }
+/// each component is resolved in turn. Links are read explicitly and their
+/// targets are fed back through the same component walker before later input
+/// components are considered. A `..` is therefore applied only after any
+/// symlink at that position has been followed. Link traversal is bounded so
+/// cycles fail instead of recursing forever. Once a component does not exist,
+/// resolution stops and the remaining tail — including any `..` components —
+/// is appended literally.
+fn canonicalize_existing_ancestor(path: &Path) -> Result<PathBuf> {
+    const MAX_SYMLINK_RESOLUTIONS: usize = 40;
+
+    canonicalize_existing_ancestor_bounded(path, 0, MAX_SYMLINK_RESOLUTIONS)
+}
+
+fn canonicalize_existing_ancestor_bounded(
+    path: &Path,
+    followed_links: usize,
+    max_followed_links: usize,
+) -> Result<PathBuf> {
     let mut resolved = PathBuf::new();
-    let mut resolving = true;
-    for component in path.components() {
+    let mut components = path.components();
+    while let Some(component) = components.next() {
         match component {
             std::path::Component::Prefix(_) | std::path::Component::RootDir => {
                 resolved.push(component.as_os_str());
             }
             std::path::Component::CurDir => {}
-            std::path::Component::ParentDir if resolving => {
-                resolved.pop();
-            }
-            std::path::Component::Normal(name) if resolving => {
-                let candidate = resolved.join(name);
-                if let Ok(canonical) = candidate.canonicalize() {
-                    resolved = canonical;
-                } else {
-                    resolving = false;
-                    resolved.push(name);
-                }
-            }
-            // Once an ancestor is missing, nothing further in the path can
-            // exist on disk, so there is no symlink left to resolve: append
-            // the remaining components literally.
             std::path::Component::ParentDir => {
                 resolved.pop();
             }
-            std::path::Component::Normal(name) => resolved.push(name),
+            std::path::Component::Normal(name) => {
+                let candidate = resolved.join(name);
+                match fs::symlink_metadata(&candidate) {
+                    Ok(metadata)
+                        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) =>
+                    {
+                        if followed_links == max_followed_links {
+                            return Err(SkillManagerError::io(
+                                &candidate,
+                                std::io::Error::other(
+                                    "too many levels of symbolic links while resolving path",
+                                ),
+                            ));
+                        }
+                        let target = fs::read_link(&candidate)
+                            .map_err(|error| SkillManagerError::io(&candidate, error))?;
+                        let mut redirected = if target.is_absolute() {
+                            target
+                        } else if let Some(parent) = candidate.parent() {
+                            parent.join(target)
+                        } else {
+                            target
+                        };
+                        for remaining in components {
+                            redirected.push(remaining.as_os_str());
+                        }
+                        return canonicalize_existing_ancestor_bounded(
+                            &redirected,
+                            followed_links + 1,
+                            max_followed_links,
+                        );
+                    }
+                    Ok(_) => resolved = candidate,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        resolved = portable_path(
+                            &resolved
+                                .canonicalize()
+                                .map_err(|error| SkillManagerError::io(&resolved, error))?,
+                        );
+                        resolved.push(name);
+                        for remaining in components {
+                            resolved.push(remaining.as_os_str());
+                        }
+                        return Ok(portable_path(&resolved));
+                    }
+                    Err(error) => return Err(SkillManagerError::io(&candidate, error)),
+                }
+            }
         }
     }
-    portable_path(&resolved)
+    let canonical = resolved
+        .canonicalize()
+        .map_err(|error| SkillManagerError::io(&resolved, error))?;
+    Ok(portable_path(&canonical))
 }
 
 fn title_case(value: &str) -> String {
@@ -8767,7 +8808,7 @@ pub fn production_repository(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use indexmap::IndexMap;
 
@@ -8792,6 +8833,17 @@ mod tests {
     use crate::event::{Level, Reporter};
     use crate::prompt::Prompt;
     use crate::transaction::NoopTransactionHook;
+
+    #[cfg(unix)]
+    fn create_directory_symlink(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).unwrap_or_else(|error| unreachable!("{error}"));
+        true
+    }
+
+    #[cfg(windows)]
+    fn create_directory_symlink(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
 
     /// The recursion/self-overwrite guard compares on path COMPONENT
     /// boundaries (finding N), so a sibling whose name merely shares a prefix —
@@ -9160,16 +9212,7 @@ mod tests {
         std::fs::create_dir_all(&inner).unwrap_or_else(|error| unreachable!("{error}"));
         let alias = sandbox.path().join("alias");
 
-        #[cfg(unix)]
-        let linked = {
-            std::os::unix::fs::symlink(&inner, &alias)
-                .unwrap_or_else(|error| unreachable!("{error}"));
-            true
-        };
-        #[cfg(windows)]
-        let linked = std::os::windows::fs::symlink_dir(&inner, &alias).is_ok();
-
-        if !linked {
+        if !create_directory_symlink(&inner, &alias) {
             // Creating a directory symlink without elevated privileges is not
             // possible in every CI environment; skip rather than fail.
             return;
@@ -9189,6 +9232,74 @@ mod tests {
             resolved,
             portable_canonicalize(sandbox.path()).join("destination"),
             "must not silently redirect the write to the symlink's own parent directory"
+        );
+    }
+
+    #[test]
+    fn absolute_path_resolves_relative_and_chained_directory_symlinks() {
+        let sandbox = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let real_root = sandbox.path().join("real-root");
+        let inner = real_root.join("inner");
+        std::fs::create_dir_all(&inner).unwrap_or_else(|error| unreachable!("{error}"));
+        let second_alias = sandbox.path().join("second-alias");
+        let first_alias = sandbox.path().join("first-alias");
+
+        if !create_directory_symlink(
+            Path::new("real-root").join("inner").as_path(),
+            &second_alias,
+        ) || !create_directory_symlink(Path::new("second-alias"), &first_alias)
+        {
+            return;
+        }
+
+        let resolved = absolute_path(first_alias.join("..").join("destination"))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            resolved,
+            portable_canonicalize(&real_root).join("destination"),
+            "relative and chained link targets must resolve before applying later components"
+        );
+    }
+
+    #[test]
+    fn absolute_path_keeps_the_tail_literal_after_the_first_missing_component() {
+        let sandbox = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let existing = sandbox.path().join("existing");
+        std::fs::create_dir_all(&existing).unwrap_or_else(|error| unreachable!("{error}"));
+        let requested = existing.join("missing").join("..").join("destination");
+
+        let resolved = absolute_path(requested).unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            resolved,
+            portable_canonicalize(&existing)
+                .join("missing")
+                .join("..")
+                .join("destination"),
+            "components after the deepest existing ancestor must stay literal"
+        );
+    }
+
+    #[test]
+    fn absolute_path_rejects_a_directory_symlink_cycle() {
+        let sandbox = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let first = sandbox.path().join("first");
+        let second = sandbox.path().join("second");
+        if !create_directory_symlink(Path::new("second"), &first)
+            || !create_directory_symlink(Path::new("first"), &second)
+        {
+            return;
+        }
+
+        let error = match absolute_path(first.join("destination")) {
+            Ok(path) => unreachable!("symlink cycle resolved unexpectedly to {}", path.display()),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SkillManagerError::FileSystem { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("too many levels of symbolic links"),
+            "cycle failure must explain the bounded link traversal: {error}"
         );
     }
 
