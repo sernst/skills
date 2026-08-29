@@ -693,6 +693,14 @@ pub struct ConfigsCopyArgs {
     pub from: String,
     /// Manager home to seed; created if it does not yet exist.
     pub to: String,
+    /// Ambient base for a relative recipe destination.
+    ///
+    /// This is parser-internal provenance, not a user-facing argument. Keeping
+    /// the recipe base separate from `to` preserves the destination-controlled
+    /// components for the strict no-link walk while allowing the pre-existing
+    /// base namespace to be resolved physically first.
+    #[arg(skip)]
+    pub to_base: Option<PathBuf>,
     /// Also copy the regenerable cache, backup, and lock directories.
     #[arg(long)]
     pub include_cache: bool,

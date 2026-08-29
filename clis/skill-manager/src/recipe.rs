@@ -623,7 +623,9 @@ fn overlay_configs_copy(
     if args.to.is_empty()
         && let Some(to) = to
     {
-        args.to = rebase_seed_destination_path(&to, base);
+        let (to, to_base) = seed_destination_recipe_path(&to, base);
+        args.to = to;
+        args.to_base = to_base;
     }
     Ok(())
 }
@@ -641,20 +643,19 @@ fn rebase_seed_path(raw: &str, base: &Path) -> String {
     resolve_path(path, base).to_string_lossy().into_owned()
 }
 
-/// Rebase a `configs copy` destination without discarding its original path
-/// components. Unlike ordinary recipe paths, `<TO>` has a strict security
-/// policy: every link/junction in the caller's component walk must be rejected
-/// even when a later `..` leaves that component. [`resolve_path`] would erase
-/// that evidence before `resolve_seed_destination` can inspect it, so a
-/// relative destination is joined to the recipe directory but deliberately
-/// not normalized here. Absolute and `~`-prefixed destinations keep the same
-/// pass-through behavior as [`rebase_seed_path`].
-fn rebase_seed_destination_path(raw: &str, base: &Path) -> String {
+/// Preserve a `configs copy` destination's security boundary while rebasing.
+///
+/// Unlike ordinary recipe paths, `<TO>` must retain every destination-side
+/// component until the strict no-link walk, including a link before a later
+/// `..`. Store a relative recipe path unchanged and carry its pre-existing
+/// recipe directory separately as the ambient base. Absolute and `~`-prefixed
+/// destinations need no recipe base and keep their pass-through behavior.
+fn seed_destination_recipe_path(raw: &str, base: &Path) -> (String, Option<PathBuf>) {
     let path = Path::new(raw);
     if path.is_absolute() || raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
-        return raw.to_owned();
+        return (raw.to_owned(), None);
     }
-    base.join(path).to_string_lossy().into_owned()
+    (raw.to_owned(), Some(base.to_path_buf()))
 }
 
 fn overlay_source_selection(
@@ -1034,6 +1035,7 @@ fn build_required_command(name: &str) -> Result<Command> {
             action: Some(ConfigsAction::Copy(ConfigsCopyArgs {
                 from: String::new(),
                 to: String::new(),
+                to_base: None,
                 include_cache: false,
                 dry_run: false,
                 yes: false,
@@ -1594,12 +1596,13 @@ mod tests {
         );
         assert_eq!(
             Path::new(&copy.to),
-            recipes
-                .join("junction")
-                .join("..")
-                .join("scratch")
-                .as_path(),
+            Path::new("junction").join("..").join("scratch").as_path(),
             "configs.copy must preserve destination components for strict link validation"
+        );
+        assert_eq!(
+            copy.to_base.as_deref(),
+            Some(recipes.as_path()),
+            "a relative recipe destination must retain its ambient recipe-directory boundary"
         );
         assert!(copy.include_cache);
         assert!(copy.yes);

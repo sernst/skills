@@ -508,7 +508,16 @@ only where `FROM` has a same-path file, and nothing already present at `TO`
 that is not part of the copy is ever deleted. `TO` is created if it does not
 yet exist. `FROM` and `TO` support the same `~` expansion as other path
 arguments (resolved against the active `--home`) and may be relative to the
-current directory.
+current directory. Destination resolution treats the pre-existing namespace
+prefix (the current/recipe directory for a relative path, or the existing
+parent namespace of an absolute path) as an explicit ambient boundary and
+resolves it physically first, so platform aliases in that ambient prefix are
+accepted. The preserved `TO`/destination-controlled expression remains
+link-free: every existing component is inspected without following links
+before a later `..` can remove its spelling, and `..` may not escape the
+resolved ambient anchor. The resulting normalized effective destination is
+used consistently for containment checks, plan and event paths, preflight,
+and writes.
 
 `FROM` must exist and be a directory; a `TO` that exists as a file is
 rejected. Because the copy touches only `FROM`'s `.skill-manager` directory

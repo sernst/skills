@@ -43,6 +43,29 @@ fn events(output: std::process::Output) -> Vec<Value> {
         .collect()
 }
 
+#[cfg(unix)]
+fn assert_destination_link_rejected(output: std::process::Output) {
+    assert!(
+        !output.status.success(),
+        "a destination-side link must hard-fail"
+    );
+    let lines = events(output);
+    assert!(
+        !lines.iter().any(|event| event["event"] == "plan"),
+        "destination-link validation must fail before the plan"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|event| event["event"] == "configs.copy.item"),
+        "destination-link validation must fail before apply"
+    );
+    assert!(
+        lines.iter().any(|event| event["event"] == "command.failed"),
+        "the destination-link rejection must be reported as a hard failure"
+    );
+}
+
 fn write_file(path: &Path, body: &str) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("create parent directories");
@@ -1005,6 +1028,125 @@ fn destination_under_from_but_outside_copied_roots_succeeds() {
     );
 }
 
+/// macOS exposes ordinary temporary paths through a pre-existing namespace
+/// alias (on hosted runners this is the familiar `/var` spelling backed by a
+/// physical `/private/var` path). That ambient alias is outside the user's
+/// destination expression and must be resolved before the strict no-link walk.
+/// The plan and writes must then use the single canonical effective `TO`.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_temp_namespace_alias_is_resolved_before_destination_validation() {
+    let raw_temp = std::env::temp_dir();
+    let physical_temp = fs::canonicalize(&raw_temp).expect("canonicalize macOS temp directory");
+    assert_ne!(
+        raw_temp, physical_temp,
+        "the macOS hosted-runner regression requires temp_dir to retain its ambient alias spelling"
+    );
+
+    let scratch = tempfile::Builder::new()
+        .prefix("skill-manager-ambient-alias-")
+        .tempdir_in(&raw_temp)
+        .expect("scratch root under raw macOS temp spelling");
+    let raw_scratch = scratch.path();
+    let physical_scratch = fs::canonicalize(raw_scratch).expect("canonicalize scratch root");
+    assert_ne!(
+        raw_scratch, physical_scratch,
+        "the fixture must retain the ambient temp namespace alias"
+    );
+
+    let from = raw_scratch.join("from");
+    let requested_to = raw_scratch.join("to");
+    let effective_to = physical_scratch.join("to");
+    let active_home = raw_scratch.join("active-home");
+    seed_real_home_with_claude_skill(&scratch, &from, "alpha");
+
+    let output = cli(raw_scratch, &active_home)
+        .args([
+            "--json",
+            "configs",
+            "copy",
+            from.to_str().expect("utf8 source path"),
+            requested_to.to_str().expect("utf8 destination path"),
+            "--yes",
+        ])
+        .output()
+        .expect("run configs copy through macOS temp alias");
+    assert!(
+        output.status.success(),
+        "ordinary sibling configs copy through the ambient temp alias failed: {output:?}"
+    );
+
+    let lines = events(output);
+    let plan = lines
+        .iter()
+        .find(|event| event["event"] == "plan")
+        .expect("configs copy plan");
+    assert_eq!(
+        plan["data"]["to"],
+        serde_json::json!(effective_to),
+        "plan paths must use the canonical effective destination"
+    );
+    assert!(
+        effective_to
+            .join(".claude")
+            .join("skills")
+            .join("alpha")
+            .join("SKILL.md")
+            .is_file(),
+        "writes must reach the same canonical effective destination shown in the plan"
+    );
+}
+
+/// Platform-neutral trust-boundary proof on Windows: an existing junction in
+/// the ambient namespace is resolved physically, while the final missing `TO`
+/// component remains strict and the plan/write path uses the junction target.
+#[cfg(windows)]
+#[test]
+fn an_ambient_junction_prefix_is_resolved_before_destination_validation() {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let physical_namespace = scratch.path().join("physical-namespace");
+    fs::create_dir_all(&physical_namespace).expect("create physical namespace");
+    let ambient_alias = scratch.path().join("ambient-alias");
+    make_junction(&physical_namespace, &ambient_alias);
+
+    let from = ambient_alias.join("from");
+    let requested_to = ambient_alias.join("to");
+    let effective_to = physical_namespace.join("to");
+    let active_home = scratch.path().join("active-home");
+    seed_real_home_with_claude_skill(&scratch, &from, "alpha");
+
+    let output = cli(scratch.path(), &active_home)
+        .args([
+            "--json",
+            "configs",
+            "copy",
+            from.to_str().expect("utf8 source path"),
+            requested_to.to_str().expect("utf8 destination path"),
+            "--yes",
+        ])
+        .output()
+        .expect("run configs copy through ambient junction");
+    assert!(
+        output.status.success(),
+        "ordinary copy through an ambient junction failed: {output:?}"
+    );
+
+    let lines = events(output);
+    let plan = lines
+        .iter()
+        .find(|event| event["event"] == "plan")
+        .expect("configs copy plan");
+    assert_eq!(plan["data"]["to"], serde_json::json!(effective_to));
+    assert!(
+        effective_to
+            .join(".claude")
+            .join("skills")
+            .join("alpha")
+            .join("SKILL.md")
+            .is_file()
+    );
+}
+
 /// A source root inside the destination is a self-overwrite hazard: writing
 /// `<TO>` could clobber the source mid-read. When `<FROM>` itself is inside
 /// `<TO>`, its `.skill-manager` root is too, so the copy is rejected.
@@ -1189,6 +1331,174 @@ fn destination_symlink_escape_is_rejected_and_leaves_the_outside_file_intact() {
         outside_body, "do not overwrite me\n",
         "the copy followed a destination symlink and overwrote a file outside <TO>"
     );
+}
+
+/// Unix coverage for a direct existing directory symlink supplied as `<TO>`.
+/// The ambient parent may be resolved physically, but `<TO>` itself remains on
+/// the strict side of the boundary and must be rejected before the plan.
+#[cfg(unix)]
+#[test]
+fn an_existing_symlink_as_to_is_rejected_before_plan_or_write() {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let from = scratch.path().join("from");
+    let active_home = scratch.path().join("active-home");
+    seed_real_home_with_claude_skill(&scratch, &from, "alpha");
+
+    let outside = scratch.path().join("outside");
+    fs::create_dir_all(&outside).expect("create existing symlink target");
+    write_file(&outside.join("keep.txt"), "keep me\n");
+    let outside_before = snapshot(&outside);
+    let to = scratch.path().join("linked-to");
+    std::os::unix::fs::symlink(&outside, &to).expect("create direct TO symlink");
+
+    let output = cli(scratch.path(), &active_home)
+        .args([
+            "--json",
+            "configs",
+            "copy",
+            from.to_str().expect("utf8 from path"),
+            to.to_str().expect("utf8 destination path"),
+            "--yes",
+        ])
+        .output()
+        .expect("run configs copy");
+    assert_destination_link_rejected(output);
+    assert_eq!(outside_before, snapshot(&outside));
+}
+
+/// Unix coverage for a dangling symlink supplied directly as `<TO>`.
+#[cfg(unix)]
+#[test]
+fn a_dangling_symlink_as_to_is_rejected_before_plan_or_write() {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let from = scratch.path().join("from");
+    let active_home = scratch.path().join("active-home");
+    seed_real_home_with_claude_skill(&scratch, &from, "alpha");
+
+    let missing_target = scratch.path().join("outside").join("missing-target");
+    fs::create_dir_all(missing_target.parent().expect("outside parent"))
+        .expect("create outside parent");
+    let to = scratch.path().join("dangling-to");
+    std::os::unix::fs::symlink(&missing_target, &to).expect("create dangling TO symlink");
+
+    let output = cli(scratch.path(), &active_home)
+        .args([
+            "--json",
+            "configs",
+            "copy",
+            from.to_str().expect("utf8 from path"),
+            to.to_str().expect("utf8 destination path"),
+            "--yes",
+        ])
+        .output()
+        .expect("run configs copy");
+    assert_destination_link_rejected(output);
+    assert!(
+        !missing_target.exists(),
+        "the rejected dangling link must not create its target"
+    );
+}
+
+/// A Unix link must be inspected before the following `..` can remove its
+/// spelling from the destination expression.
+#[cfg(unix)]
+#[test]
+fn a_symlink_component_before_parent_in_to_is_rejected_before_plan_or_write() {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let from = scratch.path().join("from");
+    let active_home = scratch.path().join("active-home");
+    seed_real_home_with_claude_skill(&scratch, &from, "alpha");
+
+    let real_root = scratch.path().join("real-root");
+    let inner = real_root.join("inner");
+    fs::create_dir_all(&inner).expect("create symlink target");
+    let link = scratch.path().join("link");
+    std::os::unix::fs::symlink(&inner, &link).expect("create directory symlink");
+    let requested_to = link.join("..").join("destination");
+    let physical_destination = real_root.join("destination");
+    let lexical_destination = scratch.path().join("destination");
+
+    let output = cli(scratch.path(), &active_home)
+        .args([
+            "--json",
+            "configs",
+            "copy",
+            from.to_str().expect("utf8 from path"),
+            requested_to.to_str().expect("utf8 destination path"),
+            "--yes",
+        ])
+        .output()
+        .expect("run configs copy");
+    assert_destination_link_rejected(output);
+    assert!(!physical_destination.exists() && !lexical_destination.exists());
+}
+
+/// Validation continues after a missing component because a later `..` can
+/// return to the anchor and expose an existing link that must still be caught.
+#[cfg(unix)]
+#[test]
+fn a_symlink_reached_after_missing_and_parent_is_rejected_before_plan_or_write() {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let from = scratch.path().join("from");
+    let active_home = scratch.path().join("active-home");
+    seed_real_home_with_claude_skill(&scratch, &from, "alpha");
+
+    let outside = scratch.path().join("outside");
+    fs::create_dir_all(&outside).expect("create symlink target");
+    let link = scratch.path().join("link-after-missing");
+    std::os::unix::fs::symlink(&outside, &link).expect("create directory symlink");
+    let missing = scratch.path().join("missing");
+    let requested_to = missing
+        .join("..")
+        .join("link-after-missing")
+        .join("destination");
+
+    let output = cli(scratch.path(), &active_home)
+        .args([
+            "--json",
+            "configs",
+            "copy",
+            from.to_str().expect("utf8 from path"),
+            requested_to.to_str().expect("utf8 destination path"),
+            "--yes",
+        ])
+        .output()
+        .expect("run configs copy");
+    assert_destination_link_rejected(output);
+    assert!(!outside.join("destination").exists() && !missing.exists());
+}
+
+/// File-recipe provenance keeps the recipe directory ambient and the raw
+/// `link/../destination` expression strict until command-level validation.
+#[cfg(unix)]
+#[test]
+fn a_recipe_destination_preserves_symlink_before_parent_until_strict_validation() {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let from = scratch.path().join("from");
+    let active_home = scratch.path().join("active-home");
+    seed_real_home_with_claude_skill(&scratch, &from, "alpha");
+
+    let recipe_dir = scratch.path().join("recipes");
+    fs::create_dir_all(&recipe_dir).expect("create recipe directory");
+    let real_root = scratch.path().join("real-root");
+    let inner = real_root.join("inner");
+    fs::create_dir_all(&inner).expect("create symlink target");
+    std::os::unix::fs::symlink(&inner, recipe_dir.join("link"))
+        .expect("create recipe-side symlink");
+    let recipe = serde_json::json!({
+        "command": "configs.copy",
+        "from": from,
+        "to": "link/../destination",
+        "yes": true,
+    });
+    fs::write(recipe_dir.join("seed.json"), recipe.to_string()).expect("write recipe file");
+
+    let output = cli(&recipe_dir, &active_home)
+        .args(["--input", "seed.json"])
+        .output()
+        .expect("run configs copy recipe");
+    assert_destination_link_rejected(output);
+    assert!(!real_root.join("destination").exists() && !recipe_dir.join("destination").exists());
 }
 
 /// Windows regression for the rejected dangling-`TO` bypass: path resolution

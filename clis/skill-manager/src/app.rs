@@ -501,7 +501,7 @@ where
         // `<FROM>` alias the active home, so the active home must never gain
         // migration markers or lock files as a side effect of this command.
         let from = self.resolve_seed_directory(&args.from)?;
-        let to = self.resolve_seed_destination(&args.to)?;
+        let to = self.resolve_seed_destination(&args.to, args.to_base.as_deref())?;
 
         if !from.is_dir() {
             return Err(SkillManagerError::InvalidInput(format!(
@@ -791,17 +791,15 @@ where
         absolute_path(expand_home(raw, &self.home))
     }
 
-    /// Resolve a `configs copy` `<TO>` argument without allowing its original
-    /// spelling to pass through a link. Unlike ordinary path operands, every
-    /// existing component of a seed destination is security-sensitive: even a
-    /// dangling junction could redirect the later `create_dir_all` outside
-    /// `<TO>`. Validate that component walk before physical normalization so
-    /// the link itself is not lost when [`absolute_path`] follows it.
-    fn resolve_seed_destination(&self, raw: &str) -> Result<PathBuf> {
-        let absolute = make_absolute(expand_home(raw, &self.home))?;
-        reject_linked_path_components(&absolute)?;
-        let resolved = canonicalize_existing_ancestor(&absolute)?;
-        Ok(normalize_verified_seed_destination(&resolved))
+    /// Resolve a `configs copy` `<TO>` through an explicit trust boundary.
+    ///
+    /// The existing ambient namespace is resolved physically first, so a
+    /// platform alias such as macOS `/var -> /private/var` does not make an
+    /// otherwise ordinary destination fail. The preserved destination-side
+    /// expression is then walked with no-follow metadata before any lexical
+    /// normalization can erase a link or junction followed by `..`.
+    fn resolve_seed_destination(&self, raw: &str, recipe_base: Option<&Path>) -> Result<PathBuf> {
+        SeedDestination::from_input(raw, &self.home, recipe_base)?.resolve()
     }
 
     /// Discover which configuration decides `configs copy`'s target
@@ -8683,59 +8681,216 @@ fn make_absolute(path: PathBuf) -> Result<PathBuf> {
     Ok(absolute)
 }
 
-/// Reject any link-like component present in the original absolute spelling
-/// of a security-sensitive destination.
+/// A security-sensitive `configs copy` destination split at an explicit trust
+/// boundary.
 ///
-/// Components continue to be inspected after a missing entry: a later `..`
-/// can return to an existing ancestor, after which another link could still be
-/// traversed by the operating system. A link is rejected before applying a
-/// following `..`, which is the distinction lost if the path is canonicalized
-/// first.
-fn reject_linked_path_components(path: &Path) -> Result<()> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
-                current.push(component.as_os_str());
-            }
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                current.pop();
-            }
-            std::path::Component::Normal(name) => {
-                current.push(name);
-                reject_link(&current)?;
-            }
-        }
-    }
-    Ok(())
+/// `anchor` is an existing ambient namespace prefix that has already been
+/// resolved physically. `expression` retains the raw, destination-controlled
+/// components that must be inspected without following links. Carrying both
+/// until [`Self::resolve`] preserves the spelling evidence needed for strict
+/// validation while still producing one normalized effective destination for
+/// every later containment check, plan/event path, preflight, and write.
+struct SeedDestination {
+    anchor: PathBuf,
+    expression: PathBuf,
 }
 
-/// Normalize the effective `configs copy` destination after its original
-/// component walk has been proven link-free.
+impl SeedDestination {
+    /// Separate one raw destination into its ambient prefix and controlled
+    /// expression, then resolve the ambient prefix physically.
+    fn from_input(raw: &str, home: &Path, recipe_base: Option<&Path>) -> Result<Self> {
+        let path = Path::new(raw);
+        let (ambient, expression) =
+            if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
+                let expression = if raw == "~" {
+                    PathBuf::new()
+                } else {
+                    PathBuf::from(&raw[2..])
+                };
+                (home.to_path_buf(), expression)
+            } else if path.is_absolute() {
+                split_absolute_seed_destination(path)
+            } else {
+                let ambient = match recipe_base {
+                    Some(base) => base.to_path_buf(),
+                    None => std::env::current_dir()
+                        .map_err(|error| SkillManagerError::io(".", error))?,
+                };
+                (ambient, path.to_path_buf())
+            };
+        let ambient = make_absolute(ambient)?;
+        let (ambient, expression) = widen_seed_anchor_for_parents(ambient, expression);
+        let (anchor, expression) = resolve_seed_ambient_prefix(ambient, expression)?;
+        Ok(Self { anchor, expression })
+    }
+
+    /// Walk the destination-controlled expression without following links and
+    /// return the one normalized path the filesystem will actually reach.
+    fn resolve(self) -> Result<PathBuf> {
+        let mut effective = self.anchor.clone();
+        let mut depth = 0_usize;
+        for component in self.expression.components() {
+            match component {
+                std::path::Component::Normal(name) => {
+                    effective.push(name);
+                    // Inspect before a later `..` can erase this component.
+                    // `symlink_metadata` also sees dangling links and Windows
+                    // junctions, so neither form can redirect the write.
+                    reject_link(&effective)?;
+                    depth += 1;
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if depth == 0 {
+                        return Err(SkillManagerError::InvalidInput(format!(
+                            "seed destination path escapes its ambient anchor: {}",
+                            self.anchor.display()
+                        )));
+                    }
+                    let _removed = effective.pop();
+                    depth -= 1;
+                }
+                std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                    return Err(SkillManagerError::InvalidInput(
+                        "seed destination expression must be relative to its ambient anchor"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(effective)
+    }
+}
+
+/// Widen a relative/home trust boundary just enough to preserve ordinary `..`
+/// semantics without ever letting strict traversal pop the physical anchor.
 ///
-/// [`canonicalize_existing_ancestor`] intentionally keeps a missing tail
-/// literal, including `.` and `..`, because resolving such a tail is unsound
-/// for generic paths that may have traversed a link. The stricter seed
-/// destination pipeline has already rejected every link-like original
-/// component, so lexical normalization is safe here and necessary: recursion
-/// guards, plan paths, and writes must all use the same path the filesystem
-/// will reach for `missing/../...`.
-fn normalize_verified_seed_destination(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
+/// For example, a recipe at `recipes/seed.json` may intentionally name
+/// `../scratch`. Moving `recipes` from the ambient side into the preserved
+/// expression yields an anchor at the recipe directory's parent and an
+/// expression of `recipes/../scratch`; the later walk reaches the same path,
+/// but can now prove that no `ParentDir` escaped its anchor. If the filesystem
+/// root is reached first, the unmatched `..` stays in the expression and is
+/// rejected by [`SeedDestination::resolve`].
+fn widen_seed_anchor_for_parents(mut ambient: PathBuf, expression: PathBuf) -> (PathBuf, PathBuf) {
+    let mut depth = 0_isize;
+    let mut required = 0_usize;
+    for component in expression.components() {
         match component {
-            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
-                normalized.push(component.as_os_str());
-            }
-            std::path::Component::CurDir => {}
+            std::path::Component::Normal(_) => depth += 1,
             std::path::Component::ParentDir => {
-                let _removed = normalized.pop();
+                depth -= 1;
+                if depth < 0 {
+                    required = required.max(depth.unsigned_abs());
+                }
             }
-            std::path::Component::Normal(name) => normalized.push(name),
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::CurDir => {}
         }
     }
-    normalized
+
+    let mut moved = Vec::new();
+    for _ in 0..required {
+        let (Some(name), Some(parent)) = (ambient.file_name(), ambient.parent()) else {
+            break;
+        };
+        moved.push(name.to_os_string());
+        ambient = parent.to_path_buf();
+    }
+    let mut controlled = PathBuf::new();
+    for name in moved.iter().rev() {
+        controlled.push(name);
+    }
+    controlled.push(expression);
+    (ambient, controlled)
+}
+
+/// Split an absolute destination so its pre-existing parent namespace is
+/// ambient while the destination itself remains strictly controlled.
+///
+/// At least the last normal component stays in the expression, which retains
+/// direct existing and dangling `<TO>` links for rejection. Any normal
+/// component consumed by a raw `..` also stays in the expression, together
+/// with everything after it, so `link/../destination` can never be normalized
+/// before `link` is inspected. If that ambient candidate is partly missing,
+/// [`resolve_seed_ambient_prefix`] moves the missing tail across the boundary
+/// too; only an existing prefix is ever trusted and canonicalized.
+fn split_absolute_seed_destination(path: &Path) -> (PathBuf, PathBuf) {
+    let components = path.components().collect::<Vec<_>>();
+    let mut controlled_start = components
+        .iter()
+        .rposition(|component| matches!(component, std::path::Component::Normal(_)))
+        .unwrap_or(components.len());
+    let mut normal_components = Vec::new();
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            std::path::Component::Normal(_) => normal_components.push(index),
+            std::path::Component::ParentDir => {
+                if let Some(consumed) = normal_components.pop() {
+                    controlled_start = controlled_start.min(consumed);
+                } else {
+                    controlled_start = controlled_start.min(index);
+                }
+            }
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::CurDir => {}
+        }
+    }
+
+    let mut ambient = PathBuf::new();
+    for component in &components[..controlled_start] {
+        if !matches!(component, std::path::Component::CurDir) {
+            ambient.push(component.as_os_str());
+        }
+    }
+    let mut expression = PathBuf::new();
+    for component in &components[controlled_start..] {
+        expression.push(component.as_os_str());
+    }
+    (ambient, expression)
+}
+
+/// Find and physically resolve the existing part of an ambient prefix.
+///
+/// Missing trailing names are transferred, in order, to the strict expression
+/// instead of being trusted. Existing ambient aliases are canonicalized with
+/// ordinary link-following semantics; this is the platform-neutral boundary
+/// that permits namespace spellings such as macOS `/var` without classifying
+/// links by ownership or hardcoding a particular path.
+fn resolve_seed_ambient_prefix(
+    mut ambient: PathBuf,
+    mut expression: PathBuf,
+) -> Result<(PathBuf, PathBuf)> {
+    loop {
+        match std::fs::symlink_metadata(&ambient) {
+            Ok(_) => {
+                let anchor = ambient
+                    .canonicalize()
+                    .map(|path| portable_path(&path))
+                    .map_err(|error| SkillManagerError::io(&ambient, error))?;
+                return Ok((anchor, expression));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = ambient.file_name().ok_or_else(|| {
+                    SkillManagerError::InvalidInput(format!(
+                        "seed destination has no existing ambient anchor: {}",
+                        ambient.display()
+                    ))
+                })?;
+                let mut controlled = PathBuf::from(name);
+                controlled.push(expression);
+                expression = controlled;
+                ambient = ambient.parent().map(Path::to_path_buf).ok_or_else(|| {
+                    SkillManagerError::InvalidInput(
+                        "seed destination has no existing ambient anchor".to_owned(),
+                    )
+                })?;
+            }
+            Err(error) => return Err(SkillManagerError::io(&ambient, error)),
+        }
+    }
 }
 
 /// Canonicalize the longest existing ancestor of `path` component by
@@ -8877,7 +9032,7 @@ mod tests {
     use indexmap::IndexMap;
 
     use super::{
-        Application, RunOutcome, absolute_path, command_dry_run, find_named_key,
+        Application, RunOutcome, SeedDestination, absolute_path, command_dry_run, find_named_key,
         normalized_patterns, path_is_within, set_target_enabled, skill_action_data, source_data,
         source_matches, status_matches, target_data, title_case,
     };
@@ -9417,6 +9572,26 @@ mod tests {
                 .to_string()
                 .contains("too many levels of symbolic links"),
             "cycle failure must explain the bounded link traversal: {error}"
+        );
+    }
+
+    #[test]
+    fn seed_destination_rejects_parent_dir_that_escapes_its_anchor() {
+        let anchor = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let destination = SeedDestination {
+            anchor: portable_canonicalize(anchor.path()),
+            expression: PathBuf::from("..").join("outside"),
+        };
+        let error = match destination.resolve() {
+            Ok(path) => unreachable!(
+                "ParentDir escaped the destination trust boundary to {}",
+                path.display()
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("escapes its ambient anchor"),
+            "anchor escape must be an actionable validation error: {error}"
         );
     }
 
