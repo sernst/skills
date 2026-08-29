@@ -898,6 +898,73 @@ fn destination_inside_the_configuration_root_is_rejected() {
         .stderr(predicate::str::contains("recurse"));
 }
 
+/// A missing destination component makes generic ancestor resolution retain
+/// the remaining tail literally. Once the strict destination walk has proved
+/// that original tail link-free, `configs copy` must normalize it before both
+/// recursion checks and writes. Otherwise `missing/../from/.skill-manager/...`
+/// looks unrelated to `<FROM>` during preflight but reaches it during apply.
+#[test]
+fn a_parent_in_an_unresolved_destination_tail_cannot_bypass_recursion_rejection() {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let from = scratch.path().join("from");
+    let active_home = scratch.path().join("active-home");
+    seed_real_home_with_claude_skill(&scratch, &from, "alpha");
+    let from_before = snapshot(&from);
+
+    let missing = scratch.path().join("missing");
+    let effective_destination = from.join(".skill-manager").join("nested");
+    let requested_to = missing
+        .join("..")
+        .join("from")
+        .join(".skill-manager")
+        .join("nested");
+    assert!(
+        !missing.exists(),
+        "fixture requires an unresolved first component"
+    );
+
+    let output = cli(scratch.path(), &active_home)
+        .args([
+            "--json",
+            "configs",
+            "copy",
+            from.to_str().expect("utf8 from path"),
+            requested_to.to_str().expect("utf8 destination path"),
+            "--yes",
+        ])
+        .output()
+        .expect("run configs copy");
+    assert!(
+        !output.status.success(),
+        "an unresolved tail that reaches a copied source root must hard-fail"
+    );
+
+    let lines = events(output);
+    assert!(
+        !lines.iter().any(|event| event["event"] == "plan"),
+        "recursion validation must fail before the plan"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|event| event["event"] == "configs.copy.item"),
+        "recursion validation must fail before apply"
+    );
+    assert!(
+        lines.iter().any(|event| event["event"] == "command.failed"),
+        "the recursion rejection must be reported as a hard failure"
+    );
+    assert_eq!(
+        snapshot(&from),
+        from_before,
+        "the rejected copy must not mutate its source"
+    );
+    assert!(
+        !effective_destination.exists() && !missing.exists(),
+        "the rejected copy must not create either the effective destination or unresolved prefix"
+    );
+}
+
 /// The headline case (finding N): a destination that lives under `<FROM>` — as
 /// a repo or `TEMP` directory under the user's home routinely does — but
 /// OUTSIDE every copied root must SUCCEED. This is `configs copy ~ ./temp/...`,
@@ -1240,6 +1307,66 @@ fn a_junction_component_before_parent_in_to_is_rejected_before_plan_or_write() {
     assert!(
         !physical_destination.exists() && !lexical_destination.exists(),
         "the rejected command must not write to either interpretation of the destination"
+    );
+}
+
+/// A file recipe is a distinct carrier for `<TO>`: rebasing it against the
+/// recipe directory must retain `junction/..` until the strict destination
+/// walk has inspected the junction. This locks the command boundary, not just
+/// the recipe helper, and verifies that validation precedes plan and apply.
+#[cfg(windows)]
+#[test]
+fn a_recipe_destination_preserves_junction_before_parent_until_strict_validation() {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let from = scratch.path().join("from");
+    let active_home = scratch.path().join("active-home");
+    seed_real_home_with_claude_skill(&scratch, &from, "alpha");
+
+    let recipe_dir = scratch.path().join("recipes");
+    fs::create_dir_all(&recipe_dir).expect("create recipe directory");
+    let real_root = scratch.path().join("real-root");
+    let inner = real_root.join("inner");
+    fs::create_dir_all(&inner).expect("create junction target");
+    let junction = recipe_dir.join("junction");
+    make_junction(&inner, &junction);
+
+    let recipe = serde_json::json!({
+        "command": "configs.copy",
+        "from": from,
+        "to": "junction/../destination",
+        "yes": true,
+    });
+    fs::write(recipe_dir.join("seed.json"), recipe.to_string()).expect("write recipe file");
+
+    let physical_destination = real_root.join("destination");
+    let lexical_destination = recipe_dir.join("destination");
+    let output = cli(&recipe_dir, &active_home)
+        .args(["--input", "seed.json"])
+        .output()
+        .expect("run configs copy recipe");
+    assert!(
+        !output.status.success(),
+        "a recipe-carried junction component in <TO> must hard-fail"
+    );
+
+    let lines = events(output);
+    assert!(
+        !lines.iter().any(|event| event["event"] == "plan"),
+        "recipe destination validation must fail before the plan"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|event| event["event"] == "configs.copy.item"),
+        "recipe destination validation must fail before apply"
+    );
+    assert!(
+        lines.iter().any(|event| event["event"] == "command.failed"),
+        "the recipe destination rejection must be reported as a hard failure"
+    );
+    assert!(
+        !physical_destination.exists() && !lexical_destination.exists(),
+        "the rejected recipe must not write to either interpretation of the destination"
     );
 }
 

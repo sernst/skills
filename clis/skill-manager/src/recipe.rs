@@ -623,24 +623,38 @@ fn overlay_configs_copy(
     if args.to.is_empty()
         && let Some(to) = to
     {
-        args.to = rebase_seed_path(&to, base);
+        args.to = rebase_seed_destination_path(&to, base);
     }
     Ok(())
 }
 
-/// Rebase a `configs copy` `from`/`to` recipe field the same way `--input
-/// FILE` rebases other path-bearing recipe fields such as `copy.destination`:
-/// a genuinely relative filesystem path is resolved against the recipe
-/// file's directory. An absolute path or a `~`-prefixed reference is passed
-/// through unchanged, exactly like [`rebase_reference`] treats a leading
-/// `~`, so [`crate::config::expand_home`] can still expand it against the
-/// active `--home` later, the same as an equivalent CLI argument would.
+/// Rebase a `configs copy` `from` recipe field the same way `--input FILE`
+/// rebases other path-bearing recipe fields such as `copy.destination`: a
+/// genuinely relative path is resolved against the recipe file's directory.
+/// Absolute and `~`-prefixed paths pass through unchanged so home expansion
+/// can still use the active `--home` later.
 fn rebase_seed_path(raw: &str, base: &Path) -> String {
     let path = Path::new(raw);
     if path.is_absolute() || raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
         return raw.to_owned();
     }
     resolve_path(path, base).to_string_lossy().into_owned()
+}
+
+/// Rebase a `configs copy` destination without discarding its original path
+/// components. Unlike ordinary recipe paths, `<TO>` has a strict security
+/// policy: every link/junction in the caller's component walk must be rejected
+/// even when a later `..` leaves that component. [`resolve_path`] would erase
+/// that evidence before `resolve_seed_destination` can inspect it, so a
+/// relative destination is joined to the recipe directory but deliberately
+/// not normalized here. Absolute and `~`-prefixed destinations keep the same
+/// pass-through behavior as [`rebase_seed_path`].
+fn rebase_seed_destination_path(raw: &str, base: &Path) -> String {
+    let path = Path::new(raw);
+    if path.is_absolute() || raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
+        return raw.to_owned();
+    }
+    base.join(path).to_string_lossy().into_owned()
 }
 
 fn overlay_source_selection(
@@ -1561,7 +1575,7 @@ mod tests {
         let recipe_path = recipes.join("configs-copy.json");
         std::fs::write(
             &recipe_path,
-            r#"{"command":"configs.copy","from":"~","to":"./scratch","include_cache":true,"yes":true}"#,
+            r#"{"command":"configs.copy","from":"~","to":"junction/../scratch","include_cache":true,"yes":true}"#,
         )
         .unwrap_or_else(|error| unreachable!("{error}"));
         let mut cli =
@@ -1579,8 +1593,13 @@ mod tests {
             "a bare ~ must pass through unrebased so expand_home can apply --home"
         );
         assert_eq!(
-            copy.to,
-            resolve_path(Path::new("./scratch"), &recipes).to_string_lossy()
+            Path::new(&copy.to),
+            recipes
+                .join("junction")
+                .join("..")
+                .join("scratch")
+                .as_path(),
+            "configs.copy must preserve destination components for strict link validation"
         );
         assert!(copy.include_cache);
         assert!(copy.yes);

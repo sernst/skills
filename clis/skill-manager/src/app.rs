@@ -800,7 +800,8 @@ where
     fn resolve_seed_destination(&self, raw: &str) -> Result<PathBuf> {
         let absolute = make_absolute(expand_home(raw, &self.home))?;
         reject_linked_path_components(&absolute)?;
-        canonicalize_existing_ancestor(&absolute)
+        let resolved = canonicalize_existing_ancestor(&absolute)?;
+        Ok(normalize_verified_seed_destination(&resolved))
     }
 
     /// Discover which configuration decides `configs copy`'s target
@@ -8708,6 +8709,33 @@ fn reject_linked_path_components(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Normalize the effective `configs copy` destination after its original
+/// component walk has been proven link-free.
+///
+/// [`canonicalize_existing_ancestor`] intentionally keeps a missing tail
+/// literal, including `.` and `..`, because resolving such a tail is unsound
+/// for generic paths that may have traversed a link. The stricter seed
+/// destination pipeline has already rejected every link-like original
+/// component, so lexical normalization is safe here and necessary: recursion
+/// guards, plan paths, and writes must all use the same path the filesystem
+/// will reach for `missing/../...`.
+fn normalize_verified_seed_destination(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let _removed = normalized.pop();
+            }
+            std::path::Component::Normal(name) => normalized.push(name),
+        }
+    }
+    normalized
 }
 
 /// Canonicalize the longest existing ancestor of `path` component by
