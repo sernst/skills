@@ -140,6 +140,7 @@ state.
 
 - [Configuration and filesystem safety](./clis/skill-manager/docs/configuration.md)
 - [Human CLI reference](./clis/skill-manager/docs/cli.md)
+- [Why skill-manager: flexible sources and stateful inventory](./clis/skill-manager/docs/source-flexibility.md)
 - [NDJSON and automation contract](./clis/skill-manager/docs/json.md)
 - [Goal-oriented cheatsheet](./cheatsheet.skill-manager.md)
 - [Using skill-manager through an agent](./docs/agent-usage.md)

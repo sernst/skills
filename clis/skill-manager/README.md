@@ -10,6 +10,9 @@ goal-oriented examples. Agents can use the
 conversational operation after following the
 [agent usage guide](../../docs/agent-usage.md).
 
+For the product rationale behind flexible sources and the stateful inventory,
+see [Why skill-manager: flexible sources and stateful inventory](docs/source-flexibility.md).
+
 ## Install
 
 Install with the default macOS/Linux or Windows one-liner in the repository
