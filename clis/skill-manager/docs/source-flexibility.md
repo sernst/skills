@@ -9,7 +9,7 @@ of what is available and what is deployed.
 
 ## Sources are ordered, identifiable inputs
 
-Sources can point at local files or GitHub. A GitHub source can select a
+Sources can point at local directories or GitHub. A GitHub source can select a
 repository subpath, and either kind can be configured as a collection (skill
 directories immediately below the source root) or as a single skill (the source
 root itself). A source can also retain an inactive alternate location: for
