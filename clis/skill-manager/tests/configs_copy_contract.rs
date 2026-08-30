@@ -855,18 +855,109 @@ fn destination_that_is_a_file_is_a_clean_error() {
     let active_home = scratch.path().join("active-home");
     seed_real_home_with_claude_skill(&scratch, &from, "alpha");
     write_file(&to, "not a directory\n");
+    let before = fs::read(&to).expect("read destination fixture");
 
-    cli(scratch.path(), &active_home)
+    let output = cli(scratch.path(), &active_home)
         .args([
+            "--json",
             "configs",
             "copy",
             from.to_str().expect("utf8 from path"),
             to.to_str().expect("utf8 to path"),
             "--yes",
         ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("not a directory"));
+        .output()
+        .expect("run configs copy");
+    assert!(!output.status.success(), "a file destination must fail");
+
+    let lines = events(output);
+    assert!(
+        lines.iter().any(|event| {
+            event["event"] == "command.failed"
+                && event["data"]["message"].as_str().is_some_and(|message| {
+                    message.contains("seed destination")
+                        && message.contains("exists and is not a directory")
+                })
+        }),
+        "a file destination must be an actionable validation error"
+    );
+    assert!(
+        !lines.iter().any(|event| event["event"] == "plan"),
+        "a file destination must fail before the plan"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|event| event["event"] == "configs.copy.item"),
+        "a file destination must fail before apply"
+    );
+    assert_eq!(
+        fs::read(&to).expect("read destination after failure"),
+        before,
+        "a file destination must remain unchanged"
+    );
+}
+
+/// Linux reports ENOTDIR when destination resolution reaches a child below a
+/// regular-file `<TO>`. That structural failure must stay in the same clean
+/// input-error class as a directly supplied file destination, before any plan
+/// or mutation is possible.
+#[cfg(unix)]
+#[test]
+fn destination_child_below_a_file_is_a_clean_error_without_mutation() {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let from = scratch.path().join("from");
+    let to_file = scratch.path().join("to-is-a-file");
+    let to = to_file.join("child");
+    let active_home = scratch.path().join("active-home");
+    seed_real_home_with_claude_skill(&scratch, &from, "alpha");
+    write_file(&to_file, "not a directory\n");
+    let before = fs::read(&to_file).expect("read destination fixture");
+
+    let output = cli(scratch.path(), &active_home)
+        .args([
+            "--json",
+            "configs",
+            "copy",
+            from.to_str().expect("utf8 from path"),
+            to.to_str().expect("utf8 to path"),
+            "--yes",
+        ])
+        .output()
+        .expect("run configs copy");
+    assert!(
+        !output.status.success(),
+        "a child below a file destination must fail"
+    );
+
+    let lines = events(output);
+    assert!(
+        lines.iter().any(|event| {
+            event["event"] == "command.failed"
+                && event["data"]["message"].as_str().is_some_and(|message| {
+                    message.contains(&format!(
+                        "seed destination {} exists and is not a directory",
+                        to_file.display()
+                    ))
+                })
+        }),
+        "ENOTDIR must be reported as the clean destination validation error"
+    );
+    assert!(
+        !lines.iter().any(|event| event["event"] == "plan"),
+        "ENOTDIR must fail before the plan"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|event| event["event"] == "configs.copy.item"),
+        "ENOTDIR must fail before apply"
+    );
+    assert_eq!(
+        fs::read(&to_file).expect("read destination after failure"),
+        before,
+        "ENOTDIR must not mutate the blocking destination file"
+    );
 }
 
 /// A destination inside a source root that is ACTUALLY copied (here the

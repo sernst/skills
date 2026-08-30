@@ -6332,8 +6332,23 @@ fn reject_link(path: &Path) -> Result<()> {
         ))),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // Every caller walks one structural path component at a time. If the
+        // metadata lookup for that child reports `NotADirectory`, its parent
+        // is the existing file that blocks the destination. Surface the same
+        // actionable validation error as an explicitly observed file instead
+        // of leaking a platform-specific filesystem error.
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => Err(
+            seed_destination_not_directory(path.parent().unwrap_or(path)),
+        ),
         Err(error) => Err(SkillManagerError::io(path, error)),
     }
+}
+
+fn seed_destination_not_directory(path: &Path) -> SkillManagerError {
+    SkillManagerError::InvalidInput(format!(
+        "seed destination {} exists and is not a directory",
+        path.display()
+    ))
 }
 
 /// Whether `metadata` describes a filesystem link that path resolution may
@@ -8802,10 +8817,18 @@ fn canonicalize_verified_seed_destination(anchor: &Path, path: &Path) -> Result<
                             candidate.display()
                         )));
                     }
+                    Ok(metadata) if !metadata.is_dir() => {
+                        return Err(seed_destination_not_directory(&candidate));
+                    }
                     Ok(_) => existing = candidate,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         found_missing = true;
                         missing_tail.push(name);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+                        return Err(seed_destination_not_directory(
+                            candidate.parent().unwrap_or(&candidate),
+                        ));
                     }
                     Err(error) => return Err(SkillManagerError::io(&candidate, error)),
                 }
@@ -9686,6 +9709,30 @@ mod tests {
                 .join("MissingTail")
                 .join("LiteralLeaf"),
             "only the deepest existing ancestor should receive physical filesystem spelling"
+        );
+    }
+
+    #[test]
+    fn seed_destination_rejects_a_child_below_a_file_as_invalid_input() {
+        let sandbox = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let file = sandbox.path().join("not-a-directory");
+        std::fs::write(&file, "fixture").unwrap_or_else(|error| unreachable!("{error}"));
+        let destination = SeedDestination {
+            anchor: portable_canonicalize(&file),
+            expression: PathBuf::from("child"),
+        };
+
+        let error = match destination.resolve() {
+            Ok(path) => unreachable!("file prefix resolved unexpectedly to {}", path.display()),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SkillManagerError::InvalidInput(_)));
+        assert!(
+            error.to_string().contains(&format!(
+                "seed destination {} exists and is not a directory",
+                file.display()
+            )),
+            "a child below a file must name the blocking file: {error}"
         );
     }
 
