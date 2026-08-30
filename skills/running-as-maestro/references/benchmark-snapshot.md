@@ -4,14 +4,14 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-08-25T12:12:08Z`
+- Retrieved after semantic change: `2026-08-30T14:24:47Z`
 - Parser version: `5`
-- Normalized SHA-256: `d97932cbfc8214a43978dba8e70293ddad516c4c5676ae4d0025bae026035d18`
+- Normalized SHA-256: `911ec47c635328e8b1c7100274bbcf45180ba37aac20a9ff09c3da960e6aee69`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
 
-Source: [DeepSWE](https://deepswe.datacurve.ai/) · version `1.1` · source updated `2026-08-20T07:48:24Z` · tasks `113` · normalized SHA-256 `5e42f049803a87646a743077e700a1c7d1314bfde41d8885d59042e83db42380`
+Source: [DeepSWE](https://deepswe.datacurve.ai/) · version `1.1` · source updated `2026-08-26T07:38:24Z` · tasks `113` · normalized SHA-256 `d300e85505ccbcd7bd1fc87c6e4347aa2c525215fbb82b790b9bdf74e92742bd`
 
 Metric: `pass@1` · Autonomous software-engineering rollouts; score is attempt pass@1. Confidence intervals are run-to-run estimates; provider, verifier, and network errors are excluded.
 
@@ -41,6 +41,7 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 | gemini-3-7-flash | high | 65.27% | $2.176 | 95% CI 63.48–67.05%; n=452; runs=4 |  |
 | grok-4-6 | high | 65.19% | $4.385 | 95% CI 63.65–66.72%; n=451; runs=4 |  |
 | gpt-5-5 | high | 64.38% | $5.100 | 95% CI 61.26–67.50%; n=452; runs=4 |  |
+| glm-5-3-flash | max | 63.39% | $0.482 | 95% CI 59.01–67.77%; n=448; runs=4 | ★ |
 | deepseek-v4-pro | max | 62.83% | $0.241 | 95% CI 56.50–69.17%; n=452; runs=4 | ★ |
 | gpt-5-6-sol | medium | 61.06% | $1.862 | 95% CI 59.48–62.65%; n=452; runs=4 |  |
 | gpt-5-6-terra | xhigh | 60.18% | $2.127 | 95% CI 58.05–62.30%; n=452; runs=4 |  |
