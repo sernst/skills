@@ -9733,8 +9733,9 @@ mod tests {
         let sandbox = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
         let file = sandbox.path().join("not-a-directory");
         std::fs::write(&file, "fixture").unwrap_or_else(|error| unreachable!("{error}"));
+        let canonical_file = portable_canonicalize(&file);
         let destination = SeedDestination {
-            anchor: portable_canonicalize(&file),
+            anchor: canonical_file.clone(),
             expression: PathBuf::from("child"),
         };
 
@@ -9742,13 +9743,15 @@ mod tests {
             Ok(path) => unreachable!("file prefix resolved unexpectedly to {}", path.display()),
             Err(error) => error,
         };
-        assert!(matches!(error, SkillManagerError::InvalidInput(_)));
-        assert!(
-            error.to_string().contains(&format!(
+        let SkillManagerError::InvalidInput(message) = error else {
+            unreachable!("a child below a file must return invalid input")
+        };
+        assert_eq!(
+            message,
+            format!(
                 "seed destination {} exists and is not a directory",
-                file.display()
-            )),
-            "a child below a file must name the blocking file: {error}"
+                canonical_file.display()
+            )
         );
     }
 
