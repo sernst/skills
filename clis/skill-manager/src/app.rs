@@ -6332,11 +6332,27 @@ fn reject_link(path: &Path) -> Result<()> {
         ))),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        // Every caller walks one structural path component at a time. If the
-        // metadata lookup for that child reports `NotADirectory`, its parent
-        // is the existing file that blocks the destination. Surface the same
-        // actionable validation error as an explicitly observed file instead
-        // of leaking a platform-specific filesystem error.
+        Err(error) => Err(SkillManagerError::io(path, error)),
+    }
+}
+
+/// Validate one raw `SeedDestination` path component without following links.
+///
+/// This is deliberately stricter than [`reject_link`]. The raw walk sees each
+/// component before a later `..` can erase it, so it can name a regular file
+/// that blocks traversal even when that component would not survive into the
+/// normalized path handed to physical canonicalization.
+fn validate_seed_destination_component(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if is_link_like(&metadata) => Err(SkillManagerError::InvalidInput(format!(
+            "seed destination path must not be a link: {}",
+            path.display()
+        ))),
+        Ok(metadata) if !metadata.is_dir() => Err(seed_destination_not_directory(path)),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // The raw walk itself constructs candidates one component at a time,
+        // so this parent is the exact existing file that prevented descent.
         Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => Err(
             seed_destination_not_directory(path.parent().unwrap_or(path)),
         ),
@@ -8758,7 +8774,7 @@ impl SeedDestination {
                     // Inspect before a later `..` can erase this component.
                     // `symlink_metadata` also sees dangling links and Windows
                     // junctions, so neither form can redirect the write.
-                    reject_link(&effective)?;
+                    validate_seed_destination_component(&effective)?;
                     depth += 1;
                 }
                 std::path::Component::CurDir => {}

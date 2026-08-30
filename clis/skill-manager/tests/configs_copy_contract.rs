@@ -898,6 +898,74 @@ fn destination_that_is_a_file_is_a_clean_error() {
     );
 }
 
+/// Destination validation must inspect each raw component before normalizing
+/// `..`. Otherwise a regular file in `file/../destination` disappears from
+/// the later physical-resolution pass and the command can reach planning or
+/// writing through a structurally invalid path.
+#[test]
+fn destination_file_erased_by_parent_dir_is_a_clean_error_without_mutation() {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let from = scratch.path().join("from");
+    let destination_parent = scratch.path().join("destination-parent");
+    let to_file = destination_parent.join("to-is-a-file");
+    let to = to_file.join("..").join("destination");
+    let active_home = scratch.path().join("active-home");
+    seed_real_home_with_claude_skill(&scratch, &from, "alpha");
+    write_file(&to_file, "not a directory\n");
+    let source_before = snapshot(&from);
+    let destination_before = snapshot(&destination_parent);
+
+    let output = cli(scratch.path(), &active_home)
+        .args([
+            "--json",
+            "configs",
+            "copy",
+            from.to_str().expect("utf8 from path"),
+            to.to_str().expect("utf8 to path"),
+            "--yes",
+        ])
+        .output()
+        .expect("run configs copy");
+    assert!(
+        !output.status.success(),
+        "a raw destination component below a file must fail"
+    );
+
+    let lines = events(output);
+    assert!(
+        lines.iter().any(|event| {
+            event["event"] == "command.failed"
+                && event["data"]["message"].as_str().is_some_and(|message| {
+                    message.contains(&format!(
+                        "seed destination {} exists and is not a directory",
+                        to_file.display()
+                    ))
+                })
+        }),
+        "the raw component validation must name the exact blocking file"
+    );
+    assert!(
+        !lines.iter().any(|event| event["event"] == "plan"),
+        "raw destination validation must fail before the plan"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|event| event["event"] == "configs.copy.item"),
+        "raw destination validation must fail before apply"
+    );
+    assert_eq!(
+        snapshot(&from),
+        source_before,
+        "raw destination validation must not mutate the source"
+    );
+    assert_eq!(
+        snapshot(&destination_parent),
+        destination_before,
+        "raw destination validation must not mutate the destination"
+    );
+}
+
 /// Linux reports ENOTDIR when destination resolution reaches a child below a
 /// regular-file `<TO>`. That structural failure must stay in the same clean
 /// input-error class as a directly supplied file destination, before any plan
