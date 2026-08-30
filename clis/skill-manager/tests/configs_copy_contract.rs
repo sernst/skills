@@ -16,6 +16,10 @@ use predicates::prelude::*;
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod support;
+
+use support::portable_canonicalize;
+
 /// Every invocation passes `--home` pointed at a scratch temp directory and
 /// additionally overrides `HOME`/`USERPROFILE`/`SKILL_MANAGER_HOME` to the
 /// same scratch directory as defense in depth, so no invocation in this file
@@ -41,6 +45,41 @@ fn events(output: std::process::Output) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("NDJSON event"))
         .collect()
+}
+
+fn assert_destination_file_rejected(output: std::process::Output, expected: &Path) -> Vec<Value> {
+    const PREFIX: &str = "seed destination ";
+    const SUFFIX: &str = " exists and is not a directory";
+
+    let lines = events(output);
+    let message = lines
+        .iter()
+        .find(|event| event["event"] == "command.failed")
+        .and_then(|event| event["data"]["message"].as_str())
+        .expect("destination file rejection must include a command.failed message");
+    assert!(
+        message.starts_with(PREFIX),
+        "destination file rejection must use the stable message prefix, got: {message}"
+    );
+    assert!(
+        message.ends_with(SUFFIX),
+        "destination file rejection must use the stable message suffix, got: {message}"
+    );
+
+    let reported = &message[PREFIX.len()..message.len() - SUFFIX.len()];
+    let reported_path = Path::new(reported);
+    assert_eq!(
+        reported_path.file_name(),
+        expected.file_name(),
+        "destination file rejection must identify the blocking path component"
+    );
+    assert_eq!(
+        portable_canonicalize(reported_path).expect("canonicalize reported destination path"),
+        portable_canonicalize(expected).expect("canonicalize expected destination path"),
+        "destination file rejection must identify the expected blocking path"
+    );
+
+    lines
 }
 
 #[cfg(unix)]
@@ -870,17 +909,7 @@ fn destination_that_is_a_file_is_a_clean_error() {
         .expect("run configs copy");
     assert!(!output.status.success(), "a file destination must fail");
 
-    let lines = events(output);
-    assert!(
-        lines.iter().any(|event| {
-            event["event"] == "command.failed"
-                && event["data"]["message"].as_str().is_some_and(|message| {
-                    message.contains("seed destination")
-                        && message.contains("exists and is not a directory")
-                })
-        }),
-        "a file destination must be an actionable validation error"
-    );
+    let lines = assert_destination_file_rejected(output, &to);
     assert!(
         !lines.iter().any(|event| event["event"] == "plan"),
         "a file destination must fail before the plan"
@@ -931,19 +960,7 @@ fn destination_file_erased_by_parent_dir_is_a_clean_error_without_mutation() {
         "a raw destination component below a file must fail"
     );
 
-    let lines = events(output);
-    assert!(
-        lines.iter().any(|event| {
-            event["event"] == "command.failed"
-                && event["data"]["message"].as_str().is_some_and(|message| {
-                    message.contains(&format!(
-                        "seed destination {} exists and is not a directory",
-                        to_file.display()
-                    ))
-                })
-        }),
-        "the raw component validation must name the exact blocking file"
-    );
+    let lines = assert_destination_file_rejected(output, &to_file);
     assert!(
         !lines.iter().any(|event| event["event"] == "plan"),
         "raw destination validation must fail before the plan"
@@ -998,19 +1015,7 @@ fn destination_child_below_a_file_is_a_clean_error_without_mutation() {
         "a child below a file destination must fail"
     );
 
-    let lines = events(output);
-    assert!(
-        lines.iter().any(|event| {
-            event["event"] == "command.failed"
-                && event["data"]["message"].as_str().is_some_and(|message| {
-                    message.contains(&format!(
-                        "seed destination {} exists and is not a directory",
-                        to_file.display()
-                    ))
-                })
-        }),
-        "ENOTDIR must be reported as the clean destination validation error"
-    );
+    let lines = assert_destination_file_rejected(output, &to_file);
     assert!(
         !lines.iter().any(|event| event["event"] == "plan"),
         "ENOTDIR must fail before the plan"
@@ -1343,7 +1348,9 @@ fn an_ambient_junction_prefix_is_resolved_before_destination_validation() {
 
     let from = ambient_alias.join("from");
     let requested_to = ambient_alias.join("to");
-    let effective_to = physical_namespace.join("to");
+    let effective_to = portable_canonicalize(&physical_namespace)
+        .expect("canonicalize physical junction namespace")
+        .join("to");
     let active_home = scratch.path().join("active-home");
     seed_real_home_with_claude_skill(&scratch, &from, "alpha");
 
