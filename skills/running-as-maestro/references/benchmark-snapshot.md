@@ -4,9 +4,9 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-08-30T14:24:47Z`
+- Retrieved after semantic change: `2026-09-02T13:39:29Z`
 - Parser version: `5`
-- Normalized SHA-256: `911ec47c635328e8b1c7100274bbcf45180ba37aac20a9ff09c3da960e6aee69`
+- Normalized SHA-256: `d67bb039f173f28519899a13bc19df0979d6a8b118bd4891e77aab22922c31be`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
@@ -85,7 +85,7 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 
 ## CursorBench
 
-Source: [CursorBench](https://cursor.com/cursorbench) · version `3.2` · source updated `2026-08-11` · normalized SHA-256 `f5e273217fee6ed15db694b4a16c78e66a5a923f36fb613e1bee36762d331e80`
+Source: [CursorBench](https://cursor.com/cursorbench) · version `3.2` · source updated `2026-08-11` · normalized SHA-256 `9552ce20a98d5398d7737de7769ee26f64ecf5ab531dcb9958a6a50cc5635b78`
 
 Metric: `score` · Ambiguous, multi-file tasks from real Cursor sessions. No uncertainty or sample count is published; small score differences may not be meaningful.
 
@@ -93,16 +93,21 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 
 | model | effort | score | avg cost/task | uncertainty / sample | Pareto |
 | --- | --- | ---: | ---: | --- | :---: |
+| Fable 5.1 | Max | 73.40% | $9.640 | — | ★ |
+| Fable 5.1 | Extra High | 72.80% | $6.960 | — | ★ |
 | Grok 4.6 | Extra High | 70.80% | $2.810 | — | ★ |
 | Fable 5 | Max | 70.50% | $17.320 | — |  |
 | Opus 5 | Max | 70.00% | $8.230 | — |  |
 | Grok 4.6 | High | 69.90% | $2.340 | — | ★ |
+| Fable 5.1 | High | 69.40% | $4.800 | — |  |
 | Opus 5 | Extra High | 69.30% | $7.350 | — |  |
 | Fable 5 | Extra High | 68.40% | $11.730 | — |  |
+| Fable 5.1 | Medium | 68.00% | $3.530 | — |  |
 | GPT-5.6 Sol | Max | 67.20% | $5.690 | — |  |
 | Grok 4.6 | Medium | 67.10% | $1.280 | — | ★ |
 | Opus 5 | High | 66.70% | $3.910 | — |  |
 | Fable 5 | High | 66.50% | $8.770 | — |  |
+| Fable 5.1 | Low | 66.20% | $2.900 | — |  |
 | Fable 5 | Medium | 65.20% | $6.800 | — |  |
 | GPT-5.6 Terra | Max | 64.90% | $2.310 | — |  |
 | GPT-5.6 Sol | Extra High | 64.50% | $3.880 | — |  |
