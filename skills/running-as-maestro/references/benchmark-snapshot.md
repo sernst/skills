@@ -4,14 +4,14 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-09-02T13:39:29Z`
+- Retrieved after semantic change: `2026-09-03T13:34:55Z`
 - Parser version: `5`
-- Normalized SHA-256: `d67bb039f173f28519899a13bc19df0979d6a8b118bd4891e77aab22922c31be`
+- Normalized SHA-256: `1bc2ff4a03e0fefa91aeeab00d89a19dd8bc780ebdf1e53f6b21e8d43bda9989`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
 
-Source: [DeepSWE](https://deepswe.datacurve.ai/) · version `1.1` · source updated `2026-08-26T07:38:24Z` · tasks `113` · normalized SHA-256 `d300e85505ccbcd7bd1fc87c6e4347aa2c525215fbb82b790b9bdf74e92742bd`
+Source: [DeepSWE](https://deepswe.datacurve.ai/) · version `1.1` · source updated `2026-09-02T15:18:19Z` · tasks `113` · normalized SHA-256 `a587ad5b8b6f5d3451094a4d15c1164fe33dcbfcd79b164b30d9df4f47a1a226`
 
 Metric: `pass@1` · Autonomous software-engineering rollouts; score is attempt pass@1. Confidence intervals are run-to-run estimates; provider, verifier, and network errors are excluded.
 
@@ -19,24 +19,26 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 
 | model | effort | score | avg cost/task | uncertainty / sample | Pareto |
 | --- | --- | ---: | ---: | --- | :---: |
-| claude-opus-5 | max | 73.65% | $11.838 | 95% CI 69.78–77.52%; n=444; runs=4 | ★ |
-| claude-opus-5 | xhigh | 73.15% | $9.072 | 95% CI 70.09–76.22%; n=447; runs=4 | ★ |
-| claude-opus-5 | high | 72.83% | $6.076 | 95% CI 70.88–74.77%; n=449; runs=4 | ★ |
+| gemini-3-8-flash | high | 73.83% | $2.362 | 95% CI 72.41–75.24%; n=447; runs=4 | ★ |
+| claude-opus-5 | max | 73.65% | $11.838 | 95% CI 69.78–77.52%; n=444; runs=4 |  |
+| claude-opus-5 | xhigh | 73.15% | $9.072 | 95% CI 70.09–76.22%; n=447; runs=4 |  |
+| claude-opus-5 | high | 72.83% | $6.076 | 95% CI 70.88–74.77%; n=449; runs=4 |  |
 | gpt-5-6-sol | max | 72.67% | $8.386 | 95% CI 69.84–75.50%; n=450; runs=4 |  |
-| gpt-5-6-sol | xhigh | 70.73% | $4.704 | 95% CI 69.91–71.55%; n=451; runs=4 | ★ |
+| gemini-3-8-flash | medium | 71.02% | $1.967 | 95% CI 68.74–73.30%; n=452; runs=4 | ★ |
+| gpt-5-6-sol | xhigh | 70.73% | $4.704 | 95% CI 69.91–71.55%; n=451; runs=4 |  |
 | claude-fable-5 | xhigh | 69.91% | $13.415 | 95% CI 66.67–73.16%; n=452; runs=4 |  |
 | claude-fable-5 | max | 69.72% | $21.635 | 95% CI 65.69–73.76%; n=436; runs=4 |  |
 | gpt-5-6-terra | max | 69.62% | $4.946 | 95% CI 67.07–72.18%; n=451; runs=4 |  |
-| gpt-5-6-sol | high | 69.40% | $3.470 | 95% CI 67.97–70.83%; n=451; runs=4 | ★ |
+| gpt-5-6-sol | high | 69.40% | $3.470 | 95% CI 67.97–70.83%; n=451; runs=4 |  |
 | glm-5-3 | max | 68.96% | $3.993 | 95% CI 65.94–71.98%; n=451; runs=4 |  |
-| claude-opus-5 | medium | 68.90% | $3.290 | 95% CI 67.73–70.08%; n=447; runs=4 | ★ |
+| claude-opus-5 | medium | 68.90% | $3.290 | 95% CI 67.73–70.08%; n=447; runs=4 |  |
 | claude-fable-5 | high | 68.60% | $9.178 | 95% CI 67.48–69.73%; n=430; runs=4 |  |
 | kimi-k3 | max | 68.51% | $4.655 | 95% CI 63.98–73.05%; n=451; runs=4 |  |
 | grok-4-6 | medium | 67.48% | $3.449 | 95% CI 65.20–69.76%; n=452; runs=4 |  |
-| gpt-5-6-luna | max | 67.19% | $3.028 | 95% CI 63.20–71.18%; n=448; runs=4 | ★ |
+| gpt-5-6-luna | max | 67.19% | $3.028 | 95% CI 63.20–71.18%; n=448; runs=4 |  |
 | gpt-5-5 | xhigh | 67.04% | $7.226 | 95% CI 60.57–73.50%; n=452; runs=4 |  |
 | grok-4-6 | xhigh | 66.74% | $5.498 | 95% CI 64.56–68.92%; n=451; runs=4 |  |
-| gemini-3-7-flash | medium | 65.49% | $2.025 | 95% CI 62.40–68.57%; n=452; runs=4 | ★ |
+| gemini-3-7-flash | medium | 65.49% | $2.025 | 95% CI 62.40–68.57%; n=452; runs=4 |  |
 | claude-fable-5 | medium | 65.37% | $6.088 | 95% CI 60.95–69.79%; n=436; runs=4 |  |
 | gemini-3-7-flash | high | 65.27% | $2.176 | 95% CI 63.48–67.05%; n=452; runs=4 |  |
 | grok-4-6 | high | 65.19% | $4.385 | 95% CI 63.65–66.72%; n=451; runs=4 |  |
@@ -85,7 +87,7 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 
 ## CursorBench
 
-Source: [CursorBench](https://cursor.com/cursorbench) · version `3.2` · source updated `2026-08-11` · normalized SHA-256 `9552ce20a98d5398d7737de7769ee26f64ecf5ab531dcb9958a6a50cc5635b78`
+Source: [CursorBench](https://cursor.com/cursorbench) · version `3.2` · source updated `2026-09-02` · normalized SHA-256 `8bc0d1c8f9e43571b60495847ff25c2501bcd9c4bd8c01df20702dcf9c13e3fb`
 
 Metric: `score` · Ambiguous, multi-file tasks from real Cursor sessions. No uncertainty or sample count is published; small score differences may not be meaningful.
 
@@ -101,10 +103,12 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 | Grok 4.6 | High | 69.90% | $2.340 | — | ★ |
 | Fable 5.1 | High | 69.40% | $4.800 | — |  |
 | Opus 5 | Extra High | 69.30% | $7.350 | — |  |
+| Gemini 3.8 Flash | High | 69.20% | $2.380 | — |  |
 | Fable 5 | Extra High | 68.40% | $11.730 | — |  |
 | Fable 5.1 | Medium | 68.00% | $3.530 | — |  |
 | GPT-5.6 Sol | Max | 67.20% | $5.690 | — |  |
 | Grok 4.6 | Medium | 67.10% | $1.280 | — | ★ |
+| Gemini 3.8 Flash | Medium | 67.00% | $1.930 | — |  |
 | Opus 5 | High | 66.70% | $3.910 | — |  |
 | Fable 5 | High | 66.50% | $8.770 | — |  |
 | Fable 5.1 | Low | 66.20% | $2.900 | — |  |
@@ -139,18 +143,15 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 | GPT-5.6 Terra | High | 54.20% | $0.710 | — |  |
 | Gemini 3.7 Flash | Low | 53.80% | $0.740 | — |  |
 | GPT-5.5 | Medium | 53.80% | $1.510 | — |  |
-| Gemini 3.6 Flash | High | 53.50% | $1.560 | — |  |
 | Opus 4.8 | Low | 53.10% | $2.020 | — |  |
 | GPT-5.6 Sol | Low | 52.60% | $1.010 | — |  |
 | Sonnet 5 | Medium | 52.40% | $1.440 | — |  |
 | GLM 5.2 | High | 51.50% | $1.190 | — |  |
-| Gemini 3.6 Flash | Medium | 51.20% | $1.480 | — |  |
 | Kimi K3 | Low | 50.50% | $0.990 | — |  |
 | GPT-5.6 Terra | Medium | 50.30% | $0.490 | — |  |
 | Kimi K2.7 Code | default | 49.70% | $1.430 | — |  |
 | GPT-5.6 Luna | Medium | 47.70% | $0.080 | — | ★ |
 | Sonnet 5 | Low | 47.70% | $0.870 | — |  |
-| Gemini 3.6 Flash | Low | 47.40% | $1.130 | — |  |
 | GPT-5.6 Terra | Low | 46.90% | $0.420 | — |  |
 | GPT-5.5 | Low | 46.60% | $0.980 | — |  |
 | GPT-5.6 Luna | Low | 37.60% | $0.030 | — | ★ |
