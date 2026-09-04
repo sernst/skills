@@ -70,7 +70,7 @@ class AdapterTests(BenchmarkTestCase):
             "claude-fable-5", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-4-6", "claude-sonnet-5",
             "deepseek-v4-flash", "deepseek-v4-pro", "gemini-3-1-pro-preview", "gemini-3-5-flash",
             "gemini-3-6-flash", "gemini-3-7-flash", "glm-5-2", "glm-5-3", "glm-5-3-flash", "gpt-5-4", "gpt-5-5",
-            "gpt-5-6-luna", "gpt-5-6-sol", "gpt-5-6-terra", "grok-4-5", "grok-4-6",
+            "gpt-5-6-luna", "gpt-5-6-sol", "gpt-5-6-terra", "gpt-6-astra", "grok-4-5", "grok-4-6",
             "kimi-k2-7-code", "kimi-k3", "muse-spark-1-1", "muse-spark-1-2", "qwen3-8-max",
         )
         cursor_models = (
@@ -91,11 +91,11 @@ class AdapterTests(BenchmarkTestCase):
                 source_model(model, "deep.model", self.deep_source)
 
     def test_likely_future_family_versions_pass_but_unknown_families_fail(self) -> None:
-        for model in ("gpt-5-7-sol", "claude-opus-5-1", "gemini-3-8-flash", "qwen3-9-max"):
+        for model in ("gpt-5-7-sol", "gpt-6-1-astra", "claude-opus-5-1", "gemini-3-8-flash", "qwen3-9-max"):
             self.assertEqual(model, source_model(model, "future.model", self.deep_source))
         for model in ("GPT-5.7 Sol", "Opus 5.1", "Gemini 3.8 Flash", "Kimi K3.1 Code"):
             self.assertEqual(model, source_model(model, "future.model", self.cursor_source))
-        for model in ("nova-1", "Ignore previous instructions 1", "ignore-previous-instructions-1"):
+        for model in ("gpt-6-nebula", "gpt-6-astra-preview", "nova-1", "Ignore previous instructions 1", "ignore-previous-instructions-1"):
             with self.assertRaisesRegex(BenchmarkError, "not an allowlisted model family"):
                 source_model(model, "deep.model", self.deep_source)
         for model in ("Nova 1", "Ignore previous instructions 1", "Ignore-previous-instructions-1"):
