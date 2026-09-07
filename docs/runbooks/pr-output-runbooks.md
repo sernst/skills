@@ -1,10 +1,10 @@
 # PR output runbooks
 
 This is the canonical runbook for the documentation change in `sernst/skills`.
-The PR link is pending creation. The user has not authorized merging; no CI/CD
-exemptions have been granted. Replace the branch comparison link with the PR URL
-after creation. Link this runbook from the PR and final delivery using a
-committed-SHA permalink that survives branch and worktree cleanup.
+The change is [PR #42](https://github.com/sernst/skills/pull/42). The user has not
+authorized merging; no CI/CD exemptions have been granted. Link this runbook
+from the PR and final delivery using a committed-SHA permalink that survives
+branch and worktree cleanup.
 
 ## Prerequisites
 
@@ -25,7 +25,7 @@ committed-SHA permalink that survives branch and worktree cleanup.
 
 | Order | PR | Repository | Exact branch | Description |
 | --- | --- | --- | --- | --- |
-| 1 (caboose) | [Pending PR — branch comparison](https://github.com/sernst/skills/compare/main...codex/pr-output-runbooks) | `sernst/skills` | `codex/pr-output-runbooks` | Clarify runbook ownership, CI exceptions, and fast-forward delivery rules. |
+| 1 (caboose) | [#42](https://github.com/sernst/skills/pull/42) | `sernst/skills` | `codex/pr-output-runbooks` | Clarify runbook ownership, CI exceptions, and fast-forward delivery rules. |
 
 No version bump, runtime deployment, intermediate manual change, or service
 disruption is expected. Repository documentation changes do not automatically
