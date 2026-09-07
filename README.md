@@ -21,9 +21,10 @@ from staged or unstaged changes.
 
 ### [`expecting-pr-outputs`](./skills/expecting-pr-outputs/SKILL.md)
 
-Produce CI-green PR chains as session deliverables — stacked branches under
-enforced linear history, deployment runbooks, and explicitly-gated fast-forward
-merges with pipeline monitoring between each merge.
+Produce PR chains (trains or stacks) with CI/CD readiness evidence, scoped
+exceptions, and ordered deployment runbooks. Plan linear branches and cross-repo
+merge order; perform fast-forward merges with exact-commit pipeline gates only
+when separately authorized.
 
 ### [`grill-me`](./skills/grill-me/SKILL.md)
 

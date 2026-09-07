@@ -1,166 +1,181 @@
 ---
 name: expecting-pr-outputs
 description:
-  Conventions and expectations around PR session outputs. Use when the user asks
-  for a "PR chain output", says the session's deliverable should be one or more
-  PRs, or asks to merge a previously produced PR chain. Covers chunking work
-  into PRs, stacked branches under enforced linear history, CI/CD readiness
-  gates, deployment runbooks, and — only when explicitly directed — conducting
-  fast-forward merges with pipeline monitoring between each merge.
+  Produce PR chains (trains or stacks) and deployment runbooks as session
+  deliverables. Use when the user requests PR outputs or asks to merge an
+  existing chain. Covers linear branches, CI/CD readiness, and separately
+  authorized fast-forward merges with pipeline monitoring.
 ---
 
-The deliverable of this session is one or more pull requests, plus a runbook
-that lets the user take them to production. Everything below defines what "done"
-means for that deliverable and how to produce it. Merging is a separate,
-explicitly-gated activity covered at the end — producing the chain never implies
-permission to merge it.
+Deliver one or more pull requests and a runbook that lets the user take them to
+production. Producing PRs never implies permission to merge: merging requires
+separate, explicit user authorization.
 
 ## The output contract
 
-**One or more PRs, each a large, meaningful chunk of work.** Group by theme and
-deployment surface — a bug-fix PR, a CLI-feature PR, a behavior/doctrine PR, an
-infra-only PR — not by file count or convenience. A PR should be independently
-understandable, reviewable as one coherent change, and revertable as one unit.
-Do not shred one concern across several small PRs, and do not staple unrelated
-risk together just to save a branch.
+Group each PR into a meaningful, coherent change by theme and deployment
+surface, independently understandable, reviewable, and revertable. Discover and
+apply each repository's conventions per PR, including version bumps, changelogs,
+local gates, and sanctioned exceptions for infra-only changes.
 
-**A PR is not ready until CI/CD passes on the pushed branch.** Local gates (the
-repo's full check/lint/test task) are necessary but never sufficient — CI runs
-checks the local environment cannot (image builds, platform differences, missing
-system binaries, structure checks). Push, watch the checks to completion, fix
-failures, and only then present the PR as ready. Expect the gap: a locally-green
-branch failing CI usually means an environment assumption (a binary the runner
-lacks, a version-bump rule, a formatting check) — fix the root cause, never
-weaken the gate.
+**Chain, train, and stack are synonyms.** PRs are cars; the final PR is the
+caboose. On GitHub, use its native stack feature only when explicitly requested
+or when the user calls the work a stack on GitHub. Ordinary chain/train wording
+does not opt in; on other hosts, stack remains a synonym. Verify available host
+capabilities before using them; do not assume automatic retargeting or PR closure.
 
-**Every repo convention binds every PR.** Version bumps, changelog entries in
-the same commit as the work, wire-compatibility test rules, commit-message style
-— discover the target repo's conventions before the first commit and apply them
-per PR. Infra-only PRs often have their own convention (for example, a changelog
-note without a version bump, enabled by an explicit skip marker) — find the
-sanctioned mechanism rather than inventing one.
+**Green PR:** the agent considers implementation and review complete, and CI/CD
+has finished successfully with no failed checks at the current pushed head.
+Local checks alone are insufficient. **Green merge:** the target-branch pipeline
+for the exact merged SHA has completed successfully. Absent, skipped, or
+never-started pipelines are unverified, not green.
 
-## Linear history rules
+User-approved CI/CD exceptions must be explicit and recorded with their scope:
+PRs/checks, heads or subsequent changes covered, target pipelines, and permitted
+continuation. A PR/check waiver does not authorize advancing after a red merge.
+A recovery train may explicitly authorize particular red cars and red merges,
+including advance authorization. The user may also explicitly ignore CI/CD for
+the whole chain, including its merge pipelines (for example, a new repo with no
+CI). A general merge request grants no waiver. Label waived failures or missing
+evidence as exceptions, never green; any unwaived failure stops progress.
+CI/CD exemptions never waive agent completion/review, fast-forward correctness,
+necessary safety gates, or merge authorization.
 
-All repos this skill applies to enforce linear git history: **no merge commits,
-no squashing, no history rewrites of shared branches.** PRs are merged by
-fast-forwarding `main` onto branch head commits. This shapes how the chain must
-be built:
+## Linear history and planning
 
-- **Stack dependent branches.** Each PR's branch is based on its predecessor's
-  branch; the first is based on `main`. Open each PR with its base set to the
-  predecessor branch (the platform retargets to `main` as bases merge). Merge
-  order is therefore fixed and must be documented.
-- **Restack when predecessors move.** When an earlier branch gains commits
-  (review fixes), rebase every later branch onto the new tip, in order. Expected
-  conflicts are mechanical and have standard resolutions: version files keep the
-  branch's own version; changelogs keep every section in reverse-chronological
-  order; lockfiles take the branch's side and are regenerated with the package
-  manager, verifying only version metadata changed. Re-run the full local gate
-  at every restacked tip.
-- **Independent work still stacks cleanly.** Even when PRs don't logically
-  depend on each other, a stacked chain keeps the eventual fast-forward merges
-  trivial. Truly independent single PRs may base on `main` directly.
-- **Never force-push shared branches.** The only exception is
-  `--force-with-lease` on a branch you just rebased as part of deliberate
-  restacking, before or between reviews — never on `main`, never to recover from
-  a mistake without the user's direction.
+Discover each repo's actual target branch and remote; never assume `main` or
+`origin`. Plan one global merge order across repos from dependencies and deploy
+constraints. **Choose the first PR's branch name before branching and use that
+same exact name in every participating repo.**
+
+Within each repo, base the first branch on its target and each subsequent branch
+on its predecessor. PR bases may be predecessor branches where supported.
+Inspect CI triggers early: ensure predecessor-based PRs can get green; do not
+assume target-branch-only filters will run for them. Resolve missing triggers
+within task scope, restructure preparation, or report a blocker; do not change
+host configuration without authorization.
+
+Merging must only append the identical, already-reviewed commits to the target
+by fast-forward: no merge commits, squash, rebase, or rewriting during merges.
+Each predecessor's head must be an ancestor of its successor, so landing a
+predecessor requires no downstream restack.
+
+If predecessors change during preparation, deliberately restack downstream
+review branches before merging begins. Preserve intended version/changelog
+content and regenerate lockfiles as needed; resolve conflicts and rerun local
+and remote checks at every changed head. Use `--force-with-lease` only for those
+review branches when necessary for deliberate restacking, never the target.
+Divergence during merging is a stop, not permission to rewrite or force the target.
 
 ## The runbook
 
-Produce a markdown runbook alongside the chain — it is part of the deliverable,
-not an afterthought. It must let the user execute the deployment without this
-session's context. Include:
+Commit one canonical Markdown runbook for the combined global order in the most
+appropriate participating repo. Every PR must link to it. Use a durable git-host
+link in the final response that survives worktree and branch cleanup (prefer a
+committed SHA permalink). Make it executable without the session's context. Keep
+exact commands, identifiers, expected results, and current evidence accurate as
+PRs evolve; retain executed steps with their status.
 
-- **A merge-order table**: position, PR link, version, one-line contents.
-- **Per-phase steps** in execution order: what to merge, what CI will do
-  automatically on merge (deploys, applies), and every **manual action** with
-  exact commands — populating secrets, service restarts/redeploys, configuration
-  steps.
-- **Pre-merge gates**, called out loudly: any verification that must happen
-  BEFORE a merge whose CI auto-applies changes (for example, verifying a
-  container image actually contains a required binary before terraform creates a
-  service from it). State plainly: "if this fails, do not merge."
-- **Deploy-order constraints and why**: which component must be current before
-  which (for example, consumers of a widened wire contract before its producer),
-  what breaks during the skew window, whether it self-heals, and how wide the
-  exposure is.
-- **Expected disruption**: anything that restarts, goes briefly down, or behaves
-  oddly mid-roll, with rough durations.
-- **A verification checklist per phase**: concrete actions with expected
-  results, biased toward re-testing the exact failures that motivated the work.
-- **A non-blocking punchlist**: known deferrals and follow-ups, so they are
-  recorded rather than lost.
+Use these mandatory sections in this order, writing **None** if a section is
+empty:
 
-Keep the runbook current as the chain evolves — when review cycles change
-behavior or new PRs join the chain, update it and re-deliver. If earlier phases
-have already been executed, mark their status rather than deleting them.
+1. **Prerequisites** — Put human preparation as early as feasible: access,
+   secrets, configuration, and other necessary setup. State pre-merge safety
+   gates and expected results before the merge that relies on them.
+2. **Merging** — Include a global merge-order table with linked PRs, repo when
+   multi-repo, exact branch, applicable version, and short contents. Give steps
+   the agent can execute and verify with this session's capabilities, including
+   automated gates, deploys, and service rolls it can perform. Explain deploy
+   dependencies, skew risks, and expected disruption where they affect order.
+   Only irreducibly intermediate **MANUAL CHANGES** may interrupt merging:
+   identify the exact change and instructions, the pause/resume condition, and
+   why it cannot precede or follow the sequence. Human validation belongs after
+   Post-merge Actions. Never blindly defer a necessary safety gate to satisfy
+   this ordering: automate it, restructure the rollout, or report an unresolved
+   blocker before the affected merge.
+3. **Post-merge Actions** — Required human actions that the agent cannot
+   automate, with exact instructions and dependencies. Service rolls are not
+   automatically human-owned; automate them when authorized and supported.
+4. **Validation** — A slim human checklist after all post-merge actions. Give
+   each check a short, distinct, referenceable title, the simplest steps, and
+   expected results; focus on the behavior and failures motivating the work.
+   Record relevant non-blocking follow-ups here, clearly separate from checks.
 
-## Building the chain, end to end
+Place deployment explanations, expected disruption/duration, and known follow-ups
+in the relevant section without repeating them. Resolve capability gaps during
+preparation so the Merging section is executable; explicitly report any gap
+that remains rather than presenting the runbook as ready.
 
-1. Plan the chunks and their order (dependencies first, then risk: production
-   fixes before features before infra, unless the user directs otherwise).
-2. Implement each PR on its stacked branch; run the repo's full local gate to
-   green at every tip.
-3. Get each PR reviewed to the session's quality bar before it is presented (if
-   operating under an orchestration skill with judges, judge-approve each PR;
-   findings fixed and re-verified).
-4. Restack, push every branch, open PRs in order with correct bases and bodies
-   that include: a bullet summary, notable review findings fixed, and the
-   PR-specific deploy notes that also appear in the runbook.
-5. Watch CI on every PR to completion. Fix and re-push until all are green.
-6. Deliver: PR links in merge order + the runbook + honest notes on anything
-   unverified (things only production or a real deploy can prove).
+## Building and delivering the chain
+
+1. Plan chunks, the shared first-branch name, global order, and runbook. Discover
+   conventions, host behavior, CI triggers, and session capabilities early.
+2. Implement and run each repo's full local gate at every tip. Complete review
+   to the session's quality bar, fixing and re-verifying findings.
+3. Finish preparatory restacking, push branches, and open PRs with appropriate
+   bases and descriptions explaining the change, relevant review fixes, and
+   deploy notes consistent with the runbook, including its canonical link.
+4. Watch every PR's CI/CD to completion at its current head. Fix root causes and
+   recheck changed heads. The default is a fully green chain; identify any
+   explicit exceptions and blockers instead of claiming readiness without proof.
+5. Before session completion, remove only task-created worktrees. First preserve
+   dirty or unpushed work safely; never discard it to satisfy cleanup. Keep
+   committed, pushed review branches accessible from the main worktree and
+   leave unrelated worktrees alone. Report any unresolved preservation blocker.
+   A main-worktree-only workflow requires no extra worktree.
+6. The final response must include a table in global merge order: linked PR,
+   repository when multi-repo, exact branch name, and short description. Link
+   the runbook immediately below the table. State current head/check evidence,
+   readiness versus authorized exceptions, blockers, and limits honestly.
 
 ## Merging the chain — only if explicitly directed
 
-Never merge, and never treat chain-production as implicit permission to merge.
-When — and only when — the user explicitly directs you to merge, the procedure
-is a supervised fast-forward walk where **CI gates every step**:
+**Preflight the entire chain before the first merge:**
 
-**Pre-flight (once):**
+- Fetch the discovered remotes. Verify clean working trees for merge operations
+  and local targets match their remote targets; preserve unrelated dirty work.
+- Within each repo, verify the target tip is an ancestor of the first PR head,
+  each head is an ancestor of its successor, and the appended ranges contain
+  zero merge commits. Record exact heads and the global merge order.
+- Verify every PR's implementation/review is complete, its current head matches
+  expectations, and CI/CD is green at that head, except explicitly scoped
+  waivers. Record exceptions separately; unresolved unwaived gates block merging.
+- Complete prerequisites and confirm intermediate manual changes, automation,
+  and any necessary safety gates are feasible before starting the sequence.
 
-- Fetch. Verify the working tree is clean and `main` matches origin.
-- Verify strict linearity: origin/main's tip is an ancestor of the first branch
-  tip; each branch tip is an ancestor of the next; zero merge commits anywhere
-  in the range. Any mismatch: stop and report — never "fix" with a rebase
-  mid-merge.
-- Verify every PR in the chain is currently green and its head matches the
-  expected commit.
+**For each PR, strictly in global order:**
 
-**Per PR, strictly in order:**
+1. Verify it is open, its current head still matches the reviewed and checked
+   SHA, and the target has not diverged. Refresh current-head check evidence;
+   changed heads require fresh review/checks and chain preflight.
+2. Determine whether the host requires retargeting to the actual target branch
+   for this merge. Verify behavior rather than assuming automatic retargeting
+   or closure. If retargeting starts checks, wait for successful completion or
+   an applicable explicit waiver before proceeding.
+3. Execute the runbook's automated gates and any irreducibly intermediate
+   MANUAL CHANGES at their specified points. An unavailable safety gate blocks
+   the affected merge unless an equivalent mechanism verifiably preserves it.
+4. On the verified local target, run `git merge --ff-only <head-sha>`, then a
+   plain push to the discovered remote/target. Verify the remote target equals
+   that SHA. On divergence or push rejection, stop and report; never force.
+5. Find the target pipeline for exactly that SHA and watch it to completion.
+   **Every merge must be green before the next by default.** An absent, skipped,
+   or never-started pipeline is unverified and blocks continuation unless
+   explicitly exempted. On failure capture the failing job's evidence and stop,
+   unless explicit red-merge continuation covers this merge. A waived red car
+   alone is insufficient. Verify conclusions directly after watcher/API errors.
+6. Verify and report the host's PR state; do not assume reachability closes PRs
+   on every host. If completion cannot be verified, report the blocker before
+   advancing. Record merge/deploy outcomes and any applied waiver in the runbook.
 
-1. Confirm the PR is OPEN and its head sha matches expectations.
-2. If its base is not `main`, retarget it to `main` now (the platform marks a PR
-   merged only when its head becomes reachable from its base ref — a stacked PR
-   left based on a sibling branch will not close). If retargeting re-triggers
-   checks, wait for green again.
-3. Execute any pre-merge gates from the runbook for this PR now — before the
-   merge whose CI will auto-apply.
-4. On local `main`: `git merge --ff-only <head-sha>`, then a plain push. If the
-   push is rejected for any reason, stop and report verbatim — never retry with
-   force.
-5. Find the main-branch pipeline run for exactly that sha and watch it to
-   completion. Any failure: capture the failing job's logs, STOP the chain — no
-   further merges — and report. Do not revert, do not improvise recovery on
-   production-affecting pipelines without the user.
-6. Confirm the PR now reports merged. (Trust but verify tooling: if a watcher
-   exits with an API blip, confirm the run's conclusion directly before
-   proceeding.)
+After the caboose successfully merges, clean up merged branches as appropriate
+(verify any automatic deletion), prune, and confirm each remote target's final
+SHA and zero merge commits in the appended range. Preserve branches still needed
+for unresolved work. Remove remaining task-created worktrees with the same
+preservation rules. Deliver the mandatory table and runbook link, per-PR pipeline
+results, final SHAs, and outstanding Post-merge Actions and Validation checks.
 
-**After the final PR:** delete the merged branches (many repos auto-delete on
-merge — verify rather than assume), prune, confirm the full range contains zero
-merge commits and origin/main sits at the final head, and report: per-PR
-pipeline results, final sha, and which runbook manual actions remain for the
-user (post-merge service rolls stay theirs unless explicitly delegated).
-
-## Failure discipline
-
-- The first red pipeline stops the chain. Partial progress is fine — report
-  exactly where it stopped, why, with verbatim evidence.
-- A blocked or unavailable tool for a runbook gate is a stop, not a substitution
-  — unless an equivalent mechanism verifiably preserves the gate's substance, in
-  which case state the substitution and its residual risk explicitly when
-  reporting.
-- Report outcomes faithfully: what merged, what deployed, what was skipped, what
-  remains. The user should never discover state you didn't mention.
+On an unwaived failure, stop at the exact affected car and report partial
+progress and evidence. Do not improvise production recovery or revert without
+user authorization. State what merged, deployed, failed, was waived, or remains
+unverified; an authorized exception never turns a red or unverified result green.
