@@ -4,9 +4,9 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-09-05T12:42:33Z`
+- Retrieved after semantic change: `2026-09-07T15:03:00Z`
 - Parser version: `5`
-- Normalized SHA-256: `31088bd31fc6909a46f8343d8734d93f1f894818cc0947d68293bab8abfae719`
+- Normalized SHA-256: `ad8a3f7f4914efb999c6cbac4f514425b1a07962c294f832d81a8f3253fb91a8`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
@@ -92,7 +92,7 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 
 ## CursorBench
 
-Source: [CursorBench](https://cursor.com/cursorbench) · version `3.2` · source updated `2026-09-02` · normalized SHA-256 `8bc0d1c8f9e43571b60495847ff25c2501bcd9c4bd8c01df20702dcf9c13e3fb`
+Source: [CursorBench](https://cursor.com/cursorbench) · version `3.2` · source updated `2026-08-11` · normalized SHA-256 `5437a72a9ee434fa755fb86b032d697ed161b83477b10c7d0bdd3beec8b3006b`
 
 Metric: `score` · Ambiguous, multi-file tasks from real Cursor sessions. No uncertainty or sample count is published; small score differences may not be meaningful.
 
