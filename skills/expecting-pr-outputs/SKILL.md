@@ -15,8 +15,21 @@ separate, explicit user authorization.
 
 Group each PR into a meaningful, coherent change by theme and deployment
 surface, independently understandable, reviewable, and revertable. Discover and
-apply each repository's conventions per PR, including version bumps, changelogs,
-local gates, and sanctioned exceptions for infra-only changes.
+apply each repository's conventions per applicable PR/car, including local gates
+and sanctioned exceptions for infra-only changes.
+
+**Before implementation starts**, inspect repository instructions, relevant
+CHANGELOG file(s), VERSION files/manifests, release tooling, and recent history
+for every affected component/repository. Plan and follow established changelog
+formatting and entry placement, version bump timing and level, and synchronized
+files as applicable. Honor automated release/version management instead of
+inventing manual bumps. Investigate changelog and version conventions
+independently: if only one exists, follow that one; if neither exists, create
+neither merely because this skill is used. Their presence does not require a
+change in every PR; respect applicability and scope. If any relevant convention
+remains ambiguous after investigation, pause implementation and ask the user for
+clarification before implementation starts; do not guess. Independent read-only
+investigation may continue.
 
 **Chain, train, and stack are synonyms.** PRs are cars; the final PR is the
 caboose. On GitHub, use its native stack feature only when explicitly requested
@@ -69,12 +82,22 @@ Divergence during merging is a stop, not permission to rewrite or force the targ
 
 ## The runbook
 
-Commit one canonical Markdown runbook for the combined global order in the most
-appropriate participating repo. Every PR must link to it. Use a durable git-host
-link in the final response that survives worktree and branch cleanup (prefer a
-committed SHA permalink). Make it executable without the session's context. Keep
-exact commands, identifiers, expected results, and current evidence accurate as
-PRs evolve; retain executed steps with their status.
+Maintain one canonical Markdown runbook for the combined global order across
+all participating repos as an agent-session artifact. Choose storage supported
+by the active harness: session-specific artifact storage or an appropriate
+session-scoped temporary folder, always outside repositories and worktrees.
+Never store runbooks inside repositories or worktrees; never stage or commit
+generated runbooks. Retain the artifact across worktree and branch cleanup,
+and deliver a usable native artifact or local file link immediately below the
+final PR table. Do not require
+installing a storage backend or making unrequested configuration changes.
+
+PR text may reference the session artifact; include a link only if it is actually
+accessible from the git host. Never publish meaningless local file paths to the
+git host or automatically publish/share private artifacts. Make the runbook
+executable without the session's context. Keep exact commands, identifiers,
+expected results, and current evidence accurate as PRs evolve; retain executed
+steps with their status.
 
 Use these mandatory sections in this order, writing **None** if a section is
 empty:
@@ -108,13 +131,16 @@ that remains rather than presenting the runbook as ready.
 
 ## Building and delivering the chain
 
-1. Plan chunks, the shared first-branch name, global order, and runbook. Discover
-   conventions, host behavior, CI triggers, and session capabilities early.
-2. Implement and run each repo's full local gate at every tip. Complete review
-   to the session's quality bar, fixing and re-verifying findings.
+1. Before implementation, discover changelog/version conventions as above and
+   plan their application per applicable PR/car. Plan chunks, the shared
+   first-branch name, global order, and runbook storage. Discover host behavior,
+   CI triggers, and session capabilities early.
+2. Implement with the applicable conventions and run each repo's full local
+   gate at every tip. Complete review to the session's quality bar, fixing and
+   re-verifying findings.
 3. Finish preparatory restacking, push branches, and open PRs with appropriate
    bases and descriptions explaining the change, relevant review fixes, and
-   deploy notes consistent with the runbook, including its canonical link.
+   deploy notes consistent with the runbook; reference/link it as allowed above.
 4. Watch every PR's CI/CD to completion at its current head. Fix root causes and
    recheck changed heads. The default is a fully green chain; identify any
    explicit exceptions and blockers instead of claiming readiness without proof.

@@ -22,9 +22,11 @@ from staged or unstaged changes.
 ### [`expecting-pr-outputs`](./skills/expecting-pr-outputs/SKILL.md)
 
 Produce PR chains (trains or stacks) with CI/CD readiness evidence, scoped
-exceptions, and ordered deployment runbooks. Plan linear branches and cross-repo
-merge order; perform fast-forward merges with exact-commit pipeline gates only
-when separately authorized.
+exceptions, and one canonical deployment runbook stored as a session artifact
+outside repositories and worktrees, linked below the final PR table. Discover
+changelog/version conventions before implementation and apply them per applicable
+PR. Plan linear branches and cross-repo merge order; perform fast-forward merges
+with exact-commit pipeline gates only when separately authorized.
 
 ### [`grill-me`](./skills/grill-me/SKILL.md)
 
