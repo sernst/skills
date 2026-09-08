@@ -1,16 +1,23 @@
 # Skills and skill-manager
 
-This repository offers two things:
+This repository offers three things:
 
 - [`skills/`](./skills): reusable Markdown instructions that teach AI agents
   specialized workflows.
 - [`skill-manager`](./clis/skill-manager): the supported way to discover and
   deploy these skills across Claude Code, Codex/OpenAI agents, and Google
   Antigravity.
+- [`.claude-plugin/marketplace.json`](./.claude-plugin/marketplace.json): a
+  Claude Code plugin marketplace that exposes `skills/` directly, for
+  repositories that just want these skills available — including in
+  [Claude Code cloud sessions](./docs/cloud-plugin-usage.md) — without
+  installing a CLI.
 
 Choose **a skill** below to inspect or adapt its instructions. Choose
 **skill-manager** to install skills, keep one source of truth, and manage
-updates across agent harnesses.
+updates across agent harnesses. Choose the **plugin marketplace** to point
+another repository at this one and always get the current skills, with no
+manual upload and no per-repo copy to go stale.
 
 ## Skill catalog
 
@@ -101,6 +108,30 @@ Agents must not install the CLI themselves. After a user installs it, follow
 the [agent usage guide](./docs/agent-usage.md) to make `managing-skills`
 available to agent sessions.
 
+## Use these skills in another repository as a plugin
+
+No CLI required. Add this repository as a Claude Code plugin marketplace and
+enable its `skills` plugin, and Claude Code — including cloud/web sessions —
+loads the current contents of `skills/` at session start:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "sernst-skills": {
+      "source": { "source": "github", "repo": "sernst/skills" }
+    }
+  },
+  "enabledPlugins": {
+    "skills@sernst-skills": true
+  }
+}
+```
+
+Merge this into the target repository's `.claude/settings.json` and commit
+it. See [Use these skills as a plugin in other repositories](./docs/cloud-plugin-usage.md)
+for why this is the right mechanism for cloud sessions specifically, how to
+have an agent apply it for you, and how to verify it.
+
 ## Try an interactive workflow
 
 Add this repository's skill collection, preview one deployment, then apply it:
@@ -147,5 +178,6 @@ state.
 - [NDJSON and automation contract](./clis/skill-manager/docs/json.md)
 - [Goal-oriented cheatsheet](./cheatsheet.skill-manager.md)
 - [Using skill-manager through an agent](./docs/agent-usage.md)
+- [Using these skills as a plugin in other repos, including cloud sessions](./docs/cloud-plugin-usage.md)
 - [Architecture and development](./clis/skill-manager/docs/development.md)
 - [Contributing](./CONTRIBUTING.md) and [releases](./RELEASES.md)

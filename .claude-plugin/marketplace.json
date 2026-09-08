@@ -1,0 +1,15 @@
+{
+  "name": "sernst-skills",
+  "owner": {
+    "name": "sernst"
+  },
+  "plugins": [
+    {
+      "name": "skills",
+      "source": "./",
+      "description": "Reusable agent skills for drafting commits, reviewing code, managing PR chains, and running as an orchestrating agent.",
+      "strict": false,
+      "skills": "./skills"
+    }
+  ]
+}
