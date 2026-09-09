@@ -41,8 +41,24 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
-      - name: Fetch, validate, and render all allowlisted sources
-        run: python -m tools.model_benchmarks refresh
+      - id: refresh
+        name: Fetch, validate, and render all allowlisted sources
+        shell: bash
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/model-benchmark-refresh.log"
+          set +e
+          python -u -m tools.model_benchmarks refresh 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if (( status != 0 )); then
+            reason=$(grep '^Error:' "$log" | tail -n 1 | tr -d '\r' | cut -c 1-500 || true)
+            if [[ -z "$reason" ]]; then
+              reason='Benchmark refresh step failed; inspect the workflow log.'
+            fi
+            echo "error=$reason" >> "$GITHUB_OUTPUT"
+            exit "$status"
+          fi
 
       - id: diff
         name: Enforce generated-file diff allowlist
@@ -131,9 +147,14 @@ jobs:
       - if: failure()
         name: Open or update the deduplicated failure issue
         env:
+          FAILURE_REASON: ${{ steps.refresh.outputs.error }}
           GITHUB_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: python -m tools.model_benchmarks issue failure --repository "$GITHUB_REPOSITORY" --run-url "$RUN_URL"
+        run: >-
+          python -m tools.model_benchmarks issue failure
+          --repository "$GITHUB_REPOSITORY"
+          --run-url "$RUN_URL"
+          --reason "$FAILURE_REASON"
 
       - if: success()
         name: Record recovery and close any open failure issue

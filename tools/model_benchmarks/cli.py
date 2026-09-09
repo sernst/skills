@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import sys
@@ -21,6 +22,7 @@ REPOSITORY_ROOT = PACKAGE_ROOT.parents[1]
 DEFAULT_REGISTRY = PACKAGE_ROOT / "sources.json"
 DEFAULT_OUTPUT = REPOSITORY_ROOT / "skills/running-as-maestro/references/benchmark-snapshot.md"
 ISSUE_TITLE = "[automation] Model benchmark refresh failed"
+_DEFAULT_FAILURE_REASON = "Diagnostic unavailable; inspect the workflow log."
 
 
 def issue_token(environ: Mapping[str, str] | None = None) -> str:
@@ -131,9 +133,17 @@ class GitHubIssues:
         # number makes recovery deterministic and prevents a new duplicate.
         return min(matches, key=lambda issue: issue["number"]) if matches else None
 
-    def record_failure(self, run_url: str) -> None:
+    def record_failure(self, run_url: str, reason: str | None = None) -> None:
         issue = self.find_issue()
-        body = f"@sernst the model benchmark refresh failed closed. The last-known-good snapshot was retained. Inspect: {run_url}"
+        diagnostic = " ".join((reason or _DEFAULT_FAILURE_REASON).split())[:500] or _DEFAULT_FAILURE_REASON
+        diagnostic = html.escape(diagnostic, quote=True)
+        for character in ("\\", "`", "*", "_", "[", "]"):
+            diagnostic = diagnostic.replace(character, "\\" + character)
+        body = (
+            "@sernst the model benchmark refresh failed closed. "
+            "The last-known-good snapshot was retained.\n\n"
+            f"Reason: {diagnostic}\n\nRun: {run_url}"
+        )
         base = f"/repos/{self.repository}"
         if issue is None:
             created = self.request("POST", f"{base}/issues", {"title": ISSUE_TITLE, "body": body})
@@ -182,7 +192,9 @@ def build_parser() -> argparse.ArgumentParser:
         state_parser.add_argument("--repository", required=True, help="GitHub OWNER/REPOSITORY")
         state_parser.add_argument("--run-url", required=True, help="workflow run URL")
         state_parser.add_argument("--api-url", default=os.environ.get("GITHUB_API_URL", "https://api.github.com"), help=argparse.SUPPRESS)
-        if state == "recovery":
+        if state == "failure":
+            state_parser.add_argument("--reason", help="bounded final diagnostic from the failed refresh")
+        else:
             state_parser.add_argument("--pull-request", help="update pull-request number")
             state_parser.add_argument("--snapshot", type=Path, default=DEFAULT_OUTPUT, help="snapshot used for recovery provenance")
     return parser
@@ -200,7 +212,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2 if args.command == "check" and result.changed else 0
         issues = GitHubIssues(args.repository, issue_token(), args.api_url)
         if args.issue_state == "failure":
-            issues.record_failure(args.run_url)
+            issues.record_failure(args.run_url, args.reason)
         else:
             issues.record_recovery(args.run_url, args.snapshot, args.pull_request)
         return 0

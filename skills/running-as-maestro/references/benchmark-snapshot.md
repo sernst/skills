@@ -4,9 +4,9 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-09-07T15:03:00Z`
-- Parser version: `5`
-- Normalized SHA-256: `ad8a3f7f4914efb999c6cbac4f514425b1a07962c294f832d81a8f3253fb91a8`
+- Retrieved after semantic change: `2026-09-09T20:47:39Z`
+- Parser version: `6`
+- Normalized SHA-256: `dc9e1a8e013ea86c4ff28cb5543339ccbd159b3e21c095e0a6631efce1963a51`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
@@ -92,7 +92,7 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 
 ## CursorBench
 
-Source: [CursorBench](https://cursor.com/cursorbench) · version `3.2` · source updated `2026-08-11` · normalized SHA-256 `5437a72a9ee434fa755fb86b032d697ed161b83477b10c7d0bdd3beec8b3006b`
+Source: [CursorBench](https://cursor.com/cursorbench) · version `3.2` · source updated `2026-08-11` · normalized SHA-256 `6c6a52c745b05ec1c8e394d43c65d869a73bcafb7682b14a7847bbd4bae0fdf8`
 
 Metric: `score` · Ambiguous, multi-file tasks from real Cursor sessions. No uncertainty or sample count is published; small score differences may not be meaningful.
 
@@ -111,6 +111,7 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 | Gemini 3.8 Flash | High | 69.20% | $2.380 | — |  |
 | Fable 5 | Extra High | 68.40% | $11.730 | — |  |
 | Fable 5.1 | Medium | 68.00% | $3.530 | — |  |
+| Muse Spark 1.3 | Max | 67.90% | $1.310 | — | ★ |
 | GPT-5.6 Sol | Max | 67.20% | $5.690 | — |  |
 | Grok 4.6 | Medium | 67.10% | $1.280 | — | ★ |
 | Gemini 3.8 Flash | Medium | 67.00% | $1.930 | — |  |
@@ -121,14 +122,17 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 | GPT-5.6 Terra | Max | 64.90% | $2.310 | — |  |
 | GPT-5.6 Sol | Extra High | 64.50% | $3.880 | — |  |
 | Opus 5 | Medium | 64.30% | $3.290 | — |  |
+| Muse Spark 1.3 | Extra High | 63.90% | $1.050 | — | ★ |
 | GPT-5.6 Sol | High | 63.50% | $2.790 | — |  |
 | Opus 5 | Low | 62.80% | $2.550 | — |  |
 | Opus 4.8 | Max | 62.30% | $5.770 | — |  |
 | Fable 5 | Low | 62.10% | $4.460 | — |  |
-| Gemini 3.7 Flash | High | 61.60% | $1.200 | — | ★ |
+| Muse Spark 1.3 | High | 61.70% | $0.840 | — | ★ |
+| Gemini 3.7 Flash | High | 61.60% | $1.200 | — |  |
 | Sonnet 5 | Max | 61.50% | $4.300 | — |  |
 | GPT-5.6 Luna | Max | 61.10% | $0.390 | — | ★ |
 | Grok 4.6 | Low | 61.00% | $0.700 | — |  |
+| Muse Spark 1.3 | Medium | 60.80% | $0.770 | — |  |
 | Kimi K3 | Max | 60.80% | $2.700 | — |  |
 | GPT-5.6 Sol | Medium | 60.00% | $1.950 | — |  |
 | Kimi K3 | High | 59.70% | $1.890 | — |  |
@@ -144,6 +148,7 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 | GPT-5.6 Luna | High | 56.80% | $0.160 | — | ★ |
 | Composer 2.5 | default | 56.10% | $0.440 | — |  |
 | Opus 4.8 | Medium | 56.10% | $2.810 | — |  |
+| Muse Spark 1.3 | Low | 55.00% | $0.450 | — |  |
 | GLM 5.2 | Max | 55.00% | $1.760 | — |  |
 | GPT-5.6 Terra | High | 54.20% | $0.710 | — |  |
 | Gemini 3.7 Flash | Low | 53.80% | $0.740 | — |  |
@@ -155,6 +160,7 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 | Kimi K3 | Low | 50.50% | $0.990 | — |  |
 | GPT-5.6 Terra | Medium | 50.30% | $0.490 | — |  |
 | Kimi K2.7 Code | default | 49.70% | $1.430 | — |  |
+| Muse Spark 1.3 | Minimal | 48.60% | $0.270 | — |  |
 | GPT-5.6 Luna | Medium | 47.70% | $0.080 | — | ★ |
 | Sonnet 5 | Low | 47.70% | $0.870 | — |  |
 | GPT-5.6 Terra | Low | 46.90% | $0.420 | — |  |

@@ -17,18 +17,6 @@
       "costField": "mean_cost_usd",
       "minimumRows": 40,
       "maximumRows": 120,
-      "modelPatterns": [
-        "^claude-(?:fable|opus|sonnet)-[0-9]+(?:-[0-9]+)*$",
-        "^deepseek-v[0-9]+(?:-[0-9]+)*-(?:flash|pro)$",
-        "^gemini-[0-9]+(?:-[0-9]+)*-(?:flash|pro)(?:-preview)?$",
-        "^glm-[0-9]+(?:-[0-9]+)*$",
-        "^glm-5-3-flash$",
-        "^gpt-[0-9]+(?:-[0-9]+)*(?:-(?:astra|luna|sol|terra))?$",
-        "^grok-[0-9]+(?:-[0-9]+)*$",
-        "^kimi-k[0-9]+(?:-[0-9]+)*(?:-code)?$",
-        "^muse-spark-[0-9]+(?:-[0-9]+)*$",
-        "^qwen[0-9]+(?:-[0-9]+)*-max$"
-      ],
       "harness": "mini-swe-agent",
       "configTemplate": "mini_swe_agent_{model}_{effort}",
       "effortLabels": ["default", "minimal", "low", "medium", "high", "xhigh", "max"],
@@ -45,18 +33,9 @@
       "scoreLabel": "score",
       "minimumRows": 35,
       "maximumRows": 120,
-      "modelPatterns": [
-        "^(?:Composer|Fable) [0-9]+(?:\\.[0-9]+)*$",
-        "^Gemini [0-9]+(?:\\.[0-9]+)* (?:Flash|Pro)(?: Preview)?$",
-        "^GLM [0-9]+(?:\\.[0-9]+)*$",
-        "^GPT-[0-9]+(?:\\.[0-9]+)*(?: (?:Luna|Sol|Terra))?$",
-        "^Grok [0-9]+(?:\\.[0-9]+)*$",
-        "^Kimi K[0-9]+(?:\\.[0-9]+)*(?: Code)?$",
-        "^(?:Opus|Sonnet) [0-9]+(?:\\.[0-9]+)*$"
-      ],
       "harness": "Cursor benchmark agent",
       "config": "published CursorBench configuration",
-      "effortLabels": ["Extra High", "Medium", "High", "Low", "Max"],
+      "effortLabels": ["Extra High", "Minimal", "Medium", "High", "Low", "Max"],
       "expectedHeaders": ["", "Model", "Score", "Cost / task", "Tokens / task", "Steps / task"],
       "scope": "Ambiguous, multi-file tasks from real Cursor sessions.",
       "caveat": "No uncertainty or sample count is published; small score differences may not be meaningful."

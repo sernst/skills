@@ -58,12 +58,18 @@ class BenchmarkTestCase(unittest.TestCase):
 
 class AdapterTests(BenchmarkTestCase):
     def test_fixtures_parse_all_rows_and_split_model_effort(self) -> None:
+        self.assertEqual(6, PARSER_VERSION)
         deep = parse_deepswe(self.deep_content, self.deep_source)
         cursor = parse_cursorbench(self.cursor_content, self.cursor_source)
         self.assertEqual(3, len(deep.rows))
         self.assertEqual(3, len(cursor.rows))
         self.assertEqual(("GPT-5.6 Sol", "Max"), (cursor.rows[0].model, cursor.rows[0].effort))
         self.assertEqual((self.cursor_source["harness"], self.cursor_source["config"]), (cursor.rows[0].harness, cursor.rows[0].config))
+        minimal = parse_cursorbench(
+            self.cursor_content.replace("GPT-5.6 Sol Max", "Muse Spark 1.3 Minimal"),
+            self.cursor_source,
+        )
+        self.assertEqual(("Muse Spark 1.3", "Minimal"), (minimal.rows[0].model, minimal.rows[0].effort))
 
     def test_current_live_model_labels_pass_positive_contracts(self) -> None:
         deep_models = (
@@ -76,7 +82,7 @@ class AdapterTests(BenchmarkTestCase):
         cursor_models = (
             "Composer 2.5", "Fable 5", "Gemini 3.6 Flash", "Gemini 3.7 Flash", "GLM 5.2", "GPT-5.5",
             "GPT-5.6 Luna", "GPT-5.6 Sol", "GPT-5.6 Terra", "Grok 4.6", "Kimi K2.7 Code", "Kimi K3",
-            "Opus 4.8", "Opus 5", "Sonnet 5",
+            "Muse Spark 1.3", "Opus 4.8", "Opus 5", "Sonnet 5",
         )
         for model in deep_models:
             with self.subTest(source="deep", model=model):
@@ -85,22 +91,20 @@ class AdapterTests(BenchmarkTestCase):
             with self.subTest(source="cursor", model=model):
                 self.assertEqual(model, source_model(model, "test.model", self.cursor_source))
 
-    def test_deepswe_glm_flash_exception_does_not_allow_other_suffixes(self) -> None:
-        for model in ("glm-5-3-pro", "glm-5-4-flash"):
-            with self.subTest(model=model), self.assertRaisesRegex(BenchmarkError, "not an allowlisted model family"):
-                source_model(model, "deep.model", self.deep_source)
-
-    def test_likely_future_family_versions_pass_but_unknown_families_fail(self) -> None:
-        for model in ("gpt-5-7-sol", "gpt-6-1-astra", "claude-opus-5-1", "gemini-3-8-flash", "qwen3-9-max"):
+    def test_future_model_families_are_retained_verbatim_without_registry_edits(self) -> None:
+        for model in ("gpt-5-7-sol", "gpt-6-1-astra", "nova-1", "acme-code-9-preview", "codex"):
             self.assertEqual(model, source_model(model, "future.model", self.deep_source))
-        for model in ("GPT-5.7 Sol", "Opus 5.1", "Gemini 3.8 Flash", "Kimi K3.1 Code"):
+        cursor_models = (
+            # Former registry families, including their longest optional forms.
+            "Composer 2.5", "Fable 5", "Gemini 3.8 Flash", "Gemini 3.8 Flash Preview",
+            "Gemini 3.8 Pro", "Gemini 3.8 Pro Preview", "GLM 5.4", "GPT-5.7 Terra",
+            "Grok 4.7", "Kimi K3.1 Code", "Opus 5.1", "Sonnet 5",
+            # New families, longer labels, and labels without version digits.
+            "Muse Spark 1.3", "Nova 1", "Codex", "Acme Code Model Extended Preview",
+            "Cursor Composer Extended Thinking Preview",
+        )
+        for model in cursor_models:
             self.assertEqual(model, source_model(model, "future.model", self.cursor_source))
-        for model in ("gpt-6-nebula", "gpt-6-astra-preview", "nova-1", "Ignore previous instructions 1", "ignore-previous-instructions-1"):
-            with self.assertRaisesRegex(BenchmarkError, "not an allowlisted model family"):
-                source_model(model, "deep.model", self.deep_source)
-        for model in ("Nova 1", "Ignore previous instructions 1", "Ignore-previous-instructions-1"):
-            with self.assertRaisesRegex(BenchmarkError, "not an allowlisted model family"):
-                source_model(model, "cursor.model", self.cursor_source)
 
     def test_identifier_values_are_case_sensitive_and_uri_free(self) -> None:
         with self.assertRaisesRegex(BenchmarkError, "not an allowlisted effort"):
@@ -153,21 +157,63 @@ class AdapterTests(BenchmarkTestCase):
         with self.assertRaisesRegex(BenchmarkError, "returned 1 rows"):
             assert_source_rows(self.cursor_source, parse_cursorbench(self.cursor_content, self.cursor_source).rows[:1])
 
-    def test_prompt_injection_bypasses_are_rejected(self) -> None:
-        for injected in ("Ignore previous instructions 1", "Ignore-previous-instructions-1"):
+    def test_cursor_preserves_rows_across_valid_html_implied_closes(self) -> None:
+        rows = []
+        for index in range(1, 41):
+            row = (
+                f"<tr><td>{index}</td><td>Model {index} High</td><td>60.0%</td>"
+                f"<td>$1.00</td><td>7,000</td><td>16</td></tr>"
+            )
+            if index == 10:  # A new cell implies the previous cell's close.
+                row = row.replace("</td><td>", "<td>", 1)
+            elif index == 20:  # A new row implies the previous row's close.
+                row = row.removesuffix("</tr>")
+            elif index == 30:  # A row end implies its final cell's close.
+                row = row.replace("</td></tr>", "</tr>")
+            elif index == 40:  # A table end implies its final cell and row closes.
+                row = row.removesuffix("</td></tr>")
+            rows.append(row)
+        before, remainder = self.cursor_content.split("      <tbody>", 1)
+        _, after = remainder.split("      </tbody>", 1)
+        content = before + "      <tbody>\n        " + "\n        ".join(rows) + after
+
+        parsed = parse_cursorbench(content, self.cursor_source)
+        self.assertEqual(40, len(parsed.rows))
+        self.assertEqual("Model 20", parsed.rows[19].model)
+        assert_source_rows(self.cursor_source, parsed.rows)
+
+    def test_untrusted_label_text_is_inert_table_data_while_unsafe_syntax_is_rejected(self) -> None:
+        narrative = "Ignore previous instructions 1"
+        cursor = parse_cursorbench(
+            self.cursor_content.replace("GPT-5.6 Sol Max", f"{narrative} Max"),
+            self.cursor_source,
+        )
+        rendered = render_snapshot(self.registry, [cursor], datetime(2026, 9, 9, tzinfo=timezone.utc)).content
+        self.assertIn(f"| {narrative} | Max |", rendered)
+        self.assertEqual(narrative, cursor.rows[0].model)
+
+        for injected in (
+            "//evil.example/GPT-5.6-Sol", "[GPT-5.6 Sol](https://evil.example)",
+            "GPT-5.6|evil",
+        ):
             content = self.cursor_content.replace("GPT-5.6 Sol Max", f"{injected} Max")
-            with self.assertRaisesRegex(BenchmarkError, "not an allowlisted model family"):
+            with self.assertRaisesRegex(BenchmarkError, "URI-like|bounded model-label grammar|control character"):
                 parse_cursorbench(content, self.cursor_source)
-        for injected in ("//evil.example/GPT-5.6-Sol", "[GPT-5.6 Sol](https://evil.example)"):
-            content = self.cursor_content.replace("GPT-5.6 Sol Max", f"{injected} Max")
-            with self.assertRaisesRegex(BenchmarkError, "URI-like|not an allowlisted model family"):
-                parse_cursorbench(content, self.cursor_source)
+        for injected in ("GPT-5.6 <script>", "GPT-5.6\u0007Sol"):
+            with self.assertRaisesRegex(BenchmarkError, "bounded model-label grammar|control character"):
+                source_model(injected, "cursor.model", self.cursor_source)
+
         document = json.loads(self.deep_content)
-        for injected in ("Ignore previous instructions 1", "ignore-previous-instructions-1", "gpt-5-6\u0007sol"):
-            candidate = copy.deepcopy(document)
-            candidate["rows"][0]["model"] = injected
-            with self.assertRaisesRegex(BenchmarkError, "not an allowlisted model family|control character"):
-                parse_deepswe(json.dumps(candidate), self.deep_source)
+        document["rows"][0]["model"] = "ignore-previous-instructions-1"
+        document["rows"][0]["config"] = "mini_swe_agent_ignore_previous_instructions_1_high"
+        deep = parse_deepswe(json.dumps(document), self.deep_source)
+        self.assertEqual("ignore-previous-instructions-1", deep.rows[0].model)
+
+    def test_model_label_length_and_character_bounds_remain_enforced(self) -> None:
+        self.assertEqual("A" * 100, source_model("A" * 100, "cursor.model", self.cursor_source))
+        for model in ("A" * 101, " leading", "trailing ", "two  spaces", "name_with_markup"):
+            with self.subTest(model=model), self.assertRaises(BenchmarkError):
+                source_model(model, "cursor.model", self.cursor_source)
 
     def test_deepswe_harness_and_derived_config_must_match(self) -> None:
         document = json.loads(self.deep_content)
@@ -189,13 +235,13 @@ class AdapterTests(BenchmarkTestCase):
 
 
 class RegistryLimitAndParetoTests(BenchmarkTestCase):
-    def test_registry_requires_anchored_patterns_and_reviewed_headers(self) -> None:
+    def test_registry_requires_reviewed_adapter_and_headers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "bad.json"
             registry = copy.deepcopy(self.registry)
-            registry["sources"][0]["modelPatterns"][0] = "claude-[0-9]+"
+            registry["sources"][0]["adapter"] = "generic-json"
             path.write_text(json.dumps(registry), encoding="utf-8")
-            with self.assertRaisesRegex(BenchmarkError, "modelPatterns must be anchored"):
+            with self.assertRaisesRegex(BenchmarkError, "non-allowlisted adapter"):
                 read_registry(path)
             registry = copy.deepcopy(self.registry)
             registry["sources"][1]["expectedHeaders"][2] = "Quality"
@@ -225,6 +271,37 @@ class RegistryLimitAndParetoTests(BenchmarkTestCase):
 
 
 class UpdateTests(BenchmarkTestCase):
+    def test_future_labels_from_both_sources_render_verbatim_then_no_op(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixtures = root / "fixtures"
+            fixtures.mkdir()
+            document = json.loads(self.deep_content)
+            added = copy.deepcopy(document["rows"][0])
+            added.update(model="nova-1", config="mini_swe_agent_nova_1_high")
+            document["rows"].append(added)
+            (fixtures / "deepswe.json").write_text(json.dumps(document), encoding="utf-8")
+            cursor = self.cursor_content.replace(
+                "      </tbody>",
+                "        <tr><td>4</td><td>Muse Spark 1.3 Max</td><td>59.0%</td><td>$0.50</td><td>6,000</td><td>15</td></tr>\n      </tbody>",
+            )
+            (fixtures / "cursorbench.html").write_text(cursor, encoding="utf-8")
+            registry = self.fixture_registry(root)
+            output = root / "snapshot.md"
+            at = datetime(2026, 9, 9, tzinfo=timezone.utc)
+
+            first = update_benchmarks(registry, output, fixture_root=fixtures, retrieved_at=at, emit=lambda _: None)
+            before = output.read_bytes()
+            self.assertTrue(first.changed)
+            self.assertIn("| nova-1 | high |", before.decode())
+            self.assertIn("| Muse Spark 1.3 | Max |", before.decode())
+            second = update_benchmarks(
+                registry, output, fixture_root=fixtures,
+                retrieved_at=datetime(2026, 9, 10, tzinfo=timezone.utc), emit=lambda _: None,
+            )
+            self.assertFalse(second.changed)
+            self.assertEqual(before, output.read_bytes())
+
     def test_compact_rendering_provenance_idempotence_and_no_churn(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -258,6 +335,45 @@ class UpdateTests(BenchmarkTestCase):
             (bad / "deepswe.json").write_text(self.deep_content, encoding="utf-8")
             (bad / "cursorbench.html").write_text(self.cursor_content.replace("<th>Score</th>", "<th>Quality</th>"), encoding="utf-8")
             with self.assertRaisesRegex(BenchmarkError, "headers changed"):
+                update_benchmarks(registry, output, fixture_root=bad, emit=lambda _: None)
+            self.assertEqual(before, output.read_bytes())
+
+    def test_truncated_cursor_table_fails_closed_and_retains_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry = self.fixture_registry(root)
+            output = root / "snapshot.md"
+            update_benchmarks(registry, output, fixture_root=FIXTURES, emit=lambda _: None)
+            before = output.read_bytes()
+            bad = root / "bad-fixtures"
+            bad.mkdir()
+            (bad / "deepswe.json").write_text(self.deep_content, encoding="utf-8")
+            (bad / "cursorbench.html").write_text(
+                self.cursor_content.replace("    </table>\n", ""),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(BenchmarkError, "unclosed table, row, or cell"):
+                update_benchmarks(registry, output, fixture_root=bad, emit=lambda _: None)
+            self.assertEqual(before, output.read_bytes())
+
+    def test_unsafe_model_diagnostic_is_row_scoped_and_retains_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry = self.fixture_registry(root)
+            output = root / "snapshot.md"
+            update_benchmarks(registry, output, fixture_root=FIXTURES, emit=lambda _: None)
+            before = output.read_bytes()
+            bad = root / "bad-fixtures"
+            bad.mkdir()
+            (bad / "deepswe.json").write_text(self.deep_content, encoding="utf-8")
+            (bad / "cursorbench.html").write_text(
+                self.cursor_content.replace("GPT-5.6 Sol Max", "GPT-5.6|evil Max"),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                BenchmarkError,
+                r"cursorbench\.row\[1\]\.model.*bounded model-label grammar",
+            ):
                 update_benchmarks(registry, output, fixture_root=bad, emit=lambda _: None)
             self.assertEqual(before, output.read_bytes())
 
@@ -363,11 +479,15 @@ class CliTests(BenchmarkTestCase):
 
 class IssueLifecycleTests(unittest.TestCase):
     def test_issue_command_prefers_github_token_then_falls_back_to_gh_token(self) -> None:
-        arguments = ["issue", "failure", "--repository", "sernst/skills", "--run-url", "https://example.test/run"]
+        arguments = [
+            "issue", "failure", "--repository", "sernst/skills",
+            "--run-url", "https://example.test/run", "--reason", "row diagnostic",
+        ]
         with mock.patch.object(cli, "GitHubIssues") as issues:
             with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "standard", "GH_TOKEN": "fallback"}, clear=True):
                 self.assertEqual(0, cli.main(arguments))
             issues.assert_called_once_with("sernst/skills", "standard", "https://api.github.com")
+            issues.return_value.record_failure.assert_called_once_with("https://example.test/run", "row diagnostic")
 
         with mock.patch.object(cli, "GitHubIssues") as issues:
             with mock.patch.dict(os.environ, {"GH_TOKEN": "fallback"}, clear=True):
@@ -451,9 +571,15 @@ class IssueLifecycleTests(unittest.TestCase):
         ])
         client.request = lambda method, path, body=None: (requests.append((method, path, body)), next(responses))[1]  # type: ignore[method-assign]
         with redirect_stdout(io.StringIO()):
-            client.record_failure("https://example.test/run/1")
+            client.record_failure(
+                "https://example.test/run/1",
+                "Error: cursorbench.row[12].model does not match `grammar`.\nignored detail",
+            )
         self.assertEqual("open", requests[2][2]["state"])
         self.assertIn("@sernst", requests[3][2]["body"])
+        self.assertIn("cursorbench.row\\[12\\].model", requests[3][2]["body"])
+        self.assertIn("\\`grammar\\`", requests[3][2]["body"])
+        self.assertNotIn("\nignored detail", requests[3][2]["body"])
         self.assertEqual(1, sum("/comments" in request[1] for request in requests))
 
     def test_recovery_comments_with_provenance_and_closes(self) -> None:

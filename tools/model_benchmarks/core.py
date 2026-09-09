@@ -24,10 +24,19 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
-PARSER_VERSION = 5
+PARSER_VERSION = 6
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _URI_RE = re.compile(r"(?i)(?:[a-z][a-z0-9+.-]*:)?//")
 _HASH_RE = re.compile(r"Normalized SHA-256: `([a-f0-9]{64})`")
+_MODEL_LABEL_RE = {
+    # DeepSWE config identity replaces these hyphens with underscores. Keeping
+    # the source shape narrow makes that derivation unambiguous without tying
+    # ingestion to any vendor or model family.
+    "deepswe-json": re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$"),
+    # CursorBench publishes human-readable display labels. Bound their character
+    # surface without inferring families, version tokens, or word counts.
+    "cursorbench-html": re.compile(r"^[A-Za-z0-9]+(?:[ .-][A-Za-z0-9]+)*$"),
+}
 _IDENTIFIER_RE = {
     "effort": re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:[ -][A-Za-z0-9]+)?$"),
     "harness": re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$"),
@@ -114,10 +123,13 @@ def source_model(value: Any, field: str, source: Mapping[str, Any]) -> str:
         raise BenchmarkError(f"{field} has leading or trailing whitespace.")
     if _URI_RE.search(text):
         raise BenchmarkError(f"{field} contains a URI-like value.")
-    for pattern in source["modelPatterns"]:
-        if re.fullmatch(pattern, text):
-            return text
-    raise BenchmarkError(f"{field} is not an allowlisted model family for source {source['id']}.")
+    adapter = source["adapter"]
+    pattern = _MODEL_LABEL_RE.get(adapter)
+    if pattern is None:
+        raise BenchmarkError(f"{field} has no model-label grammar for adapter {adapter}.")
+    if not pattern.fullmatch(text):
+        raise BenchmarkError(f"{field} does not match the bounded model-label grammar for source {source['id']}.")
+    return text
 
 
 def bounded_decimal(value: Any, field: str, minimum: Decimal | int, maximum: Decimal | int) -> Decimal:
@@ -202,12 +214,12 @@ def parse_deepswe(content: str, source: Mapping[str, Any]) -> Benchmark:
     )
     rows: list[Row] = []
     for index, raw in enumerate(inputs):
-        item = _require_mapping(raw, f"deepswe row {index}")
-        _require_fields(item, required, "deepswe row")
+        item = _require_mapping(raw, f"deepswe.row[{index}]")
+        _require_fields(item, required, f"deepswe.row[{index}]")
         model = source_model(item["model"], f"deepswe.row[{index}].model", source)
         harness = identifier(item["harness"], f"deepswe.row[{index}].harness", "harness")
         if harness != source["harness"]:
-            raise BenchmarkError("deepswe.harness does not match the registered harness.")
+            raise BenchmarkError(f"deepswe.row[{index}].harness does not match the registered harness.")
         effort_value = item["reasoning_effort"]
         if effort_value is None or effort_value == "":
             effort_value = "default"
@@ -215,19 +227,19 @@ def parse_deepswe(content: str, source: Mapping[str, Any]) -> Benchmark:
         config = identifier(item["config"], f"deepswe.row[{index}].config", "config")
         expected_config = source["configTemplate"].replace("{model}", model.replace("-", "_")).replace("{effort}", effort)
         if config != expected_config:
-            raise BenchmarkError("deepswe.config does not correspond to the validated model and effort.")
-        score_ratio = bounded_decimal(item[source["scoreField"]], f"deepswe.{source['scoreField']}", 0, 1)
-        cost = bounded_decimal(item[source["costField"]], f"deepswe.{source['costField']}", 0, 10_000)
-        ci_low = bounded_decimal(item["ci_lo"], "deepswe.ci_lo", 0, 1)
-        ci_high = bounded_decimal(item["ci_hi"], "deepswe.ci_hi", 0, 1)
+            raise BenchmarkError(f"deepswe.row[{index}].config does not correspond to the validated model and effort.")
+        score_ratio = bounded_decimal(item[source["scoreField"]], f"deepswe.row[{index}].{source['scoreField']}", 0, 1)
+        cost = bounded_decimal(item[source["costField"]], f"deepswe.row[{index}].{source['costField']}", 0, 10_000)
+        ci_low = bounded_decimal(item["ci_lo"], f"deepswe.row[{index}].ci_lo", 0, 1)
+        ci_high = bounded_decimal(item["ci_hi"], f"deepswe.row[{index}].ci_hi", 0, 1)
         if ci_low > score_ratio or ci_high < score_ratio or ci_low > ci_high:
-            raise BenchmarkError("deepswe confidence interval does not contain the score.")
+            raise BenchmarkError(f"deepswe.row[{index}] confidence interval does not contain the score.")
         rows.append(Row(
             model=model, effort=effort, harness=harness, config=config,
             score=score_ratio * 100, cost=cost, ci_low=ci_low * 100,
             ci_high=ci_high * 100,
-            sample_count=bounded_integer(item["n_attempted"], "deepswe.n_attempted", 1, 1_000_000),
-            run_count=bounded_integer(item["n_runs"], "deepswe.n_runs", 1, 10_000),
+            sample_count=bounded_integer(item["n_attempted"], f"deepswe.row[{index}].n_attempted", 1, 1_000_000),
+            run_count=bounded_integer(item["n_runs"], f"deepswe.row[{index}].n_runs", 1, 10_000),
         ))
     return Benchmark(
         id="deepswe", display_name="DeepSWE",
@@ -247,6 +259,36 @@ class _TableParser(HTMLParser):
         self._cell_parts: list[str] = []
         self._ignored = 0
 
+    def _finish_cell(self) -> None:
+        if self._cell_kind is None:
+            return
+        if self._row is None:
+            raise BenchmarkError("cursorbench table parser reached an invalid cell state.")
+        text = re.sub(r"\s+", " ", html.unescape("".join(self._cell_parts))).strip()
+        self._row.append((self._cell_kind, text))
+        self._cell_kind = None
+        self._cell_parts = []
+
+    def _finish_row(self) -> None:
+        if self._row is None:
+            return
+        if self._table is None:
+            raise BenchmarkError("cursorbench table parser reached an invalid row state.")
+        self._finish_cell()
+        self._table.append(self._row)
+        self._row = None
+
+    def _finish_table(self) -> None:
+        if self._table is None:
+            return
+        self._finish_row()
+        self.tables.append(self._table)
+        self._table = None
+
+    def finish(self) -> None:
+        if self._table is not None or self._row is not None or self._cell_kind is not None:
+            raise BenchmarkError("cursorbench HTML ended with an unclosed table, row, or cell.")
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
         if self._ignored:
@@ -259,8 +301,14 @@ class _TableParser(HTMLParser):
                 raise BenchmarkError("cursorbench contains nested tables.")
             self._table = []
         elif tag == "tr" and self._table is not None:
+            self._finish_row()
             self._row = []
-        elif tag in ("th", "td") and self._row is not None:
+        elif tag in ("thead", "tbody", "tfoot") and self._table is not None:
+            self._finish_row()
+        elif tag in ("th", "td") and self._table is not None:
+            if self._row is None:
+                raise BenchmarkError("cursorbench contains a table cell outside a row.")
+            self._finish_cell()
             self._cell_kind = tag
             self._cell_parts = []
 
@@ -268,16 +316,18 @@ class _TableParser(HTMLParser):
         if self._ignored:
             self._ignored -= 1
             return
-        if tag in ("th", "td") and self._cell_kind == tag and self._row is not None:
-            text = re.sub(r"\s+", " ", html.unescape("".join(self._cell_parts))).strip()
-            self._row.append((tag, text))
-            self._cell_kind = None
-        elif tag == "tr" and self._row is not None and self._table is not None:
-            self._table.append(self._row)
-            self._row = None
+        if tag in ("th", "td") and self._table is not None:
+            if self._cell_kind != tag:
+                raise BenchmarkError(f"cursorbench contains an unmatched </{tag}> tag.")
+            self._finish_cell()
+        elif tag == "tr" and self._table is not None:
+            if self._row is None:
+                raise BenchmarkError("cursorbench contains an unmatched </tr> tag.")
+            self._finish_row()
+        elif tag in ("thead", "tbody", "tfoot") and self._table is not None:
+            self._finish_row()
         elif tag == "table" and self._table is not None:
-            self.tables.append(self._table)
-            self._table = None
+            self._finish_table()
 
     def handle_data(self, data: str) -> None:
         if not self._ignored and self._cell_kind is not None:
@@ -304,6 +354,7 @@ def parse_cursorbench(content: str, source: Mapping[str, Any]) -> Benchmark:
     try:
         parser.feed(content)
         parser.close()
+        parser.finish()
     except BenchmarkError:
         raise
     except Exception as exc:
@@ -395,17 +446,6 @@ def read_registry(path: Path) -> MutableMapping[str, Any]:
         trusted_scalar(source.get("caveat"), f"{source_id}.caveat", 220)
         bounded_integer(source.get("minimumRows"), f"{source_id}.minimumRows", 1, 10_000)
         bounded_integer(source.get("maximumRows"), f"{source_id}.maximumRows", source["minimumRows"], 10_000)
-        patterns = source.get("modelPatterns")
-        if not isinstance(patterns, list) or not 1 <= len(patterns) <= 20:
-            raise BenchmarkError(f"Source {source_id} must define 1..20 modelPatterns.")
-        for pattern_value in patterns:
-            pattern = trusted_scalar(pattern_value, f"{source_id}.modelPatterns", 200)
-            if not pattern.startswith("^") or not pattern.endswith("$"):
-                raise BenchmarkError(f"Source {source_id} modelPatterns must be anchored.")
-            try:
-                re.compile(pattern)
-            except re.error as exc:
-                raise BenchmarkError(f"Source {source_id} has an invalid model pattern: {exc}") from None
         efforts = source.get("effortLabels")
         if not isinstance(efforts, list) or not efforts:
             raise BenchmarkError(f"Source {source_id} must define effortLabels.")
@@ -467,12 +507,14 @@ def assert_source_rows(source: Mapping[str, Any], rows: Sequence[Row]) -> None:
     maximum = bounded_integer(source["maximumRows"], f"{source['id']}.maximumRows", minimum, 10_000)
     if not minimum <= len(rows) <= maximum:
         raise BenchmarkError(f"{source['id']} returned {len(rows)} rows; expected {minimum}..{maximum}.")
-    seen: set[tuple[str, str, str, str]] = set()
-    for row in rows:
+    seen: dict[tuple[str, str, str, str], int] = {}
+    for index, row in enumerate(rows):
         key = (row.model, row.effort, row.harness, row.config)
         if key in seen:
-            raise BenchmarkError(f"{source['id']} returned a duplicate model/effort/config row.")
-        seen.add(key)
+            raise BenchmarkError(
+                f"{source['id']}.row[{index}] duplicates model/effort/harness/config from row[{seen[key]}]."
+            )
+        seen[key] = index
 
 
 def set_pareto(rows: Sequence[Row]) -> None:
