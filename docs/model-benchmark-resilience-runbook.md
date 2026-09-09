@@ -8,7 +8,7 @@ edits. It does not change the `skill-manager` CLI version.
 
 | position | pull request | version | contents |
 | ---: | --- | --- | --- |
-| 1 | [PR link — fill after publication](PR_LINK_TO_BE_FILLED) | no CLI version change | Bounded family-independent model labels, reviewed CursorBench `Minimal` effort, row-scoped failure diagnostics, tests, and the refreshed benchmark snapshot |
+| 1 | [PR #45](https://github.com/sernst/skills/pull/45) | no CLI version change | Bounded family-independent model labels, reviewed CursorBench `Minimal` effort, row-scoped failure diagnostics, tests, and the refreshed benchmark snapshot |
 
 This human-authored code PR must be merged by fast-forward only. The existing
 scheduled snapshot bot continues to use its established generated-file-only
@@ -32,7 +32,7 @@ just check
 python -m unittest discover -s tools/model_benchmarks/tests -v
 git switch main
 git status --short
-gh pr checks PR_LINK_TO_BE_FILLED --watch
+gh pr checks https://github.com/sernst/skills/pull/45 --watch
 ```
 
 The two `rev-parse` commands must print the same commit. The ancestry command
@@ -46,7 +46,7 @@ Resolve and verify the exact reviewed PR head, then fast-forward `main` to that
 commit. A rejected push is a stop condition; do not force-push.
 
 ```powershell
-$benchmarkPr = "PR_LINK_TO_BE_FILLED"
+$benchmarkPr = "https://github.com/sernst/skills/pull/45"
 $benchmarkHead = gh pr view $benchmarkPr --json headRefOid --jq .headRefOid
 git fetch origin
 git switch main
