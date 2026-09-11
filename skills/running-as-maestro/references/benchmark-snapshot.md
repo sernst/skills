@@ -4,9 +4,9 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-09-09T20:47:39Z`
+- Retrieved after semantic change: `2026-09-11T13:34:05Z`
 - Parser version: `6`
-- Normalized SHA-256: `dc9e1a8e013ea86c4ff28cb5543339ccbd159b3e21c095e0a6631efce1963a51`
+- Normalized SHA-256: `644351be08660fe73bac1d3c61b9fd5a1d16a998bdb4835f7c0d76bd2a807b22`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
@@ -92,7 +92,7 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 
 ## CursorBench
 
-Source: [CursorBench](https://cursor.com/cursorbench) · version `3.2` · source updated `2026-08-11` · normalized SHA-256 `6c6a52c745b05ec1c8e394d43c65d869a73bcafb7682b14a7847bbd4bae0fdf8`
+Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-09-10` · normalized SHA-256 `08acbd0f50323e0f691979cb91d82f9a50326c5d5ac06d0fb55fe639efca9beb`
 
 Metric: `score` · Ambiguous, multi-file tasks from real Cursor sessions. No uncertainty or sample count is published; small score differences may not be meaningful.
 
@@ -100,69 +100,46 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 
 | model | effort | score | avg cost/task | uncertainty / sample | Pareto |
 | --- | --- | ---: | ---: | --- | :---: |
-| Fable 5.1 | Max | 73.40% | $9.640 | — | ★ |
-| Fable 5.1 | Extra High | 72.80% | $6.960 | — | ★ |
-| Grok 4.6 | Extra High | 70.80% | $2.810 | — | ★ |
-| Fable 5 | Max | 70.50% | $17.320 | — |  |
-| Opus 5 | Max | 70.00% | $8.230 | — |  |
-| Grok 4.6 | High | 69.90% | $2.340 | — | ★ |
-| Fable 5.1 | High | 69.40% | $4.800 | — |  |
-| Opus 5 | Extra High | 69.30% | $7.350 | — |  |
-| Gemini 3.8 Flash | High | 69.20% | $2.380 | — |  |
-| Fable 5 | Extra High | 68.40% | $11.730 | — |  |
-| Fable 5.1 | Medium | 68.00% | $3.530 | — |  |
-| Muse Spark 1.3 | Max | 67.90% | $1.310 | — | ★ |
-| GPT-5.6 Sol | Max | 67.20% | $5.690 | — |  |
-| Grok 4.6 | Medium | 67.10% | $1.280 | — | ★ |
-| Gemini 3.8 Flash | Medium | 67.00% | $1.930 | — |  |
-| Opus 5 | High | 66.70% | $3.910 | — |  |
-| Fable 5 | High | 66.50% | $8.770 | — |  |
-| Fable 5.1 | Low | 66.20% | $2.900 | — |  |
-| Fable 5 | Medium | 65.20% | $6.800 | — |  |
-| GPT-5.6 Terra | Max | 64.90% | $2.310 | — |  |
-| GPT-5.6 Sol | Extra High | 64.50% | $3.880 | — |  |
-| Opus 5 | Medium | 64.30% | $3.290 | — |  |
-| Muse Spark 1.3 | Extra High | 63.90% | $1.050 | — | ★ |
-| GPT-5.6 Sol | High | 63.50% | $2.790 | — |  |
-| Opus 5 | Low | 62.80% | $2.550 | — |  |
-| Opus 4.8 | Max | 62.30% | $5.770 | — |  |
-| Fable 5 | Low | 62.10% | $4.460 | — |  |
-| Muse Spark 1.3 | High | 61.70% | $0.840 | — | ★ |
-| Gemini 3.7 Flash | High | 61.60% | $1.200 | — |  |
-| Sonnet 5 | Max | 61.50% | $4.300 | — |  |
-| GPT-5.6 Luna | Max | 61.10% | $0.390 | — | ★ |
-| Grok 4.6 | Low | 61.00% | $0.700 | — |  |
-| Muse Spark 1.3 | Medium | 60.80% | $0.770 | — |  |
-| Kimi K3 | Max | 60.80% | $2.700 | — |  |
-| GPT-5.6 Sol | Medium | 60.00% | $1.950 | — |  |
-| Kimi K3 | High | 59.70% | $1.890 | — |  |
-| Opus 4.8 | Extra High | 59.40% | $4.500 | — |  |
-| GPT-5.6 Terra | Extra High | 59.20% | $1.150 | — |  |
-| Gemini 3.7 Flash | Medium | 59.00% | $0.950 | — |  |
-| Sonnet 5 | Extra High | 58.70% | $2.770 | — |  |
-| GPT-5.5 | High | 58.40% | $2.050 | — |  |
-| GPT-5.5 | Extra High | 58.40% | $2.850 | — |  |
-| Opus 4.8 | High | 58.00% | $3.150 | — |  |
-| GPT-5.6 Luna | Extra High | 57.70% | $0.230 | — | ★ |
-| Sonnet 5 | High | 56.90% | $2.130 | — |  |
-| GPT-5.6 Luna | High | 56.80% | $0.160 | — | ★ |
-| Composer 2.5 | default | 56.10% | $0.440 | — |  |
-| Opus 4.8 | Medium | 56.10% | $2.810 | — |  |
-| Muse Spark 1.3 | Low | 55.00% | $0.450 | — |  |
-| GLM 5.2 | Max | 55.00% | $1.760 | — |  |
-| GPT-5.6 Terra | High | 54.20% | $0.710 | — |  |
-| Gemini 3.7 Flash | Low | 53.80% | $0.740 | — |  |
-| GPT-5.5 | Medium | 53.80% | $1.510 | — |  |
-| Opus 4.8 | Low | 53.10% | $2.020 | — |  |
-| GPT-5.6 Sol | Low | 52.60% | $1.010 | — |  |
-| Sonnet 5 | Medium | 52.40% | $1.440 | — |  |
-| GLM 5.2 | High | 51.50% | $1.190 | — |  |
-| Kimi K3 | Low | 50.50% | $0.990 | — |  |
-| GPT-5.6 Terra | Medium | 50.30% | $0.490 | — |  |
-| Kimi K2.7 Code | default | 49.70% | $1.430 | — |  |
-| Muse Spark 1.3 | Minimal | 48.60% | $0.270 | — |  |
-| GPT-5.6 Luna | Medium | 47.70% | $0.080 | — | ★ |
-| Sonnet 5 | Low | 47.70% | $0.870 | — |  |
-| GPT-5.6 Terra | Low | 46.90% | $0.420 | — |  |
-| GPT-5.5 | Low | 46.60% | $0.980 | — |  |
-| GPT-5.6 Luna | Low | 37.60% | $0.030 | — | ★ |
+| Fable 5.1 | Max | 51.80% | $17.280 | — | ★ |
+| Fable 5.1 | Extra High | 51.60% | $13.010 | — | ★ |
+| Fable 5.1 | High | 49.20% | $9.080 | — | ★ |
+| Fable 5.1 | Medium | 46.80% | $7.050 | — | ★ |
+| Opus 5 | Max | 46.60% | $11.950 | — |  |
+| Opus 5 | Extra High | 46.10% | $11.430 | — |  |
+| Fable 5.1 | Low | 45.10% | $5.440 | — | ★ |
+| Opus 5 | High | 44.70% | $9.000 | — |  |
+| Opus 5 | Medium | 43.30% | $6.940 | — |  |
+| GPT-5.6 Sol | Max | 41.70% | $8.230 | — |  |
+| Muse Spark 1.3 | Max | 41.60% | $2.640 | — | ★ |
+| Grok 4.6 | Extra High | 41.40% | $6.100 | — |  |
+| GPT-5.6 Terra | Max | 41.30% | $5.140 | — |  |
+| Opus 5 | Low | 40.70% | $4.870 | — |  |
+| Grok 4.6 | High | 40.40% | $5.200 | — |  |
+| Gemini 3.8 Flash | High | 39.60% | $4.700 | — |  |
+| GPT-5.6 Sol | Extra High | 37.70% | $4.400 | — |  |
+| Muse Spark 1.3 | Extra High | 37.50% | $2.100 | — | ★ |
+| Gemini 3.8 Flash | Medium | 37.30% | $4.060 | — |  |
+| Grok 4.6 | Medium | 36.10% | $3.480 | — |  |
+| GPT-5.6 Luna | Max | 35.90% | $1.030 | — | ★ |
+| GPT-5.6 Sol | High | 35.70% | $2.850 | — |  |
+| Sonnet 5 | Max | 34.10% | $7.170 | — |  |
+| GPT-5.6 Terra | Extra High | 33.60% | $1.810 | — |  |
+| Muse Spark 1.3 | High | 33.40% | $1.660 | — |  |
+| Grok 4.6 | Low | 33.40% | $2.250 | — |  |
+| GPT-5.6 Luna | Extra High | 33.00% | $0.440 | — | ★ |
+| Muse Spark 1.3 | Medium | 32.60% | $1.490 | — |  |
+| Sonnet 5 | Extra High | 32.00% | $4.550 | — |  |
+| GPT-5.6 Sol | Medium | 31.10% | $1.770 | — |  |
+| Sonnet 5 | High | 30.80% | $3.480 | — |  |
+| GPT-5.6 Terra | High | 30.70% | $1.110 | — |  |
+| GPT-5.6 Luna | High | 29.40% | $0.250 | — | ★ |
+| Muse Spark 1.3 | Low | 29.30% | $0.930 | — |  |
+| Sonnet 5 | Medium | 28.00% | $2.310 | — |  |
+| Composer 2.5 | default | 27.70% | $0.680 | — |  |
+| GPT-5.6 Terra | Medium | 27.60% | $0.640 | — |  |
+| GPT-5.6 Terra | Low | 25.20% | $0.520 | — |  |
+| GPT-5.6 Sol | Low | 24.60% | $0.870 | — |  |
+| Muse Spark 1.3 | Minimal | 24.30% | $0.560 | — |  |
+| Sonnet 5 | Low | 24.10% | $1.390 | — |  |
+| GPT-5.6 Luna | Medium | 22.20% | $0.080 | — | ★ |
+| GPT-5.6 Luna | Low | 16.00% | $0.030 | — | ★ |
