@@ -112,6 +112,9 @@ remains blocking; never ignore an exit code by itself.
 - A clear request may execute `source.add`, `source.update`, `source.locate`,
   `source.alternate`, `source.swap`, `source.branch`, `target.add`, `target.enable`, or
   `resolve` after preflight without a redundant confirmation.
+- For an actual `source.branch` change in machine mode, pass `yes:true` after
+  preflight; omitted or false `yes` intentionally leaves the reviewed plan
+  unapplied. A dry run or validated no-op does not need authorization.
 - Never guess an ambiguous source, collision winner, target, scope, target
   path, or backup. `yes` confirms; it never chooses a scope.
 - To remove from both scopes in one recipe, set `both:true` (mutually

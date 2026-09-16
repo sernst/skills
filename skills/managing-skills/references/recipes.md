@@ -268,6 +268,8 @@ new baseline. Omit `branch` to restore the existing baseline. `alternate:true`
 selects the inactive location; otherwise the active GitHub location is used,
 except that a sole GitHub alternate is inferred when the active location is
 local. The branch is validated remotely before any plan or configuration save.
+An actual branch or saved-default change requires `yes:true`; omit `yes` only
+for `dry_run:true` or a request expected to be a validated no-op.
 
 ```json
 {"command":"source.branch","source":"team","branch":"release/2026","default":true,"dry_run":true}

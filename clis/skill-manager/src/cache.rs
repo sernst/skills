@@ -25,6 +25,45 @@ const MAX_ENTRIES: usize = 100_000;
 const MAX_ARCHIVE_PATH_BYTES: usize = 4096;
 const MAX_COMPONENT_UNITS: usize = 255;
 
+/// Validate one branch name using Git's ref-format rules for branch names.
+///
+/// This deliberately does not support checkout shorthand such as `@{-1}`:
+/// source configuration stores a remote branch name, not a local checkout
+/// expression.
+///
+/// # Errors
+///
+/// Returns an actionable input error when `branch` cannot name a Git branch.
+pub fn validate_git_branch_name(branch: &str) -> Result<()> {
+    let invalid_character = branch.chars().any(|character| {
+        character <= ' ' || character == '\u{7f}' || "~^:?*[\\".contains(character)
+    });
+    #[allow(
+        clippy::case_sensitive_file_extension_comparisons,
+        reason = "Git ref validation rejects the exact case-sensitive `.lock` suffix"
+    )]
+    let invalid_component = branch
+        .split('/')
+        .any(|component| component.starts_with('.') || component.ends_with(".lock"));
+    if branch.is_empty()
+        || branch == "@"
+        || branch.starts_with('-')
+        || branch.starts_with('/')
+        || branch.ends_with('/')
+        || branch.ends_with('.')
+        || branch.contains("//")
+        || branch.contains("..")
+        || branch.contains("@{")
+        || invalid_character
+        || invalid_component
+    {
+        return Err(SkillManagerError::InvalidInput(format!(
+            "invalid Git branch name {branch:?}; provide a full remote branch name"
+        )));
+    }
+    Ok(())
+}
+
 /// Metadata persisted beside one remote source cache.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CacheMetadata {
@@ -242,32 +281,62 @@ impl GitHubTransport for ReqwestGitHubTransport {
     }
 
     fn validate_branch(&self, owner: &str, repo: &str, branch: &str) -> Result<()> {
+        validate_git_branch_name(branch)?;
         let source = format!("{owner}/{repo}:{branch}");
-        let encoded_branch: String =
-            url::form_urlencoded::byte_serialize(branch.as_bytes()).collect();
-        let url = format!(
-            "{}/repos/{owner}/{repo}/branches/{encoded_branch}",
-            self.api_base
-        );
-        let response = self
-            .send_with_retry(&url)
-            .map_err(|error| SkillManagerError::GitHub {
+        let mut url =
+            url::Url::parse(&self.api_base).map_err(|error| SkillManagerError::GitHub {
                 reference: source.clone(),
-                message: error.to_string(),
+                message: format!("invalid GitHub API base URL: {error}"),
             })?;
+        url.set_query(None);
+        url.set_fragment(None);
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|()| SkillManagerError::GitHub {
+                    reference: source.clone(),
+                    message: "GitHub API base URL cannot contain path segments".into(),
+                })?;
+            segments.pop_if_empty();
+            segments.extend(["repos", owner, repo, "branches", branch]);
+        }
+        let response =
+            self.send_with_retry(url.as_str())
+                .map_err(|error| SkillManagerError::GitHub {
+                    reference: source.clone(),
+                    message: error.to_string(),
+                })?;
         if response.status() == StatusCode::NOT_FOUND {
             return Err(SkillManagerError::GitHub {
                 reference: source,
                 message: "branch does not exist or is not accessible".into(),
             });
         }
-        response
+        let response = response
             .error_for_status()
-            .map(|_| ())
             .map_err(|error| SkillManagerError::GitHub {
-                reference: source,
+                reference: source.clone(),
                 message: error.to_string(),
-            })
+            })?;
+        let value: serde_json::Value =
+            response.json().map_err(|error| SkillManagerError::GitHub {
+                reference: source.clone(),
+                message: error.to_string(),
+            })?;
+        let returned = value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| SkillManagerError::GitHub {
+                reference: source.clone(),
+                message: "GitHub branch response omitted name".into(),
+            })?;
+        if returned != branch {
+            return Err(SkillManagerError::GitHub {
+                reference: source,
+                message: format!("GitHub returned branch {returned:?} while validating {branch:?}"),
+            });
+        }
+        Ok(())
     }
 
     fn download_archive(
@@ -1022,8 +1091,8 @@ mod tests {
         CacheJournal, CacheMetadata, CacheSwapState, Clock, GitHubTransport, MAX_COMPRESSED_BYTES,
         ReqwestGitHubTransport, cache_is_fresh, cache_swap_paths, is_transient_status,
         mozilla_root_store, mozilla_tls_config, read_metadata, recover_cache_swap, resolved_cached,
-        ring_tls_config, select_repo_path, swap_cache, validate_relative_path, write_cache_journal,
-        write_metadata,
+        ring_tls_config, select_repo_path, swap_cache, validate_git_branch_name,
+        validate_relative_path, write_cache_journal, write_metadata,
     };
     use crate::config::source_from_reference;
 
@@ -1487,6 +1556,23 @@ mod tests {
         assert!(requests[0].contains("GET /repos/owner/repo/branches/feature%2Fone HTTP/1.1"));
 
         let (base, handle) = mock_server(vec![MockResponse {
+            status: "200 OK",
+            body: r#"{"name":"other"}"#,
+            content_length: None,
+        }]);
+        let error = test_transport(&base, None)
+            .validate_branch("owner", "repo", "feature/one")
+            .err()
+            .unwrap_or_else(|| unreachable!("a mismatched branch response must fail"));
+        assert!(
+            error
+                .to_string()
+                .contains("returned branch \"other\" while validating \"feature/one\"")
+        );
+        let requests = handle.join().unwrap_or_else(|_| unreachable!("server"));
+        assert!(requests[0].contains("GET /repos/owner/repo/branches/feature%2Fone HTTP/1.1"));
+
+        let (base, handle) = mock_server(vec![MockResponse {
             status: "404 Not Found",
             body: "{}",
             content_length: None,
@@ -1536,6 +1622,51 @@ mod tests {
         let _requests = handle.join().unwrap_or_else(|_| unreachable!("server"));
 
         ReqwestGitHubTransport::new().unwrap_or_else(|error| unreachable!("{error}"));
+    }
+
+    #[test]
+    fn git_branch_names_follow_remote_branch_ref_rules() {
+        for branch in [
+            "main",
+            "feature/one",
+            "release/2026.09",
+            "team/@name",
+            "café",
+        ] {
+            validate_git_branch_name(branch)
+                .unwrap_or_else(|error| unreachable!("valid branch {branch:?}: {error}"));
+        }
+
+        for branch in [
+            "",
+            "@",
+            "-main",
+            ".hidden",
+            "topic/.hidden",
+            "topic.lock",
+            "topic/component.lock",
+            "a..b",
+            "a@{b",
+            "a b",
+            "a~b",
+            "a^b",
+            "a:b",
+            "a?b",
+            "a*b",
+            "a[b",
+            "a\\b",
+            "/a",
+            "a/",
+            "a//b",
+            "a.",
+            "a\nb",
+            "a\u{7f}b",
+        ] {
+            let error = validate_git_branch_name(branch)
+                .err()
+                .unwrap_or_else(|| unreachable!("invalid branch {branch:?} must fail"));
+            assert!(error.to_string().contains("invalid Git branch name"));
+        }
     }
 
     #[test]

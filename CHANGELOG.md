@@ -7,6 +7,8 @@ All notable changes to the downloadable CLIs are documented here.
 - Adds reusable terminal radio and checklist prompts with accessible line
   fallbacks, safe cancellation, deterministic keyboard behavior, and strict
   isolation from noninteractive modes.
+- Adds reviewed GitHub source branch switching with per-location defaults,
+  remote validation, and cache-safe refreshes.
 - Retries transient filesystem errors across deployment, import, removal,
   configuration, migration, source caching, discovery, and file output. Every
   primitive starts immediately and waits at most 775ms in bounded backoff;

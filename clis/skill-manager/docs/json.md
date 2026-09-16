@@ -33,7 +33,9 @@ declare that prompting is unavailable; it cannot resolve ambiguous roles.
 Terminal radio and checklist editors are human-input surfaces only; no JSON,
 recipe, or `--no-input` path may start one.
 `source.branch` accepts `source`, optional `branch`, `default`, `alternate`,
-`dry_run`, and `yes`; `default:true` requires a nonblank `branch`.
+`dry_run`, and `yes`; `default:true` requires a nonblank `branch`. An actual
+branch or saved-default change requires `yes:true` in every noninteractive
+mode, including `--json`, inline/stdin/file recipes, and `--no-input`.
 
 ## Event stream
 

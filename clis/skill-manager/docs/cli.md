@@ -279,7 +279,8 @@ baseline. A location that originally followed the repository default keeps that
 choice as a distinct baseline: restoring it resolves and validates the
 repository's current default branch, then continues to follow future repository
 default changes. The command never changes the default branch on GitHub or a
-local Git checkout.
+local Git checkout. An actual noninteractive change requires `--yes`; dry-run
+and validated no-op requests do not.
 
 The active GitHub location is selected by default. `--alternate` explicitly
 selects the inactive location. When the active location is local and the only

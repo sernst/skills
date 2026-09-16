@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 
 use crate::authorize::selection_range;
 use crate::authorize::{Authorization, Authorizer, SelectionOption};
-use crate::cache::{GitHubTransport, materialize_source};
+use crate::cache::{GitHubTransport, materialize_source, validate_git_branch_name};
 use crate::cli::{
     Command, ConfigsAction, ConfigsArgs, ConfigsCopyArgs, CopyArgs, DescribeAction, DescribeArgs,
     DescribeSelection, ImportArgs, RemoveArgs, ResolveArgs, ScopeSelection, SourceAction,
@@ -1794,6 +1794,7 @@ where
                 GitHubBranchDefault::Branch { name } => (Some(name.clone()), name.clone()),
             },
         };
+        validate_git_branch_name(&resolved_branch)?;
         self.github
             .validate_branch(&owner, &repo, &resolved_branch)?;
 
@@ -1882,11 +1883,9 @@ where
         }
         if !args.yes {
             if self.no_input {
-                if !self.reporter.is_json() {
-                    return Err(SkillManagerError::InteractionRequired(
-                        "applying this source branch plan noninteractively requires --yes".into(),
-                    ));
-                }
+                return Err(SkillManagerError::InteractionRequired(
+                    "applying this source branch plan noninteractively requires --yes".into(),
+                ));
             } else if !Authorizer::new(self.prompt)
                 .confirm("Apply this source branch plan?", false)?
                 .is_approved()
@@ -9531,6 +9530,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
 
+    use clap::Parser as _;
     use indexmap::IndexMap;
 
     use super::{
@@ -9541,7 +9541,7 @@ mod tests {
     };
     use crate::cache::GitHubTransport;
     use crate::cli::{
-        Command, CopyArgs, DescribeArgs, DescribeSelection, ImportArgs, LoadArgs, RemoveArgs,
+        Cli, Command, CopyArgs, DescribeArgs, DescribeSelection, ImportArgs, LoadArgs, RemoveArgs,
         SourceAction, SourceAddArgs, SourceArgs, SourceBranchArgs, SourceModeArg, SourceRemoveArgs,
         SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction, TargetAddArgs,
         TargetArgs, TargetNameArgs, TargetPathArgs, UpdateArgs,
@@ -9557,7 +9557,23 @@ mod tests {
     use crate::error::{Result, SkillManagerError};
     use crate::event::{Level, Reporter};
     use crate::prompt::Prompt;
+    use crate::recipe::apply_recipe;
     use crate::transaction::NoopTransactionHook;
+
+    fn source_branch_recipe(value: &serde_json::Value) -> SourceBranchArgs {
+        let argument = format!("--json={value}");
+        let mut cli = Cli::try_parse_from(["skill-manager", argument.as_str()])
+            .unwrap_or_else(|error| unreachable!("parse source branch recipe: {error}"));
+        apply_recipe(&mut cli)
+            .unwrap_or_else(|error| unreachable!("apply source branch recipe: {error}"));
+        let Some(Command::Source(SourceArgs {
+            action: SourceAction::Branch(args),
+        })) = cli.command
+        else {
+            unreachable!("recipe must produce source branch arguments");
+        };
+        args
+    }
 
     #[cfg(unix)]
     fn create_directory_symlink(target: &Path, link: &Path) -> bool {
@@ -10275,6 +10291,36 @@ mod tests {
             original
         );
 
+        let validations_before = network.validations.borrow().len();
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let malformed = Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            true,
+            home.path().to_path_buf(),
+        )
+        .run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "paired".into(),
+                branch: Some(".".into()),
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: true,
+            }),
+        }));
+        assert!(matches!(malformed, Err(SkillManagerError::InvalidInput(_))));
+        assert_eq!(network.validations.borrow().len(), validations_before);
+        assert!(!reporter.events.iter().any(|event| event == "plan"));
+        assert_eq!(
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}")),
+            original
+        );
+
         let mut prompt = TestPrompt::default();
         let mut reporter = RecordingReporter::default();
         let noninteractive = Application::new(
@@ -10305,6 +10351,61 @@ mod tests {
             original
         );
 
+        for recipe in [
+            serde_json::json!({
+                "command": "source.branch",
+                "source": "paired",
+                "branch": "recipe-absent/x"
+            }),
+            serde_json::json!({
+                "command": "source.branch",
+                "source": "paired",
+                "branch": "recipe-false/x",
+                "yes": false
+            }),
+        ] {
+            let args = source_branch_recipe(&recipe);
+            let mut prompt = TestPrompt::default();
+            let mut reporter = RecordingReporter {
+                json: true,
+                ..RecordingReporter::default()
+            };
+            let unauthorized = Application::new(
+                &repository,
+                &network,
+                &mut prompt,
+                &mut reporter,
+                &hook,
+                true,
+                home.path().to_path_buf(),
+            )
+            .run(Command::Source(SourceArgs {
+                action: SourceAction::Branch(args),
+            }));
+            assert!(matches!(
+                unauthorized,
+                Err(SkillManagerError::InteractionRequired(_))
+            ));
+            assert!(reporter.events.iter().any(|event| event == "plan"));
+            assert!(
+                !reporter
+                    .events
+                    .iter()
+                    .any(|event| event == "source.branch-set")
+            );
+            assert_eq!(
+                std::fs::read(repository.config_path())
+                    .unwrap_or_else(|error| unreachable!("{error}")),
+                original
+            );
+        }
+
+        let args = source_branch_recipe(&serde_json::json!({
+            "command": "source.branch",
+            "source": "paired",
+            "branch": "machine/x",
+            "yes": true
+        }));
         let mut prompt = TestPrompt::default();
         let mut reporter = RecordingReporter {
             json: true,
@@ -10320,14 +10421,7 @@ mod tests {
             home.path().to_path_buf(),
         )
         .run(Command::Source(SourceArgs {
-            action: SourceAction::Branch(SourceBranchArgs {
-                source: "paired".into(),
-                branch: Some("machine/x".into()),
-                default: false,
-                alternate: false,
-                dry_run: false,
-                yes: false,
-            }),
+            action: SourceAction::Branch(args),
         }))
         .unwrap_or_else(|error| unreachable!("{error}"));
         let loaded = repository
