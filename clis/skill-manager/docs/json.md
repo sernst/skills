@@ -32,6 +32,8 @@ not accept `yes`. The direct argv commands retain `--yes` only as a way to
 declare that prompting is unavailable; it cannot resolve ambiguous roles.
 Terminal radio and checklist editors are human-input surfaces only; no JSON,
 recipe, or `--no-input` path may start one.
+`source.branch` accepts `source`, optional `branch`, `default`, `alternate`,
+`dry_run`, and `yes`; `default:true` requires a nonblank `branch`.
 
 ## Event stream
 
@@ -132,6 +134,15 @@ command whose plan can carry more than one decision (source copy, then
 propagation mode), so it is the only command that can emit `plan.updated` —
 one per nonfinal answer, before the corresponding narrowed re-render; the
 final answer needs no extra revision because applying begins immediately.
+`source.branch` also emits `plan` revision `0` for a real branch or baseline
+change. Its compact command-specific payload has `command`, `revision`,
+`authorization`, `items`, and `summary`. The single item identifies `source`,
+`source_id`, `slot`, whether it is `inactive`, `owner`, `repo`, optional
+`repo_path`, configured `old_branch`/`new_branch`, concrete
+`resolved_branch`, typed `default_before`/`default_after`, and
+`cache_refresh`. Its summary counts `sources`, `branch_changes`, and
+`default_changes`. This plan is emitted only after remote branch validation and
+before confirmation or writes. An unchanged request emits no plan.
 Propagation resolves silently (no flag, no prompt) whenever the resolved
 source copy would leave nothing else out of date, so a single-deployment or
 already-synchronized import can commit with `yes:true` alone. Otherwise, every

@@ -110,7 +110,7 @@ remains blocking; never ignore an exit code by itself.
   `yes:true` where supported. Never treat the user's initial request as that
   second confirmation.
 - A clear request may execute `source.add`, `source.update`, `source.locate`,
-  `source.alternate`, `source.swap`, `target.add`, `target.enable`, or
+  `source.alternate`, `source.swap`, `source.branch`, `target.add`, `target.enable`, or
   `resolve` after preflight without a redundant confirmation.
 - Never guess an ambiguous source, collision winner, target, scope, target
   path, or backup. `yes` confirms; it never chooses a scope.

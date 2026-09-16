@@ -270,6 +270,27 @@ it. `source swap SOURCE` exchanges active and inactive locations. Local/local,
 local/GitHub, and GitHub/GitHub pairs are supported, and local paths need not
 exist yet. A swap requires an alternate.
 
+`source branch SOURCE [BRANCH]` changes the branch of a GitHub location without
+changing its repository, repository subpath, source identity, mode, or
+exclusions. A branch can contain `/`. The first change records the location's
+current branch as its manager-local baseline; omitting `BRANCH` later restores
+that baseline. `BRANCH --default` changes the branch and replaces the saved
+baseline. A location that originally followed the repository default keeps that
+choice as a distinct baseline: restoring it resolves and validates the
+repository's current default branch, then continues to follow future repository
+default changes. The command never changes the default branch on GitHub or a
+local Git checkout.
+
+The active GitHub location is selected by default. `--alternate` explicitly
+selects the inactive location. When the active location is local and the only
+GitHub location is the alternate, the command infers that alternate and marks
+it as inactive in the plan; the source remains local after the change. A
+selected local location is an error. The requested or resolved branch is
+checked on GitHub before the plan is emitted, so an inaccessible branch leaves
+the configuration unchanged. A branch change makes the existing remote cache
+ineligible and refreshes it on the next materialization; dry-run, cancellation,
+and unchanged requests do not modify configuration or cache eligibility.
+
 Source selectors are a stable ID, name, unique label, or active location.
 Inactive locations are deliberately not selectors. A newly set active or
 alternate location cannot collide with any slot of another source; existing

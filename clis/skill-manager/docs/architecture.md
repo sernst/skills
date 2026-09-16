@@ -19,6 +19,15 @@ name. Ordered collections preserve that order through discovery, planning,
 event emission, and status rendering. Skill names and Python-style `fnmatch`
 patterns use NFKC case folding.
 
+GitHub branch selection is manager-local configuration. The application asks
+the transport to validate the requested branch before it emits a plan or saves
+configuration, while the transport reuses the same bounded retry and response
+handling as archive materialization. Per-location typed baselines distinguish
+an explicit saved branch from following the repository default. A source-wide
+generation joins remote identity in cache metadata, so any branch change makes
+old content ineligible even after a switch away and back; replacement remains
+transactional and recoverable.
+
 ## Scoped targets and effective deployments
 
 Targets persist one normalized root-relative template. The resolver pairs that

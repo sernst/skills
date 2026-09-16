@@ -1216,6 +1216,8 @@ pub fn source_from_reference(
             repo: Some(reference.repo),
             r#ref: reference.reference,
             repo_path: reference.repo_path,
+            branch_default: None,
+            cache_generation: 0,
             alternate: None,
             extra: IndexMap::new(),
         };
@@ -1256,6 +1258,8 @@ pub fn source_from_reference(
         repo: None,
         r#ref: None,
         repo_path: None,
+        branch_default: None,
+        cache_generation: 0,
         alternate: None,
         extra: IndexMap::new(),
     };
@@ -1295,6 +1299,7 @@ fn raw_source_location(source: &SourceEntry) -> Result<SourceLocation> {
                 || source.repo.is_some()
                 || source.r#ref.is_some()
                 || source.repo_path.is_some()
+                || source.branch_default.is_some()
             {
                 return Err(SkillManagerError::InvalidInput(format!(
                     "local source '{}' forbids GitHub location fields",
@@ -1333,6 +1338,7 @@ fn raw_source_location(source: &SourceEntry) -> Result<SourceLocation> {
                 repo,
                 r#ref: source.r#ref.clone(),
                 repo_path: source.repo_path.clone(),
+                branch_default: source.branch_default.clone(),
             })
         }
     }
@@ -1355,6 +1361,7 @@ fn normalize_location(location: SourceLocation) -> Result<SourceLocation> {
             repo,
             r#ref,
             repo_path,
+            branch_default,
         } => Ok(SourceLocation::GitHub {
             owner,
             repo,
@@ -1362,6 +1369,7 @@ fn normalize_location(location: SourceLocation) -> Result<SourceLocation> {
             repo_path: repo_path
                 .map(|path| normalize_repo_path(&path))
                 .transpose()?,
+            branch_default,
         }),
     }
 }
@@ -1389,6 +1397,7 @@ pub fn set_source_location(source: &mut SourceEntry, location: &SourceLocation) 
     source.repo = None;
     source.r#ref = None;
     source.repo_path = None;
+    source.branch_default = None;
     match location {
         SourceLocation::Local { path } => {
             source.source_type = SourceType::Local;
@@ -1399,12 +1408,14 @@ pub fn set_source_location(source: &mut SourceEntry, location: &SourceLocation) 
             repo,
             r#ref,
             repo_path,
+            branch_default,
         } => {
             source.source_type = SourceType::GitHub;
             source.owner = Some(owner.clone());
             source.repo = Some(repo.clone());
             source.r#ref.clone_from(r#ref);
             source.repo_path.clone_from(repo_path);
+            source.branch_default.clone_from(branch_default);
         }
     }
 }
@@ -1431,6 +1442,7 @@ pub fn location_identity(location: &SourceLocation) -> String {
             repo,
             r#ref,
             repo_path,
+            ..
         } => {
             let normalized_repo_path = repo_path
                 .as_deref()
@@ -1457,6 +1469,7 @@ pub fn location_reference(location: &SourceLocation) -> String {
             repo,
             r#ref,
             repo_path,
+            ..
         } => {
             let mut value = format!("{owner}/{repo}");
             if let Some(reference) = r#ref {
@@ -1491,6 +1504,7 @@ fn validate_location(location: &SourceLocation, source_name: &str) -> Result<()>
             repo,
             r#ref,
             repo_path,
+            branch_default,
         } => {
             if !valid_github_segment(owner) || !valid_github_segment(repo) {
                 return Err(SkillManagerError::InvalidInput(format!(
@@ -1500,6 +1514,13 @@ fn validate_location(location: &SourceLocation, source_name: &str) -> Result<()>
             if r#ref.as_ref().is_some_and(|value| value.trim().is_empty()) {
                 return Err(SkillManagerError::InvalidInput(format!(
                     "GitHub location for source '{source_name}' has a blank ref"
+                )));
+            }
+            if let Some(crate::domain::GitHubBranchDefault::Branch { name }) = branch_default
+                && name.trim().is_empty()
+            {
+                return Err(SkillManagerError::InvalidInput(format!(
+                    "GitHub location for source '{source_name}' has a blank branch default"
                 )));
             }
             if let Some(path) = repo_path {
@@ -2174,10 +2195,13 @@ mod tests {
         derive_salted_source_id, derive_source_id, ensure_ascii, find_source_index,
         is_builtin_name, is_github_reference, locations_equal, manager_home, migrate_v0,
         normalize_target_template, parse_github_reference, paths_equal, resolved_targets,
-        resolved_targets_for_scope, source_from_reference, source_location, source_reference,
-        validate_config, validate_source,
+        resolved_targets_for_scope, set_source_location, source_from_reference, source_location,
+        source_reference, validate_config, validate_source,
     };
-    use crate::domain::{Scope, SourceEntry, SourceLocation, SourceMode, SourceType, TargetEntry};
+    use crate::domain::{
+        GitHubBranchDefault, Scope, SourceEntry, SourceLocation, SourceMode, SourceType,
+        TargetEntry,
+    };
 
     /// Placeholder manager home for call sites whose reference is a GitHub
     /// shorthand or an already-absolute local path, neither of which is
@@ -3287,6 +3311,8 @@ mod tests {
             repo: None,
             r#ref: None,
             repo_path: None,
+            branch_default: None,
+            cache_generation: 0,
             alternate: None,
             extra: IndexMap::new(),
         };
@@ -3379,6 +3405,74 @@ mod tests {
     }
 
     #[test]
+    fn branch_defaults_are_typed_legacy_safe_and_travel_with_github_locations() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let legacy = json!({
+            "id": "src_remote",
+            "type": "github",
+            "mode": "collection",
+            "name": "remote",
+            "label": "Remote",
+            "owner": "owner",
+            "repo": "repo",
+            "ref": "legacy"
+        });
+        let mut source: SourceEntry =
+            serde_json::from_value(legacy).unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(source.branch_default.is_none());
+        assert_eq!(source.cache_generation, 0);
+        source.branch_default = Some(GitHubBranchDefault::Branch {
+            name: "legacy".into(),
+        });
+        source.alternate = Some(SourceLocation::GitHub {
+            owner: "owner".into(),
+            repo: "mirror".into(),
+            r#ref: None,
+            repo_path: Some("skills".into()),
+            branch_default: Some(GitHubBranchDefault::RepositoryDefault),
+        });
+
+        let active = source_location(&source).unwrap_or_else(|error| unreachable!("{error}"));
+        let alternate = source
+            .alternate
+            .clone()
+            .unwrap_or_else(|| unreachable!("alternate"));
+        set_source_location(&mut source, &alternate);
+        source.alternate = Some(active);
+
+        assert_eq!(
+            source.branch_default,
+            Some(GitHubBranchDefault::RepositoryDefault)
+        );
+        assert_eq!(
+            source.alternate,
+            Some(SourceLocation::GitHub {
+                owner: "owner".into(),
+                repo: "repo".into(),
+                r#ref: Some("legacy".into()),
+                repo_path: None,
+                branch_default: Some(GitHubBranchDefault::Branch {
+                    name: "legacy".into()
+                }),
+            })
+        );
+        let value = serde_json::to_value(&source).unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(value["branch_default"]["type"], "repository-default");
+        assert_eq!(value["alternate"]["branch_default"]["type"], "branch");
+        assert_eq!(value["alternate"]["branch_default"]["name"], "legacy");
+        let repository = FileConfigRepository::new(root.path());
+        repository
+            .save(
+                repository.config_path(),
+                &Config {
+                    sources: vec![source],
+                    ..Config::default()
+                },
+            )
+            .unwrap_or_else(|error| unreachable!("{error}"));
+    }
+
+    #[test]
     fn persistence_normalizes_local_paths_and_github_repo_path_separators() {
         let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
         let repository = FileConfigRepository::new(root.path());
@@ -3418,12 +3512,14 @@ mod tests {
                 repo: "Repo".into(),
                 r#ref: Some("Main".into()),
                 repo_path: Some(r"Skills\Team".into()),
+                branch_default: None,
             },
             &SourceLocation::GitHub {
                 owner: "owner".into(),
                 repo: "repo".into(),
                 r#ref: Some("Main".into()),
                 repo_path: Some("Skills/Team".into()),
+                branch_default: None,
             }
         ));
     }

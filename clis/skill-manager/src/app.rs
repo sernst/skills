@@ -13,8 +13,9 @@ use crate::cache::{GitHubTransport, materialize_source};
 use crate::cli::{
     Command, ConfigsAction, ConfigsArgs, ConfigsCopyArgs, CopyArgs, DescribeAction, DescribeArgs,
     DescribeSelection, ImportArgs, RemoveArgs, ResolveArgs, ScopeSelection, SourceAction,
-    SourceAddArgs, SourceAlternateArgs, SourceLocateArgs, SourceModeArg, SourceSelection,
-    SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction, TargetSelection,
+    SourceAddArgs, SourceAlternateArgs, SourceBranchArgs, SourceLocateArgs, SourceModeArg,
+    SourceSelection, SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction,
+    TargetSelection,
 };
 use crate::config::{
     CONFIG_SCHEMA_VERSION, Config, ConfigBackup, ConfigRepository, FileConfigRepository,
@@ -26,8 +27,8 @@ use crate::config::{
     source_reference,
 };
 use crate::domain::{
-    ResolvedSource, Scope, ScopedTarget, SkillCandidate, SkillDiscovery, SourceEntry,
-    SourceLocation, SourceMode, SourceType, Target, TargetEntry,
+    GitHubBranchDefault, ResolvedSource, Scope, ScopedTarget, SkillCandidate, SkillDiscovery,
+    SourceEntry, SourceLocation, SourceMode, SourceType, Target, TargetEntry,
 };
 use crate::error::{Result, SkillManagerError};
 use crate::event::{Level, Reporter};
@@ -94,6 +95,12 @@ struct ImportDeployment {
 struct ScopeContext {
     project_root: PathBuf,
     project_available: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceBranchSlot {
+    Active,
+    Alternate,
 }
 
 /// Normalized selection shared by the three `describe` entry points.
@@ -1266,6 +1273,7 @@ where
             SourceAction::Locate(args) => self.source_locate(config, active_path, &args),
             SourceAction::Alternate(args) => self.source_alternate(config, active_path, args),
             SourceAction::Swap(args) => self.source_swap(config, active_path, &args),
+            SourceAction::Branch(args) => self.source_branch(config, active_path, &args),
         }
     }
 
@@ -1725,6 +1733,286 @@ where
             "source.locations-swapped",
             Level::Info,
             source_change_data(&proposed, &previous, true),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Branch selection, remote validation, review, and mutation remain auditable together."
+    )]
+    fn source_branch(
+        &mut self,
+        config: &mut Config,
+        active_path: &Path,
+        args: &SourceBranchArgs,
+    ) -> Result<()> {
+        if args
+            .branch
+            .as_ref()
+            .is_some_and(|branch| branch.trim().is_empty())
+        {
+            return Err(SkillManagerError::InvalidInput(
+                "branch name must not be blank".into(),
+            ));
+        }
+        let index = source_selector_index(config, &args.source, &self.home)?;
+        let previous = config.sources[index].clone();
+        let active = source_location(&previous)?;
+        let (slot, selected) = select_source_branch_location(&previous, active, args.alternate)?;
+        let SourceLocation::GitHub {
+            owner,
+            repo,
+            r#ref: old_ref,
+            repo_path,
+            branch_default: saved_default,
+        } = selected
+        else {
+            return Err(SkillManagerError::InvalidInput(format!(
+                "the selected {} location for source '{}' is local; choose a GitHub location",
+                source_branch_slot_name(slot),
+                previous.name
+            )));
+        };
+        let legacy_default = saved_default
+            .clone()
+            .unwrap_or_else(|| branch_default_from_ref(old_ref.as_deref()));
+        let next_default = if args.default {
+            GitHubBranchDefault::Branch {
+                name: args.branch.clone().ok_or_else(|| {
+                    SkillManagerError::InvalidInput("--default requires an explicit BRANCH".into())
+                })?,
+            }
+        } else {
+            legacy_default.clone()
+        };
+        let (new_ref, resolved_branch) = match args.branch.as_ref() {
+            Some(branch) => (Some(branch.clone()), branch.clone()),
+            None => match &legacy_default {
+                GitHubBranchDefault::RepositoryDefault => {
+                    (None, self.github.default_branch(&owner, &repo)?)
+                }
+                GitHubBranchDefault::Branch { name } => (Some(name.clone()), name.clone()),
+            },
+        };
+        self.github
+            .validate_branch(&owner, &repo, &resolved_branch)?;
+
+        let branch_changed = old_ref != new_ref;
+        let default_changed = args.default && saved_default.as_ref() != Some(&next_default);
+        let next_cache_generation = if branch_changed {
+            previous.cache_generation.checked_add(1).ok_or_else(|| {
+                SkillManagerError::InvalidInput(format!(
+                    "source '{}' cache generation cannot advance further",
+                    previous.name
+                ))
+            })?
+        } else {
+            previous.cache_generation
+        };
+        if !branch_changed && !default_changed {
+            let branch = branch_display(new_ref.as_deref(), Some(&resolved_branch));
+            self.reporter.human(&format!(
+                "Source {} already uses {branch} at its {} location; nothing changed.",
+                previous.name,
+                source_branch_slot_name(slot)
+            ))?;
+            self.reporter.event(
+                "source.branch-unchanged",
+                Level::Info,
+                json!({
+                    "source": previous.name,
+                    "source_id": previous.id,
+                    "slot": source_branch_slot_name(slot),
+                    "branch": new_ref,
+                    "resolved_branch": resolved_branch,
+                    "default": next_default,
+                    "changed": false,
+                }),
+            )?;
+            return self.report_source_branch_summary(false, false, args.dry_run);
+        }
+
+        let persisted_default = if saved_default.is_none() || args.default {
+            Some(next_default.clone())
+        } else {
+            saved_default.clone()
+        };
+        let plan = json!({
+            "command": "source.branch",
+            "revision": 0,
+            "items": [{
+                "source": previous.name,
+                "source_id": previous.id,
+                "slot": source_branch_slot_name(slot),
+                "inactive": slot == SourceBranchSlot::Alternate,
+                "owner": owner,
+                "repo": repo,
+                "repo_path": repo_path,
+                "old_branch": old_ref,
+                "new_branch": new_ref,
+                "resolved_branch": resolved_branch,
+                "default_before": saved_default,
+                "default_after": persisted_default,
+                "cache_refresh": branch_changed,
+            }],
+            "summary": {
+                "sources": 1,
+                "branch_changes": usize::from(branch_changed),
+                "default_changes": usize::from(default_changed),
+            },
+            "authorization": source_branch_authorization(args, self.no_input),
+        });
+        self.reporter.event("plan", Level::Info, plan)?;
+        self.render_source_branch_plan(
+            &previous,
+            slot,
+            &owner,
+            &repo,
+            repo_path.as_deref(),
+            old_ref.as_deref(),
+            new_ref.as_deref(),
+            &resolved_branch,
+            saved_default.as_ref(),
+            persisted_default.as_ref(),
+            branch_changed,
+        )?;
+
+        if args.dry_run {
+            return self.report_source_branch_summary(true, false, true);
+        }
+        if !args.yes {
+            if self.no_input {
+                if !self.reporter.is_json() {
+                    return Err(SkillManagerError::InteractionRequired(
+                        "applying this source branch plan noninteractively requires --yes".into(),
+                    ));
+                }
+            } else if !Authorizer::new(self.prompt)
+                .confirm("Apply this source branch plan?", false)?
+                .is_approved()
+            {
+                self.report_cancelled("source.branch")?;
+                self.report_source_branch_summary(true, false, false)?;
+                return Err(SkillManagerError::Cancelled);
+            }
+        }
+
+        let mut proposed = previous.clone();
+        proposed.cache_generation = next_cache_generation;
+        let replacement = SourceLocation::GitHub {
+            owner,
+            repo,
+            r#ref: new_ref,
+            repo_path,
+            branch_default: persisted_default,
+        };
+        match slot {
+            SourceBranchSlot::Active => set_source_location(&mut proposed, &replacement),
+            SourceBranchSlot::Alternate => proposed.alternate = Some(replacement),
+        }
+        config.sources[index] = proposed.clone();
+        self.repository.save(active_path, config)?;
+        self.reporter.human(&format!(
+            "Updated source {} {} branch.{}",
+            proposed.name,
+            source_branch_slot_name(slot),
+            if branch_changed {
+                " Its remote cache will refresh on next use."
+            } else {
+                ""
+            }
+        ))?;
+        self.reporter.event(
+            "source.branch-set",
+            Level::Info,
+            json!({
+                "source": proposed.name,
+                "source_id": proposed.id,
+                "slot": source_branch_slot_name(slot),
+                "branch": match slot {
+                    SourceBranchSlot::Active => proposed.r#ref.clone(),
+                    SourceBranchSlot::Alternate => proposed.alternate.as_ref().and_then(|location| match location {
+                        SourceLocation::GitHub { r#ref, .. } => r#ref.clone(),
+                        SourceLocation::Local { .. } => None,
+                    }),
+                },
+                "resolved_branch": resolved_branch,
+                "default": next_default,
+                "cache_refresh": branch_changed,
+                "changed": true,
+            }),
+        )?;
+        self.report_source_branch_summary(true, true, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_source_branch_plan(
+        &mut self,
+        source: &SourceEntry,
+        slot: SourceBranchSlot,
+        owner: &str,
+        repo: &str,
+        repo_path: Option<&str>,
+        old_ref: Option<&str>,
+        new_ref: Option<&str>,
+        resolved_branch: &str,
+        default_before: Option<&GitHubBranchDefault>,
+        default_after: Option<&GitHubBranchDefault>,
+        cache_refresh: bool,
+    ) -> Result<()> {
+        self.reporter.human("Source branch plan")?;
+        self.reporter.human("")?;
+        self.reporter
+            .human(&format!("  Source      {}", source.name))?;
+        let inactive = if slot == SourceBranchSlot::Alternate {
+            " (inactive)"
+        } else {
+            ""
+        };
+        self.reporter.human(&format!(
+            "  Location    {}{inactive}",
+            source_branch_slot_name(slot)
+        ))?;
+        let path = repo_path.map_or_else(String::new, |path| format!("/{path}"));
+        self.reporter
+            .human(&format!("  Repository  {owner}/{repo}{path}"))?;
+        self.reporter.human(&format!(
+            "  Branch      {} → {}",
+            branch_display(old_ref, None),
+            branch_display(new_ref, Some(resolved_branch))
+        ))?;
+        self.reporter.human(&format!(
+            "  Default     {} → {}",
+            branch_default_display(default_before, old_ref),
+            branch_default_display(default_after, new_ref)
+        ))?;
+        self.reporter.human(&format!(
+            "  Cache       {}",
+            if cache_refresh {
+                "refresh required on next use"
+            } else {
+                "existing cache remains eligible"
+            }
+        ))
+    }
+
+    fn report_source_branch_summary(
+        &mut self,
+        planned: bool,
+        applied: bool,
+        dry_run: bool,
+    ) -> Result<()> {
+        let action = "source.branch";
+        self.reporter.event(
+            "summary",
+            Level::Info,
+            json!({
+                "action": action,
+                "planned": usize::from(planned),
+                "applied": usize::from(applied),
+                "unchanged": usize::from(!planned),
+                "dry_run": dry_run,
+            }),
         )
     }
 
@@ -5550,6 +5838,90 @@ fn describe_source_data(source: &SourceEntry) -> Value {
     value
 }
 
+fn select_source_branch_location(
+    source: &SourceEntry,
+    active: SourceLocation,
+    alternate_requested: bool,
+) -> Result<(SourceBranchSlot, SourceLocation)> {
+    if alternate_requested {
+        return source
+            .alternate
+            .clone()
+            .map(|location| (SourceBranchSlot::Alternate, location))
+            .ok_or_else(|| {
+                SkillManagerError::InvalidInput(format!(
+                    "source '{}' has no alternate location; omit --alternate or configure one first",
+                    source.name
+                ))
+            });
+    }
+    if matches!(active, SourceLocation::GitHub { .. }) {
+        return Ok((SourceBranchSlot::Active, active));
+    }
+    if let Some(alternate @ SourceLocation::GitHub { .. }) = source.alternate.clone() {
+        return Ok((SourceBranchSlot::Alternate, alternate));
+    }
+    Err(SkillManagerError::InvalidInput(format!(
+        "source '{}' has no GitHub location whose branch can be changed",
+        source.name
+    )))
+}
+
+const fn source_branch_slot_name(slot: SourceBranchSlot) -> &'static str {
+    match slot {
+        SourceBranchSlot::Active => "active",
+        SourceBranchSlot::Alternate => "alternate",
+    }
+}
+
+fn branch_default_from_ref(reference: Option<&str>) -> GitHubBranchDefault {
+    reference.map_or(GitHubBranchDefault::RepositoryDefault, |name| {
+        GitHubBranchDefault::Branch {
+            name: name.to_owned(),
+        }
+    })
+}
+
+fn branch_display(reference: Option<&str>, resolved: Option<&str>) -> String {
+    reference.map_or_else(
+        || {
+            resolved.map_or_else(
+                || "repository default".into(),
+                |name| format!("repository default ({name})"),
+            )
+        },
+        ToOwned::to_owned,
+    )
+}
+
+fn branch_default_display(value: Option<&GitHubBranchDefault>, legacy_ref: Option<&str>) -> String {
+    match value {
+        Some(GitHubBranchDefault::RepositoryDefault) => "repository default".into(),
+        Some(GitHubBranchDefault::Branch { name }) => name.clone(),
+        None => format!(
+            "not recorded (currently {})",
+            branch_display(legacy_ref, None)
+        ),
+    }
+}
+
+fn source_branch_authorization(args: &SourceBranchArgs, no_input: bool) -> Value {
+    let mode = if args.dry_run {
+        "dry-run"
+    } else if args.yes {
+        "yes"
+    } else if no_input {
+        "noninteractive"
+    } else {
+        "prompt"
+    };
+    json!({
+        "kind": "binary",
+        "mode": mode,
+        "default": (!args.dry_run && !args.yes && !no_input).then_some(true),
+    })
+}
+
 fn command_dry_run(command: &Command) -> bool {
     match command {
         Command::Load(args) => args.sync.dry_run,
@@ -5557,6 +5929,9 @@ fn command_dry_run(command: &Command) -> bool {
         Command::Import(args) => args.dry_run,
         Command::Copy(args) => args.dry_run,
         Command::Remove(args) => args.dry_run,
+        Command::Source(crate::cli::SourceArgs {
+            action: SourceAction::Branch(args),
+        }) => args.dry_run,
         _ => false,
     }
 }
@@ -9152,6 +9527,7 @@ pub fn production_repository(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
 
@@ -9166,15 +9542,18 @@ mod tests {
     use crate::cache::GitHubTransport;
     use crate::cli::{
         Command, CopyArgs, DescribeArgs, DescribeSelection, ImportArgs, LoadArgs, RemoveArgs,
-        SourceAction, SourceAddArgs, SourceArgs, SourceModeArg, SourceRemoveArgs, SourceUpdateArgs,
-        StatusArgs, SyncArgs, TargetAction, TargetAddArgs, TargetArgs, TargetNameArgs,
-        TargetPathArgs, UpdateArgs,
+        SourceAction, SourceAddArgs, SourceArgs, SourceBranchArgs, SourceModeArg, SourceRemoveArgs,
+        SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction, TargetAddArgs,
+        TargetArgs, TargetNameArgs, TargetPathArgs, UpdateArgs,
     };
     use crate::config::{
-        Config, FileConfigRepository, portable_canonicalize, resolved_targets,
-        source_from_reference,
+        Config, ConfigRepository, FileConfigRepository, location_from_reference,
+        portable_canonicalize, resolved_targets, source_from_reference,
     };
-    use crate::domain::{ResolvedSource, Scope, SkillCandidate, SkillDiscovery, TargetEntry};
+    use crate::domain::{
+        GitHubBranchDefault, ResolvedSource, Scope, SkillCandidate, SkillDiscovery, SourceLocation,
+        SourceType, TargetEntry,
+    };
     use crate::error::{Result, SkillManagerError};
     use crate::event::{Level, Reporter};
     use crate::prompt::Prompt;
@@ -9275,6 +9654,12 @@ mod tests {
             ))
         }
 
+        fn validate_branch(&self, _owner: &str, _repo: &str, _branch: &str) -> Result<()> {
+            Err(SkillManagerError::InvalidInput(
+                "network must not be used".into(),
+            ))
+        }
+
         fn download_archive(
             &self,
             _owner: &str,
@@ -9288,14 +9673,50 @@ mod tests {
         }
     }
 
+    struct BranchNetwork {
+        default: String,
+        reject: bool,
+        validations: RefCell<Vec<String>>,
+    }
+
+    impl GitHubTransport for BranchNetwork {
+        fn default_branch(&self, _owner: &str, _repo: &str) -> Result<String> {
+            Ok(self.default.clone())
+        }
+
+        fn validate_branch(&self, _owner: &str, _repo: &str, branch: &str) -> Result<()> {
+            self.validations.borrow_mut().push(branch.to_owned());
+            if self.reject {
+                Err(SkillManagerError::InvalidInput(format!(
+                    "branch is not accessible: {branch}"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn download_archive(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _reference: &str,
+            _destination: &std::path::Path,
+        ) -> Result<()> {
+            Err(SkillManagerError::InvalidInput(
+                "archive download is outside this test".into(),
+            ))
+        }
+    }
+
     #[derive(Default)]
     struct TestPrompt {
         texts: VecDeque<String>,
+        confirmations: VecDeque<bool>,
     }
 
     impl Prompt for TestPrompt {
         fn confirm(&mut self, _message: &str, default: bool) -> Result<bool> {
-            Ok(default)
+            Ok(self.confirmations.pop_front().unwrap_or(default))
         }
 
         fn text(&mut self, _message: &str, default: Option<&str>) -> Result<String> {
@@ -9321,6 +9742,7 @@ mod tests {
         event_data: Vec<serde_json::Value>,
         human: Vec<String>,
         diagnostics: Vec<String>,
+        json: bool,
     }
 
     impl Reporter for RecordingReporter {
@@ -9341,7 +9763,7 @@ mod tests {
         }
 
         fn is_json(&self) -> bool {
-            false
+            self.json
         }
     }
 
@@ -9515,6 +9937,16 @@ mod tests {
             ..RemoveArgs::default()
         };
         assert!(command_dry_run(&Command::Remove(remove)));
+        assert!(command_dry_run(&Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "remote".into(),
+                branch: Some("feature/x".into()),
+                default: false,
+                alternate: false,
+                dry_run: true,
+                yes: false,
+            }),
+        })));
         assert!(!command_dry_run(&Command::Status(StatusArgs::default())));
 
         assert_eq!(
@@ -9527,6 +9959,563 @@ mod tests {
             ]),
             ["a*", "b?"]
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One lifecycle fixture proves legacy, saved-default, temporary, reset, and no-op transitions."
+    )]
+    fn source_branch_switches_slash_refs_then_restores_the_legacy_baseline() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+        let mut source = source_from_reference("owner/repo:main/skills", None, home.path())
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        source.name = "remote".into();
+        source.label = "Remote skills".into();
+        source.r#ref = Some("feature/x".into());
+        source.exclude = vec!["draft-*".into()];
+        let stable_id = source.id.clone();
+        repository
+            .save(
+                repository.config_path(),
+                &Config {
+                    sources: vec![source],
+                    ..Config::default()
+                },
+            )
+            .unwrap_or_else(|error| unreachable!("{error}"));
+
+        let network = BranchNetwork {
+            default: "main".into(),
+            reject: false,
+            validations: RefCell::new(Vec::new()),
+        };
+        let hook = NoopTransactionHook;
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let mut app = Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            false,
+            home.path().to_path_buf(),
+        );
+        app.run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "remote".into(),
+                branch: Some("release/y".into()),
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: true,
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        app.run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "remote".into(),
+                branch: None,
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: true,
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        app.run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "remote".into(),
+                branch: Some("stable".into()),
+                default: true,
+                alternate: false,
+                dry_run: false,
+                yes: true,
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        app.run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "remote".into(),
+                branch: Some("temporary/z".into()),
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: true,
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        app.run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "remote".into(),
+                branch: None,
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: true,
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+
+        let before_noop =
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}"));
+        app.run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "remote".into(),
+                branch: Some("stable".into()),
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: true,
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}")),
+            before_noop
+        );
+        drop(app);
+        assert_eq!(
+            reporter
+                .events
+                .iter()
+                .filter(|event| *event == "plan")
+                .count(),
+            5
+        );
+        assert!(
+            reporter
+                .events
+                .iter()
+                .any(|event| event == "source.branch-unchanged")
+        );
+
+        let loaded = repository
+            .load(false)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let restored = &loaded.config.sources[0];
+        assert_eq!(restored.id, stable_id);
+        assert_eq!(restored.name, "remote");
+        assert_eq!(restored.label, "Remote skills");
+        assert_eq!(restored.exclude, ["draft-*"]);
+        assert_eq!(restored.repo_path.as_deref(), Some("skills"));
+        assert_eq!(restored.r#ref.as_deref(), Some("stable"));
+        assert_eq!(restored.cache_generation, 5);
+        assert_eq!(
+            restored.branch_default,
+            Some(GitHubBranchDefault::Branch {
+                name: "stable".into()
+            })
+        );
+        assert_eq!(
+            network.validations.into_inner(),
+            [
+                "release/y",
+                "feature/x",
+                "stable",
+                "temporary/z",
+                "stable",
+                "stable"
+            ]
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One fixture proves every pre-save branch authorization path leaves identical bytes."
+    )]
+    fn source_branch_infers_remote_alternate_and_failed_authorization_never_saves() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let local = home.path().join("local");
+        std::fs::create_dir_all(&local).unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+        let mut source = source_from_reference(&local.to_string_lossy(), None, home.path())
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        source.name = "paired".into();
+        source.alternate = Some(
+            location_from_reference("owner/repo:main/skills", source.mode, home.path())
+                .unwrap_or_else(|error| unreachable!("{error}")),
+        );
+        repository
+            .save(
+                repository.config_path(),
+                &Config {
+                    sources: vec![source],
+                    ..Config::default()
+                },
+            )
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let original =
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}"));
+        let hook = NoopTransactionHook;
+
+        let network = BranchNetwork {
+            default: "main".into(),
+            reject: false,
+            validations: RefCell::new(Vec::new()),
+        };
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            false,
+            home.path().to_path_buf(),
+        )
+        .run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "paired".into(),
+                branch: Some("preview/x".into()),
+                default: false,
+                alternate: false,
+                dry_run: true,
+                yes: false,
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}")),
+            original
+        );
+        let plan_index = reporter
+            .events
+            .iter()
+            .position(|event| event == "plan")
+            .unwrap_or_else(|| unreachable!("plan event"));
+        assert_eq!(
+            reporter.event_data[plan_index]["items"][0]["inactive"],
+            true
+        );
+        assert!(
+            reporter
+                .human
+                .iter()
+                .any(|line| line.contains("alternate (inactive)"))
+        );
+
+        let mut prompt = TestPrompt {
+            confirmations: VecDeque::from([false]),
+            ..TestPrompt::default()
+        };
+        let mut reporter = RecordingReporter::default();
+        let cancelled = Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            false,
+            home.path().to_path_buf(),
+        )
+        .run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "paired".into(),
+                branch: Some("cancelled/x".into()),
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: false,
+            }),
+        }));
+        assert!(matches!(cancelled, Err(SkillManagerError::Cancelled)));
+        let plan_index = reporter
+            .events
+            .iter()
+            .position(|event| event == "plan")
+            .unwrap_or_else(|| unreachable!("plan event"));
+        assert_eq!(
+            reporter.event_data[plan_index]["authorization"]["mode"],
+            "prompt"
+        );
+        assert_eq!(
+            reporter.event_data[plan_index]["authorization"]["default"],
+            true
+        );
+        assert_eq!(
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}")),
+            original
+        );
+
+        let rejecting = BranchNetwork {
+            default: "main".into(),
+            reject: true,
+            validations: RefCell::new(Vec::new()),
+        };
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let rejected = Application::new(
+            &repository,
+            &rejecting,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            false,
+            home.path().to_path_buf(),
+        )
+        .run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "paired".into(),
+                branch: Some("missing/x".into()),
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: true,
+            }),
+        }));
+        assert!(rejected.is_err());
+        assert!(!reporter.events.iter().any(|event| event == "plan"));
+        assert_eq!(
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}")),
+            original
+        );
+
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let noninteractive = Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            true,
+            home.path().to_path_buf(),
+        )
+        .run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "paired".into(),
+                branch: Some("no-input/x".into()),
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: false,
+            }),
+        }));
+        assert!(matches!(
+            noninteractive,
+            Err(SkillManagerError::InteractionRequired(_))
+        ));
+        assert_eq!(
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}")),
+            original
+        );
+
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter {
+            json: true,
+            ..RecordingReporter::default()
+        };
+        Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            true,
+            home.path().to_path_buf(),
+        )
+        .run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "paired".into(),
+                branch: Some("machine/x".into()),
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: false,
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        let loaded = repository
+            .load(false)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let changed = &loaded.config.sources[0];
+        assert_eq!(changed.source_type, SourceType::Local);
+        assert_eq!(changed.cache_generation, 1);
+        assert!(matches!(
+            changed.alternate,
+            Some(SourceLocation::GitHub {
+                ref r#ref,
+                ref branch_default,
+                ..
+            }) if r#ref.as_deref() == Some("machine/x")
+                && branch_default == &Some(GitHubBranchDefault::Branch { name: "main".into() })
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One fixture proves repository-default restore, explicit alternate targeting, and baseline-preserving swap."
+    )]
+    fn source_branch_preserves_repository_default_sentinel_and_targets_requested_slot() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+        let mut source = source_from_reference("owner/primary", None, home.path())
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        source.name = "remote".into();
+        source.alternate = Some(
+            location_from_reference("owner/mirror:develop", source.mode, home.path())
+                .unwrap_or_else(|error| unreachable!("{error}")),
+        );
+        repository
+            .save(
+                repository.config_path(),
+                &Config {
+                    sources: vec![source],
+                    ..Config::default()
+                },
+            )
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let network = BranchNetwork {
+            default: "main".into(),
+            reject: false,
+            validations: RefCell::new(Vec::new()),
+        };
+        let hook = NoopTransactionHook;
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let mut app = Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            false,
+            home.path().to_path_buf(),
+        );
+        for (branch, alternate) in [
+            (Some("feature/x"), false),
+            (None, false),
+            (Some("release/y"), true),
+        ] {
+            app.run(Command::Source(SourceArgs {
+                action: SourceAction::Branch(SourceBranchArgs {
+                    source: "remote".into(),
+                    branch: branch.map(ToOwned::to_owned),
+                    default: false,
+                    alternate,
+                    dry_run: false,
+                    yes: true,
+                }),
+            }))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        }
+        let loaded = repository
+            .load(false)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let changed = &loaded.config.sources[0];
+        assert!(changed.r#ref.is_none());
+        assert_eq!(
+            changed.branch_default,
+            Some(GitHubBranchDefault::RepositoryDefault)
+        );
+        assert_eq!(changed.cache_generation, 3);
+        assert!(matches!(
+            changed.alternate,
+            Some(SourceLocation::GitHub {
+                ref r#ref,
+                ref branch_default,
+                ..
+            }) if r#ref.as_deref() == Some("release/y")
+                && branch_default == &Some(GitHubBranchDefault::Branch { name: "develop".into() })
+        ));
+
+        app.run(Command::Source(SourceArgs {
+            action: SourceAction::Swap(SourceSwapArgs {
+                source: "remote".into(),
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        let swapped = repository
+            .load(false)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let swapped = &swapped.config.sources[0];
+        assert_eq!(swapped.r#ref.as_deref(), Some("release/y"));
+        assert_eq!(
+            swapped.branch_default,
+            Some(GitHubBranchDefault::Branch {
+                name: "develop".into()
+            })
+        );
+        assert!(matches!(
+            swapped.alternate,
+            Some(SourceLocation::GitHub {
+                ref r#ref,
+                ref branch_default,
+                ..
+            }) if r#ref.is_none()
+                && branch_default == &Some(GitHubBranchDefault::RepositoryDefault)
+        ));
+        assert_eq!(
+            network.validations.into_inner(),
+            ["feature/x", "main", "release/y"]
+        );
+    }
+
+    #[test]
+    fn source_branch_rejects_an_explicitly_selected_local_location() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let local = home.path().join("local");
+        std::fs::create_dir_all(&local).unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+        let mut source = source_from_reference("owner/repo:main", None, home.path())
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        source.name = "paired".into();
+        source.alternate = Some(SourceLocation::Local { path: local });
+        repository
+            .save(
+                repository.config_path(),
+                &Config {
+                    sources: vec![source],
+                    ..Config::default()
+                },
+            )
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let original =
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}"));
+        let network = BranchNetwork {
+            default: "main".into(),
+            reject: false,
+            validations: RefCell::new(Vec::new()),
+        };
+        let hook = NoopTransactionHook;
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let result = Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            false,
+            home.path().to_path_buf(),
+        )
+        .run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "paired".into(),
+                branch: Some("feature/x".into()),
+                default: false,
+                alternate: true,
+                dry_run: false,
+                yes: true,
+            }),
+        }));
+        let Err(error) = result else {
+            unreachable!("selected local location must fail");
+        };
+        assert!(error.to_string().contains("selected alternate location"));
+        assert!(error.to_string().contains("choose a GitHub location"));
+        assert_eq!(
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}")),
+            original
+        );
+        assert!(network.validations.into_inner().is_empty());
+        assert!(!reporter.events.iter().any(|event| event == "plan"));
     }
 
     #[test]
@@ -9953,6 +10942,7 @@ mod tests {
         let hook = NoopTransactionHook;
         let mut prompt = TestPrompt {
             texts: VecDeque::from(["prompted-source".into()]),
+            ..TestPrompt::default()
         };
         let mut reporter = RecordingReporter::default();
         let mut app = Application::new(

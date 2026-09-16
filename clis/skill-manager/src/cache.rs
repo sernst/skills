@@ -41,6 +41,9 @@ pub struct CacheMetadata {
     pub source_ref: Option<String>,
     /// Configured repository subpath.
     pub repo_path: Option<String>,
+    /// Source generation that produced this cache entry.
+    #[serde(default)]
+    pub cache_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -84,6 +87,12 @@ pub trait GitHubTransport {
     ///
     /// Returns an error when transport or response validation fails.
     fn default_branch(&self, owner: &str, repo: &str) -> Result<String>;
+    /// Validate that a branch exists and is accessible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when transport or response validation fails.
+    fn validate_branch(&self, owner: &str, repo: &str, branch: &str) -> Result<()>;
     /// Download a repository tarball into `destination`.
     ///
     /// # Errors
@@ -229,6 +238,35 @@ impl GitHubTransport for ReqwestGitHubTransport {
             .ok_or_else(|| SkillManagerError::GitHub {
                 reference: format!("{owner}/{repo}"),
                 message: "GitHub response omitted default_branch".into(),
+            })
+    }
+
+    fn validate_branch(&self, owner: &str, repo: &str, branch: &str) -> Result<()> {
+        let source = format!("{owner}/{repo}:{branch}");
+        let encoded_branch: String =
+            url::form_urlencoded::byte_serialize(branch.as_bytes()).collect();
+        let url = format!(
+            "{}/repos/{owner}/{repo}/branches/{encoded_branch}",
+            self.api_base
+        );
+        let response = self
+            .send_with_retry(&url)
+            .map_err(|error| SkillManagerError::GitHub {
+                reference: source.clone(),
+                message: error.to_string(),
+            })?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(SkillManagerError::GitHub {
+                reference: source,
+                message: "branch does not exist or is not accessible".into(),
+            });
+        }
+        response
+            .error_for_status()
+            .map(|_| ())
+            .map_err(|error| SkillManagerError::GitHub {
+                reference: source,
+                message: error.to_string(),
             })
     }
 
@@ -487,6 +525,7 @@ fn prepare_cache<G: GitHubTransport, C: Clock>(
             repo: repo.to_ascii_lowercase(),
             source_ref: source.r#ref.clone(),
             repo_path: source.repo_path.clone(),
+            cache_generation: source.cache_generation,
         },
     )?;
     Ok(staged_cache)
@@ -523,6 +562,7 @@ fn cache_identity_matches(metadata: &CacheMetadata, source: &SourceEntry) -> boo
                 .to_ascii_lowercase()
         && metadata.source_ref == source.r#ref
         && metadata.repo_path == source.repo_path
+        && metadata.cache_generation == source.cache_generation
 }
 
 fn cache_is_fresh<C: Clock>(clock: &C, metadata: &CacheMetadata, ttl: i64) -> bool {
@@ -1199,6 +1239,7 @@ mod tests {
             repo: "repo".into(),
             source_ref: None,
             repo_path: None,
+            cache_generation: 0,
         };
         write_metadata(&path, &metadata).unwrap_or_else(|error| unreachable!("{error}"));
         let decoded = read_metadata(&path).unwrap_or_else(|| unreachable!("valid metadata"));
@@ -1433,6 +1474,33 @@ mod tests {
         let requests = handle.join().unwrap_or_else(|_| unreachable!("server"));
         assert!(requests[0].contains("GET /owner/repo/tar.gz/feature%2Fone HTTP/1.1"));
         assert!(!requests[0].contains("authorization:"));
+
+        let (base, handle) = mock_server(vec![MockResponse {
+            status: "200 OK",
+            body: r#"{"name":"feature/one"}"#,
+            content_length: None,
+        }]);
+        test_transport(&base, None)
+            .validate_branch("owner", "repo", "feature/one")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let requests = handle.join().unwrap_or_else(|_| unreachable!("server"));
+        assert!(requests[0].contains("GET /repos/owner/repo/branches/feature%2Fone HTTP/1.1"));
+
+        let (base, handle) = mock_server(vec![MockResponse {
+            status: "404 Not Found",
+            body: "{}",
+            content_length: None,
+        }]);
+        let error = test_transport(&base, None)
+            .validate_branch("owner", "repo", "missing")
+            .err()
+            .unwrap_or_else(|| unreachable!("missing branch must fail"));
+        assert!(
+            error
+                .to_string()
+                .contains("does not exist or is not accessible")
+        );
+        let _requests = handle.join().unwrap_or_else(|_| unreachable!("server"));
 
         for response in [
             MockResponse {

@@ -439,6 +439,39 @@ fn recipe_overlay_covers_source_location_switching_shapes() {
         Some(Command::Source(source))
             if matches!(source.action, SourceAction::Swap(ref args) if args.source == "local")
     ));
+
+    let source_branch = recipe(&serde_json::json!({
+        "command": "source.branch",
+        "source": "remote",
+        "branch": "feature/one",
+        "default": true,
+        "alternate": true,
+        "dry_run": true,
+        "yes": true
+    }));
+    assert!(matches!(
+        source_branch.command,
+        Some(Command::Source(source))
+            if matches!(source.action, SourceAction::Branch(ref args)
+                if args.source == "remote"
+                    && args.branch.as_deref() == Some("feature/one")
+                    && args.default
+                    && args.alternate
+                    && args.dry_run
+                    && args.yes)
+    ));
+
+    let source_branch_reset = recipe(&serde_json::json!({
+        "command": "source.branch",
+        "source": "remote",
+        "yes": true
+    }));
+    assert!(matches!(
+        source_branch_reset.command,
+        Some(Command::Source(source))
+            if matches!(source.action, SourceAction::Branch(ref args)
+                if args.branch.is_none() && args.yes)
+    ));
 }
 
 #[test]
@@ -568,6 +601,26 @@ fn source_location_recipes_reject_missing_conflicting_alias_and_unknown_fields()
         (
             serde_json::json!({"command": "source.swap"}),
             "requires field source.swap.source",
+        ),
+        (
+            serde_json::json!({"command": "source.branch", "branch": "main"}),
+            "requires field source.branch.source",
+        ),
+        (
+            serde_json::json!({
+                "command": "source.branch",
+                "source": "one",
+                "default": true
+            }),
+            "default:true requires field branch",
+        ),
+        (
+            serde_json::json!({
+                "command": "source.branch",
+                "source": "one",
+                "branch": false
+            }),
+            "must be a string",
         ),
         (
             serde_json::json!({
