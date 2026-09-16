@@ -471,7 +471,13 @@ fn overlay_source(
             }
         }
         SourceAction::Locate(args) => {
-            reject_unknown(object, &["command", "no_input", "source", "location"])?;
+            reject_unknown(
+                object,
+                &[
+                    "command", "no_input", "source", "location", "copy", "no_copy", "all",
+                    "missing", "skill", "skills", "filter", "include", "exclude", "dry_run", "yes",
+                ],
+            )?;
             if args.source.is_empty() {
                 args.source = first_string(object, &["source"])?.unwrap_or_default();
             }
@@ -479,6 +485,27 @@ fn overlay_source(
                 args.location = first_string(object, &["location"])?
                     .map(|value| rebase_reference(&value, base, true))
                     .unwrap_or_default();
+            }
+            overlay_bool(&mut args.copy, object.get("copy"))?;
+            overlay_bool(&mut args.no_copy, object.get("no_copy"))?;
+            overlay_bool(&mut args.all, object.get("all"))?;
+            overlay_bool(&mut args.missing, object.get("missing"))?;
+            overlay_bool(&mut args.dry_run, object.get("dry_run"))?;
+            overlay_bool(&mut args.yes, object.get("yes"))?;
+            overlay_strings(&mut args.skills, object, &["skill", "skills"])?;
+            overlay_strings(&mut args.filters, object, &["filter", "include"])?;
+            overlay_strings(&mut args.exclude, object, &["exclude"])?;
+            if args.no_copy
+                && (args.copy
+                    || args.all
+                    || args.missing
+                    || !args.skills.is_empty()
+                    || !args.filters.is_empty()
+                    || !args.exclude.is_empty())
+            {
+                return Err(SkillManagerError::InvalidInput(
+                    "source.locate no_copy conflicts with all copy selection fields".into(),
+                ));
             }
         }
         SourceAction::Alternate(args) => {
@@ -1094,6 +1121,7 @@ fn build_required_command(name: &str) -> Result<Command> {
             action: SourceAction::Locate(SourceLocateArgs {
                 source: String::new(),
                 location: String::new(),
+                ..SourceLocateArgs::default()
             }),
         })),
         "source.alternate" => Ok(Command::Source(SourceArgs {

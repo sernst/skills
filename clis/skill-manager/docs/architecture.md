@@ -108,3 +108,23 @@ recovery; the backup and journal remain available for diagnosis.
 Configuration and migration backup staging use exact-path cleanup receipts
 under their respective locks. No filename-prefix sweep authorizes deletion:
 unknown leftovers require inspection and must be moved aside manually.
+
+Source relocation uses one command-specific batch journal across every selected
+physical skill and configuration. It holds the existing config lock, then the
+destination target lock, and retains exact before/after config images. The config
+write session installs atomically without post-install backup pruning. Source and
+destination evidence is rechecked after authorization; all selected trees are
+staged and validated before any placement, and all backups remain until durable
+commit. Any precommit failure rolls back configuration and all placed copies.
+
+Relocation metadata uses an exact destination-hashed journal name found only at
+that destination's ancestor paths; multiple claims fail. Staging and backups stay
+on the destination filesystem. Workspace and ancestor directory ownership is
+recorded only after successful exclusive creation and before population or further
+mutation. A crash before that ownership record preserves ambiguous paths and
+requires inspection. Recovery validates every recorded mapping, restores only
+matching before/after configuration images, and never overwrites divergent edits.
+Committed recovery only cleans owned scratch data. The application renders and
+authorizes a pending recovery phase before writes, then builds a fresh copy plan.
+Dry-run, cancelled, configuration-only, and location no-op operations never run
+recovery; no recovery CLI or filename-prefix sweep is provided.

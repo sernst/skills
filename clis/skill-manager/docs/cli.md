@@ -263,12 +263,66 @@ and the active location are updated atomically with `source update`;
 `--location LOCATION` can be combined with metadata flags. IDs do not change
 when a source moves.
 
-`source locate SOURCE LOCATION` is the location-only spelling, with aliases
+`source locate SOURCE LOCATION` changes the active location, with aliases
 `relocate`, `move`, and `mv`. `source alternate SOURCE LOCATION` saves or
 replaces an inactive location, while `source alternate SOURCE --clear` removes
 it. `source swap SOURCE` exchanges active and inactive locations. Local/local,
 local/GitHub, and GitHub/GitHub pairs are supported, and local paths need not
 exist yet. A swap requires an alternate.
+
+### Local source relocation copies
+
+For local-to-local relocation, copying retains originals and includes every
+valid physical skill, even skills excluded from ordinary load/update. Only
+complete skill directories are copied; source-root README, Git and build files
+are omitted. Selected collisions replace whole directories, removing old extra
+files. Destination-only skills and root files are preserved. A single-skill
+source copies directly to LOCATION.
+
+Bare interactive locate previews candidate effects, then opens a checklist
+with missing skills selected and replacements unchecked. After selection it
+renders the exact copy and location plan before one confirmation. Empty
+selection explicitly means configuration only and creates no directories.
+
+- `--copy` selects missing skills only.
+- `--all` selects every physical skill, including replacements.
+- `--missing` selects missing skills and can be combined with specific replacements.
+- Repeat `--skill NAME` for exact names or `--filter PATTERN` (visible alias
+  `--include`) for patterns. Positive selectors imply copying. Unknown exact
+  names fail; unmatched patterns warn when other selections survive and fail
+  when the positive selection matches nothing.
+- Repeat `--exclude PATTERN`; exclusions apply last. Deliberately excluding
+  every selected skill produces a truthful configuration-only final plan.
+- `--no-copy` conflicts with all copy selectors and changes only configuration,
+  including when the old local source directory is missing.
+- `--dry-run` never copies or changes configuration. Resolved selections show
+  the exact final plan; unresolved selections show candidates and flag guidance.
+- `--yes` authorizes a resolved plan and cannot choose skills. JSON, recipes,
+  and `--no-input` require explicit selection plus `--yes` for actual changes.
+
+```text
+skill-manager source locate personal /work/skills --copy --yes
+skill-manager source locate personal /work/skills --missing --skill alpha --yes
+skill-manager source locate personal /work/skills --all --exclude 'draft-*' --dry-run
+skill-manager source locate personal /work/skills --no-copy --yes
+```
+
+All selected trees are staged before any placement. Configuration changes only
+after every placement succeeds; any precommit failure restores the entire
+batch. Bounded filesystem retries may leave a journal when an OS handle blocks
+rollback or cleanup. A later applicable relocation first shows the exact pending
+recovery plan and obtains authorization, then prepares a fresh relocation plan.
+This rare safety phase can add a recovery confirmation before the checklist and
+final confirmation. Dry-run, cancellation, location no-ops, and `--no-copy` do
+not retry recovery. Committed recovery cleans only recorded owned scratch paths
+and preserves subsequent edits. Recovery never sweeps manager-looking prefixes.
+Overlapping paths, selected files/links/reparse points, case-folded collisions,
+duplicate source identities and changed review evidence fail before replacement.
+Missing destination parents are created under recorded ownership and removed
+only when empty during rollback. `source update --location` remains configuration
+only and does not gain copy selection.
+
+### GitHub source branches
 
 `source branch SOURCE [BRANCH]` changes the branch of a GitHub location without
 changing its repository, repository subpath, source identity, mode, or

@@ -586,12 +586,45 @@ pub struct SourceUpdateArgs {
 }
 
 /// Arguments for `source locate`.
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Default, Args)]
+#[allow(clippy::struct_excessive_bools)] // Independent argv switches become a resolved copy policy.
 pub struct SourceLocateArgs {
     /// Source name, ID, label, path, or GitHub reference.
     pub source: String,
     /// Replacement active local path or GitHub reference.
     pub location: String,
+    /// Copy missing physical skills; combine --missing with explicit replacements.
+    #[arg(long, conflicts_with = "no_copy")]
+    pub copy: bool,
+    /// Change the location only, even if the old local directory is missing.
+    #[arg(long, conflicts_with_all = ["copy", "all", "missing", "skills", "filters", "exclude"])]
+    pub no_copy: bool,
+    /// Select every physical skill, including whole-directory replacements.
+    #[arg(long, conflicts_with = "no_copy")]
+    pub all: bool,
+    /// Select skills absent from the destination.
+    #[arg(long, conflicts_with = "no_copy")]
+    pub missing: bool,
+    /// Select an exact physical skill name; repeat to select more.
+    #[arg(long = "skill", value_name = "NAME", conflicts_with = "no_copy")]
+    pub skills: Vec<String>,
+    /// Select physical skills matching a pattern; repeat to select more.
+    #[arg(
+        long = "filter",
+        visible_alias = "include",
+        value_name = "PATTERN",
+        conflicts_with = "no_copy"
+    )]
+    pub filters: Vec<String>,
+    /// Exclude matching skills after all positive selectors.
+    #[arg(long, value_name = "PATTERN", conflicts_with = "no_copy")]
+    pub exclude: Vec<String>,
+    /// Render the relocation plan without changing files or configuration.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Authorize the fully resolved relocation plan without prompting.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 /// Arguments for `source alternate`.

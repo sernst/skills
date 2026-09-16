@@ -145,6 +145,15 @@ pub struct RestoreOutcome {
 
 /// Persistence port used by the application service.
 pub trait ConfigRepository {
+    /// Hold the configuration lock for a multi-resource write, without housekeeping.
+    ///
+    /// # Errors
+    /// Returns an error when the repository does not support transactional writes.
+    fn begin_write(&self, _active_path: &Path) -> Result<Box<dyn ConfigWriteSession + '_>> {
+        Err(SkillManagerError::InvalidInput(
+            "configuration repository does not support relocation transactions".into(),
+        ))
+    }
     /// Run the isolated startup layout migration.
     ///
     /// # Errors
@@ -254,14 +263,7 @@ impl FileConfigRepository {
     }
 
     fn save_unlocked(active_path: &Path, config: &Config) -> Result<()> {
-        let mut normalized = config.clone();
-        normalize_config_locations(&mut normalized)?;
-        normalize_config_targets(&mut normalized)?;
-        validate_config(&normalized, active_path)?;
-        let mut bytes = serde_json::to_vec_pretty(&normalized)
-            .map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
-        bytes.push(b'\n');
-        atomic_write(active_path, &bytes)
+        atomic_write(active_path, &configuration_image(active_path, config)?)
     }
 
     fn backup_unlocked(&self, reason: &str) -> Result<ConfigBackup> {
@@ -475,6 +477,13 @@ fn invalid_backup_record(path: &Path, message: &str) -> SkillManagerError {
 }
 
 impl ConfigRepository for FileConfigRepository {
+    fn begin_write(&self, active_path: &Path) -> Result<Box<dyn ConfigWriteSession + '_>> {
+        let lock = acquire_lock(&self.lock_path(), "configuration", Duration::from_secs(10))?;
+        Ok(Box::new(FileConfigWriteSession {
+            path: active_path.to_path_buf(),
+            _lock: lock,
+        }))
+    }
     fn migrate_layout(&self) -> Result<LayoutMigrationResult> {
         let _lock = acquire_lock(&self.lock_path(), "configuration", Duration::from_secs(10))?;
         storage_migration::migrate(&self.layout_paths)
@@ -680,6 +689,57 @@ pub fn canonical_config_bytes() -> Result<Vec<u8>> {
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::atomic_write(path, bytes).map_err(|error| SkillManagerError::io(path, error))
+}
+
+/// A configuration lock retained across destination placement and rollback.
+pub trait ConfigWriteSession {
+    /// Read the exact current image, including an absent configuration.
+    /// # Errors
+    /// Returns an error for configuration I/O failure.
+    fn image(&self) -> Result<Option<Vec<u8>>>;
+    /// Install an exact image atomically; no post-install housekeeping runs.
+    /// # Errors
+    /// Returns an error if replacement fails; callers must inspect the image.
+    fn install(&mut self, image: Option<&[u8]>) -> Result<()>;
+}
+
+struct FileConfigWriteSession {
+    path: PathBuf,
+    _lock: ResourceLock,
+}
+
+impl ConfigWriteSession for FileConfigWriteSession {
+    fn image(&self) -> Result<Option<Vec<u8>>> {
+        match fs::read(&self.path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(SkillManagerError::io(&self.path, error)),
+        }
+    }
+    fn install(&mut self, image: Option<&[u8]>) -> Result<()> {
+        match image {
+            Some(bytes) => atomic_write(&self.path, bytes),
+            None => match fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(SkillManagerError::io(&self.path, error)),
+            },
+        }
+    }
+}
+
+/// Normalize and validate the exact proposed configuration image before staging.
+/// # Errors
+/// Returns an error for invalid configuration or serialization.
+pub fn configuration_image(active_path: &Path, config: &Config) -> Result<Vec<u8>> {
+    let mut normalized = config.clone();
+    normalize_config_locations(&mut normalized)?;
+    normalize_config_targets(&mut normalized)?;
+    validate_config(&normalized, active_path)?;
+    let mut bytes = serde_json::to_vec_pretty(&normalized)
+        .map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 /// Advisory lock held for one resource.

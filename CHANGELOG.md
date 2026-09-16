@@ -4,6 +4,12 @@ All notable changes to the downloadable CLIs are documented here.
 
 ## 0.1.5 - 2026-09-16
 
+- Adds reviewed local source relocation copying with physical skill selection,
+  whole-directory replacement, retained originals, and durable whole-batch
+  rollback across destination placement and configuration changes. Includes
+  checklist selection, explicit CLI/recipe policies, dry-run plans, and owned
+  recovery when filesystem handles block rollback or cleanup.
+
 - Adds reusable terminal radio and checklist prompts with accessible line
   fallbacks, safe cancellation, deterministic keyboard behavior, and strict
   isolation from noninteractive modes.

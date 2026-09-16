@@ -741,6 +741,7 @@ fn every_production_event_has_a_source_derived_payload_family() {
         ("source.branch-unchanged", "source-branch-unchanged"),
         ("source.listed", "source"),
         ("source.location-set", "source-change"),
+        ("source.relocation-candidate", "source-relocation-candidate"),
         ("source.locations-swapped", "source-change"),
         ("source.removed", "source"),
         ("source.updated", "source-change"),

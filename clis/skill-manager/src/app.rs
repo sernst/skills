@@ -36,7 +36,8 @@ use crate::plan::{
     DiffStat, FileChange, FileDelta, PlanAction, creation_line, diff_directories,
     diff_directory_maps, totals_line,
 };
-use crate::prompt::Prompt;
+use crate::prompt::{Prompt, PromptChoice, PromptOutcome};
+use crate::relocation::{self, RelocationHook, RelocationPlan};
 use crate::review::{
     ChangePlan, Decision, DecisionOption, Destination, DestinationKind, OptionConsequence,
     OptionDetail, PlanAuthorization, PlanRow, PlanSelection, PlannedAction, PreviewBlock,
@@ -244,6 +245,7 @@ pub struct Application<'a, R, G, P, O, H> {
     hook: &'a H,
     no_input: bool,
     home: PathBuf,
+    relocation_hook: Option<&'a dyn RelocationHook>,
 }
 
 impl<'a, R, G, P, O, H> Application<'a, R, G, P, O, H>
@@ -272,7 +274,15 @@ where
             hook,
             no_input,
             home,
+            relocation_hook: None,
         }
+    }
+
+    /// Inject relocation transaction boundaries for application-level validation.
+    #[must_use]
+    pub fn with_relocation_hook(mut self, hook: &'a dyn RelocationHook) -> Self {
+        self.relocation_hook = Some(hook);
+        self
     }
 
     /// Execute one domain command.
@@ -1596,6 +1606,7 @@ where
         )
     }
 
+    #[allow(clippy::too_many_lines)] // Keep the reviewed source-location transition together.
     fn source_locate(
         &mut self,
         config: &mut Config,
@@ -1607,6 +1618,21 @@ where
         let replacement = location_from_reference(&args.location, previous.mode, &self.home)?;
         let active = source_location(&previous)?;
         if locations_equal(&active, &replacement) {
+            if args.copy
+                || args.all
+                || args.missing
+                || !args.skills.is_empty()
+                || !args.filters.is_empty()
+            {
+                return Err(SkillManagerError::InvalidInput(
+                    "copy source and destination roots must not overlap".into(),
+                ));
+            }
+            self.reporter.human(&format!(
+                "Source {} already uses {}.",
+                previous.name,
+                source_reference(&previous)
+            ))?;
             return self.reporter.event(
                 "source.location-set",
                 Level::Info,
@@ -1623,19 +1649,367 @@ where
             ));
         }
         reject_location_collision(config, &replacement, index)?;
+        let before = match fs::read(active_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(SkillManagerError::io(active_path, error)),
+        };
+        let positive = args.copy
+            || args.all
+            || args.missing
+            || !args.skills.is_empty()
+            || !args.filters.is_empty();
+        if args.no_copy && (positive || !args.exclude.is_empty()) {
+            return Err(SkillManagerError::InvalidInput(
+                "--no-copy conflicts with copy selection flags".into(),
+            ));
+        }
+        let local_pair = match (&active, &replacement) {
+            (
+                SourceLocation::Local { path: source },
+                SourceLocation::Local { path: destination },
+            ) => Some((source, destination)),
+            _ => None,
+        };
+        if local_pair.is_none() && (positive || !args.exclude.is_empty()) {
+            return Err(SkillManagerError::InvalidInput(
+                "copy selection requires local-to-local source relocation".into(),
+            ));
+        }
+        let mut batch = None;
+        if !args.no_copy
+            && let Some((source, destination)) = local_pair
+        {
+            let operand = expand_home(&args.location, &self.home);
+            let operand = if operand.is_absolute() {
+                operand
+            } else {
+                current_project_root()?.join(operand)
+            };
+            relocation::validate_copy_operand(&operand)?;
+            if let Some((journal, effect)) = relocation::pending_recovery(destination)? {
+                if !self.authorize_relocation_recovery(&previous, &journal, &effect, args)? {
+                    return Ok(());
+                }
+                relocation::recover_authorized(self.repository, active_path, destination)?;
+                let loaded = self.repository.load(false)?;
+                *config = loaded.config;
+                return self.source_locate(config, &loaded.active_path, args);
+            }
+            let resolved = ResolvedSource {
+                entry: previous.clone(),
+                path: source.clone(),
+                from_cache: false,
+                temporary: None,
+                cleanup_pending: None,
+            };
+            let candidates = relocation::candidates(&resolved, destination)?;
+            let mut selected = if positive {
+                self.relocation_selection(args, &candidates)?
+            } else {
+                self.render_relocation_candidates(&previous, destination, &candidates)?;
+                if args.dry_run {
+                    return self.reporter.human("Selection unresolved. Use --copy for missing skills, --all or --skill/--filter for explicit copies, or --no-copy for a location change only.");
+                }
+                if args.yes || self.no_input || self.reporter.is_json() {
+                    return Err(SkillManagerError::InteractionRequired("source locate requires an explicit copy policy: --copy, --all, --missing, --skill, --filter, or --no-copy; --yes only authorizes a resolved plan".into()));
+                }
+                let choices = candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, copy)| {
+                        Ok(
+                            PromptChoice::new((index + 1).to_string(), skill_name(&copy.source)?)
+                                .selected(!copy.existed),
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                match self
+                    .prompt
+                    .select_many("Select physical skills to copy", &choices)?
+                {
+                    PromptOutcome::Cancelled => return self.report_cancelled("source.locate"),
+                    PromptOutcome::Submitted(indices) => {
+                        let mut selected = BTreeSet::new();
+                        for index in indices {
+                            let copy = candidates.get(index).ok_or_else(|| {
+                                SkillManagerError::InvalidInput(
+                                    "relocation checklist returned an invalid index".into(),
+                                )
+                            })?;
+                            selected.insert(fold(&skill_name(&copy.source)?));
+                        }
+                        selected
+                    }
+                }
+            };
+            for name in selected.clone() {
+                if !args.exclude.is_empty() && matches_patterns(&name, &args.exclude)? {
+                    selected.remove(&name);
+                }
+            }
+            if !selected.is_empty() {
+                batch = Some(relocation::plan(
+                    config,
+                    active_path,
+                    before.clone(),
+                    &previous.id,
+                    destination,
+                    &selected.into_iter().collect::<Vec<_>>(),
+                )?);
+            }
+        }
         let mut proposed = previous.clone();
         set_source_location(&mut proposed, &replacement);
-        config.sources[index] = proposed.clone();
-        self.repository.save(active_path, config)?;
+        self.render_relocation_plan(&previous, &proposed, batch.as_ref(), args)?;
+        if args.dry_run {
+            return Ok(());
+        }
+        if !args.yes {
+            if self.no_input || self.reporter.is_json() {
+                return Err(SkillManagerError::InteractionRequired(
+                    "applying source locate noninteractively requires --yes".into(),
+                ));
+            }
+            if !Authorizer::new(self.prompt)
+                .confirm("Apply this source relocation plan?", true)?
+                .is_approved()
+            {
+                return self.report_cancelled("source.locate");
+            }
+        }
+        if let Some(batch) = &batch {
+            let outcome = relocation::apply(
+                self.repository,
+                batch,
+                self.relocation_hook
+                    .unwrap_or(&relocation::NoopRelocationHook),
+            )?;
+            *config = outcome.value;
+            proposed = config.sources[index].clone();
+            if let Some(warning) = outcome.cleanup_pending {
+                self.emit_message_diagnostic(&warning)?;
+            }
+        } else {
+            let mut next = config.clone();
+            next.sources[index] = proposed.clone();
+            let image = crate::config::configuration_image(active_path, &next)?;
+            let mut session = self.repository.begin_write(active_path)?;
+            if session.image()? != before {
+                return Err(SkillManagerError::InvalidInput(
+                    "configuration changed after relocation planning; replan before applying"
+                        .into(),
+                ));
+            }
+            session.install(Some(&image))?;
+            *config = next;
+        }
         self.reporter.human(&format!(
             "Located source {} at {}",
             proposed.name,
             source_reference(&proposed)
         ))?;
+        let mut data = source_change_data(&proposed, &previous, true);
+        if let Some(batch) = &batch {
+            let copied = batch.copies.iter().filter(|copy| !copy.unchanged()).count();
+            let unchanged = batch.copies.len() - copied;
+            if copied > 0 {
+                self.reporter.human(&format!(
+                    "Copied {copied} physical skill directories; retained source originals."
+                ))?;
+                data["copied"] = json!(copied);
+            }
+            if unchanged > 0 {
+                data["unchanged"] = json!(unchanged);
+            }
+            data["originals_retained"] = json!(true);
+        }
+        self.reporter
+            .event("source.location-set", Level::Info, data)
+    }
+
+    fn authorize_relocation_recovery(
+        &mut self,
+        source: &SourceEntry,
+        journal: &Path,
+        effect: &str,
+        args: &SourceLocateArgs,
+    ) -> Result<bool> {
+        let mut plan = relocation_change_plan(
+            source,
+            source,
+            None,
+            !args.dry_run && !args.yes && !self.no_input && !self.reporter.is_json(),
+        )?;
+        plan.plan_id.push_str(":recovery");
+        plan.heading = "Pending relocation recovery plan".into();
+        plan.metadata = vec![
+            ("Source".into(), source.name.clone()),
+            ("Journal".into(), journal.display().to_string()),
+            ("Effect".into(), effect.into()),
+            (
+                "Next".into(),
+                "Prepare and review a fresh copy/location plan after recovery.".into(),
+            ),
+        ];
+        let view = plan.view();
+        for line in render_plan(&view, self.render_style()) {
+            self.reporter.human(&line)?;
+        }
         self.reporter.event(
-            "source.location-set",
+            "plan",
             Level::Info,
-            source_change_data(&proposed, &previous, true),
+            plan_event_data(
+                &view,
+                0,
+                args.dry_run,
+                PlanAuthorization {
+                    kind: "binary",
+                    mode: if args.dry_run {
+                        "dry-run"
+                    } else if args.yes {
+                        "yes"
+                    } else {
+                        "prompt"
+                    },
+                    default: plan.prompting.then_some(false),
+                },
+                &PlanSelection::default(),
+            ),
+        )?;
+        if args.dry_run {
+            return Ok(false);
+        }
+        if args.yes {
+            return Ok(true);
+        }
+        if self.no_input || self.reporter.is_json() {
+            return Err(SkillManagerError::InteractionRequired(
+                "pending relocation recovery requires --yes in noninteractive mode".into(),
+            ));
+        }
+        if Authorizer::new(self.prompt)
+            .confirm("Apply this pending relocation recovery plan?", true)?
+            .is_approved()
+        {
+            return Ok(true);
+        }
+        self.report_cancelled("source.locate")?;
+        Ok(false)
+    }
+
+    fn relocation_selection(
+        &mut self,
+        args: &SourceLocateArgs,
+        candidates: &[relocation::RelocationCandidate],
+    ) -> Result<BTreeSet<String>> {
+        let names = candidates
+            .iter()
+            .map(|copy| skill_name(&copy.source))
+            .collect::<Result<Vec<_>>>()?;
+        let identities = names.iter().map(|name| fold(name)).collect::<BTreeSet<_>>();
+        let missing = args.missing
+            || (args.copy && !args.all && args.skills.is_empty() && args.filters.is_empty());
+        let mut selected = BTreeSet::new();
+        for copy in candidates {
+            if args.all || (missing && !copy.existed) {
+                selected.insert(fold(&skill_name(&copy.source)?));
+            }
+        }
+        for name in &args.skills {
+            if !identities.contains(&fold(name)) {
+                return Err(SkillManagerError::InvalidInput(format!(
+                    "unknown physical skill: {name}"
+                )));
+            }
+            selected.insert(fold(name));
+        }
+        let expanded = expand_skill_patterns(&args.filters, names.iter().map(String::as_str))?;
+        self.emit_unmatched_patterns(&expanded.unmatched_patterns)?;
+        selected.extend(expanded.matched.iter().map(|name| fold(name)));
+        if !args.filters.is_empty() && selected.is_empty() {
+            return Err(SkillManagerError::InvalidInput(
+                "no physical skills match the positive relocation selection".into(),
+            ));
+        }
+        Ok(selected)
+    }
+
+    fn render_relocation_candidates(
+        &mut self,
+        source: &SourceEntry,
+        destination: &Path,
+        candidates: &[relocation::RelocationCandidate],
+    ) -> Result<()> {
+        self.reporter
+            .human(&format!("Relocation candidates for {}", source.name))?;
+        self.reporter.human(&format!("From  {}\nTo    {}\nOriginals are retained. Only selected complete skill directories are copied.", source_reference(source), destination.display()))?;
+        for copy in candidates {
+            let effect = if copy.existed {
+                "replace the entire destination directory if different; validate before authorization"
+            } else {
+                "create missing destination skill"
+            };
+            self.reporter.human(&format!(
+                "  {}: {effect}; {}",
+                skill_name(&copy.source)?,
+                copy.destination.display()
+            ))?;
+            self.reporter.event(
+                "source.relocation-candidate",
+                Level::Info,
+                json!({
+                    "source_id": source.id, "source_name": source.name,
+                    "skill": skill_name(&copy.source)?, "from": copy.source, "to": copy.destination,
+                    "effect": if copy.existed { "replace-if-different" } else { "create" },
+                    "default_selected": !copy.existed, "selection_resolved": false,
+                    "originals_retained": true,
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn render_relocation_plan(
+        &mut self,
+        previous: &SourceEntry,
+        proposed: &SourceEntry,
+        batch: Option<&RelocationPlan>,
+        args: &SourceLocateArgs,
+    ) -> Result<()> {
+        let style = self.render_style();
+        let plan = relocation_change_plan(
+            previous,
+            proposed,
+            batch,
+            !args.dry_run && !args.yes && !self.no_input && !self.reporter.is_json(),
+        )?;
+        let view = plan.view();
+        for line in render_plan(&view, style) {
+            self.reporter.human(&line)?;
+        }
+        self.reporter.event(
+            "plan",
+            Level::Info,
+            plan_event_data(
+                &view,
+                0,
+                args.dry_run,
+                PlanAuthorization {
+                    kind: "binary",
+                    mode: if args.dry_run {
+                        "dry-run"
+                    } else if args.yes {
+                        "yes"
+                    } else if self.no_input || self.reporter.is_json() {
+                        "noninteractive"
+                    } else {
+                        "prompt"
+                    },
+                    default: plan.prompting.then_some(false),
+                },
+                &PlanSelection::default(),
+            ),
         )
     }
 
@@ -5931,8 +6305,99 @@ fn command_dry_run(command: &Command) -> bool {
         Command::Source(crate::cli::SourceArgs {
             action: SourceAction::Branch(args),
         }) => args.dry_run,
+        Command::Source(crate::cli::SourceArgs {
+            action: SourceAction::Locate(args),
+        }) => args.dry_run,
         _ => false,
     }
+}
+
+fn relocation_change_plan(
+    previous: &SourceEntry,
+    proposed: &SourceEntry,
+    batch: Option<&RelocationPlan>,
+    prompting: bool,
+) -> Result<ChangePlan> {
+    let mut destinations = Vec::new();
+    let mut rows = Vec::new();
+    if let Some(batch) = batch {
+        for copy in &batch.copies {
+            let name = skill_name(&copy.source)?;
+            let id = format!("relocation:{name}");
+            destinations.push(Destination {
+                id: id.clone(),
+                column: "action".into(),
+                label: copy.destination.display().to_string(),
+                kind: DestinationKind::Path,
+                path: Some(copy.destination.clone()),
+            });
+            let stat = diff_directories(&copy.destination, &copy.source)?;
+            let action = if copy.unchanged() {
+                PlanAction::Skip
+            } else if copy.existed() {
+                PlanAction::Update
+            } else {
+                PlanAction::Copy
+            };
+            let effect = if copy.unchanged() {
+                "already identical"
+            } else if copy.existed() {
+                "replace entire skill directory"
+            } else {
+                "create complete skill directory"
+            };
+            rows.push(PlanRow {
+                identity: name,
+                actions: vec![PlannedAction {
+                    destination: id,
+                    action,
+                    existed: copy.existed(),
+                    description: if stat.is_empty() {
+                        effect.into()
+                    } else {
+                        format!(
+                            "{effect}; {} changed file{}",
+                            stat.files_changed(),
+                            if stat.files_changed() == 1 { "" } else { "s" }
+                        )
+                    },
+                    stat,
+                }],
+                ..PlanRow::default()
+            });
+        }
+    }
+    let outcome = batch.map_or_else(|| "Change source location only; no skill directories are copied.".into(), |batch| {
+        let copied = batch.copies.iter().filter(|copy| !copy.unchanged()).count();
+        let unchanged = batch.copies.len() - copied;
+        if copied == 0 {
+            format!("Change source location only; all {unchanged} selected physical skills are already identical.")
+        } else {
+            let kept = if unchanged > 0 { format!(" {unchanged} selected skills are already identical.") } else { String::new() };
+            format!("Copy {copied} physical skill directories, retaining originals; change source location after the entire batch commits.{kept}")
+        }
+    });
+    Ok(ChangePlan {
+        command: "source.locate".into(),
+        plan_id: format!("source.locate:{}", previous.id),
+        heading: "Source relocation plan".into(),
+        metadata: vec![
+            ("Source".into(), previous.name.clone()),
+            ("From".into(), source_reference(previous)),
+            ("To".into(), source_reference(proposed)),
+            ("Effect".into(), outcome),
+        ],
+        destinations,
+        body_heading: None,
+        metric_header: None,
+        detail_heading: "Destination changes".into(),
+        connector: Some("->".into()),
+        rows,
+        blocks: Vec::new(),
+        decisions: Vec::new(),
+        prompting,
+        distinguishes_overwrites: true,
+    })
 }
 
 fn current_project_root() -> Result<PathBuf> {

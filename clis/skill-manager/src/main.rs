@@ -102,6 +102,7 @@ fn run_generation(command: &Command, reporter: &mut ConsoleReporter) -> Option<E
             let mut output = Vec::new();
             let result = clap_mangen::Man::new(Cli::command())
                 .render(&mut output)
+                .and_then(|()| append_relocation_manual(&mut output))
                 .map_err(|error| SkillManagerError::io(&args.output, error))
                 .and_then(|()| {
                     if let Some(parent) = args.output.parent() {
@@ -120,6 +121,25 @@ fn run_generation(command: &Command, reporter: &mut ConsoleReporter) -> Option<E
         }
         _ => None,
     }
+}
+
+fn append_relocation_manual(output: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut command = Cli::command();
+    command.build();
+    let relocation = command
+        .find_subcommand("source")
+        .and_then(|source| source.find_subcommand("locate"))
+        .ok_or_else(|| std::io::Error::other("source locate is missing from the CLI schema"))?;
+    let manual = clap_mangen::Man::new(relocation.clone().bin_name("skill-manager source locate"));
+    let mut sections = Vec::new();
+    manual.render_synopsis_section(&mut sections)?;
+    manual.render_options_section(&mut sections)?;
+    let sections = String::from_utf8(sections)
+        .map_err(std::io::Error::other)?
+        .replace(".SH SYNOPSIS", ".SH SOURCE RELOCATION SYNOPSIS")
+        .replace(".SH OPTIONS", ".SH SOURCE RELOCATION OPTIONS");
+    output.extend_from_slice(sections.as_bytes());
+    Ok(())
 }
 
 fn report_error(reporter: &mut ConsoleReporter, error: &SkillManagerError) {

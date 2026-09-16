@@ -515,7 +515,7 @@ fn cleanup_warning(destination: &Path, journal: &Path, error: &SkillManagerError
     )
 }
 
-fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir(destination).map_err(|error| SkillManagerError::io(destination, error))?;
     for item in walkdir::WalkDir::new(source).follow_links(false) {
         let item = item.map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;

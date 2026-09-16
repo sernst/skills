@@ -25,6 +25,8 @@ pub mod plan;
 pub mod prompt;
 /// Strict JSON invocation input.
 pub mod recipe;
+/// All-or-rollback local source relocation.
+pub mod relocation;
 /// Shared plan review: destinations, rendering, and plan events.
 pub mod review;
 /// Skill discovery and status helpers.

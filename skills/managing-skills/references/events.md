@@ -90,6 +90,8 @@ The comments in this section are machine-checked against production emit sites.
 - `source.listed`: one stored source.
 <!-- event: source.location-set -->
 - `source.location-set`: active source location changed or unchanged.
+<!-- event: source.relocation-candidate -->
+- `source.relocation-candidate`: unresolved physical copy candidate and default selection.
 <!-- event: source.locations-swapped -->
 - `source.locations-swapped`: active and inactive locations exchanged.
 <!-- event: source.removed -->
@@ -119,6 +121,7 @@ The comments in this section are machine-checked against production emit sites.
 <!-- payload: source-location fields: source,source_type -->
 <!-- payload: source-previous fields: alternate,source,source_type -->
 <!-- payload: source-change fields: alternate,changed,mode,previous,source,source_id,source_label,source_name,source_type -->
+<!-- payload: source-relocation-candidate fields: default_selected,effect,from,originals_retained,selection_resolved,skill,source_id,source_name,to -->
 <!-- payload: source-branch-set fields: branch,cache_refresh,changed,default,resolved_branch,slot,source,source_id -->
 <!-- payload: source-branch-unchanged fields: branch,changed,default,resolved_branch,slot,source,source_id -->
 `source.added`, `source.removed`, and `source.listed` contain one flattened
@@ -145,6 +148,16 @@ source object (source identity is not nested):
 (`bool`) and `previous`, where `previous` contains exactly `source`,
 `source_type`, and `alternate`. These event payloads do not expose exclusions
 or cache TTL.
+
+After a committed relocation batch, `source.location-set` additionally reports
+nonzero `copied` and `unchanged` counts and `originals_retained:true`. These
+optional fields are absent from location-only changes and location no-ops.
+No success event is emitted for a failed precommit batch.
+`source.relocation-candidate` contains `source_id`, `source_name`, `skill`,
+`from`, `to`, `effect` (`create` or `replace-if-different`),
+`default_selected`, `selection_resolved:false`, and `originals_retained:true`.
+It is a preview for an unresolved checklist, including unresolved JSON dry runs,
+and does not claim a chosen or authorized action.
 
 `source.branch-set` and `source.branch-unchanged` identify the stable source,
 selected `slot` (`active` or `alternate`), configured `branch` (`null` means
