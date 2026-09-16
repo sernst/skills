@@ -572,10 +572,18 @@ validation problems are not fixed by retrying.
 
 A committed import, deployment, removal, or cache refresh can succeed while
 cleanup remains blocked. The warning explicitly says the change committed,
-names the recovery journal, and explains that the next operation on the same
-skill/source retries cleanup. Do not repeat an import solely to reapply already
-committed content; preserve any edits made after that commit. Recovery itself
+names the recovery journal, and explains when internal recovery can retry
+cleanup. Skill cleanup is retried when a later operation applies that skill;
+commands that stop at a no-op or discovery do not retry it. Cache cleanup is
+retried on a later source access outside a dry run. Do not repeat an import
+solely to reapply already committed content; preserve any edits made after
+that commit. Recovery itself
 only finishes housekeeping and does not replay the committed replacement.
+
+There is no separate recovery command or automatic recovery before discovery.
+If a process stops after moving an import source to its backup, the missing
+source can prevent subsequent discovery from reaching internal recovery.
+Preserve that backup and journal while diagnosing the interrupted operation.
 
 A staging directory or backup without an ownership journal/receipt is never
 swept by its name. Inspect any reported unowned path and move it aside before

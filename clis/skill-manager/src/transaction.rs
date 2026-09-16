@@ -499,7 +499,7 @@ fn cleanup_committed(path: &Path, journal: &Journal) -> Result<()> {
 
 fn cleanup_warning(destination: &Path, journal: &Path, error: &SkillManagerError) -> String {
     format!(
-        "change committed at {}; cleanup pending: {error}. Recovery journal: {}; the next operation on this skill retries cleanup",
+        "change committed at {}; cleanup pending: {error}. Recovery journal: {}; cleanup is retried when a later operation applies this skill; no-op and dry-run commands do not retry cleanup",
         destination.display(),
         journal.display()
     )

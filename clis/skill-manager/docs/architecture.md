@@ -83,7 +83,13 @@ scratch directory. New deployment records retain `stage` and `staging_root`
 through commit; legacy records remain readable. Recovery validates all paths
 and rejects links/reparse points before mutating any backup or stage. A
 committed operation returns its result with a warning if cleanup is still
-pending, retaining its journal for the next operation under the same lock.
+pending, retaining its journal for recovery under the same lock. Transaction
+recovery runs when a later operation enters the transaction API; commands that
+stop at discovery or a no-op do not reach it. Cache recovery runs during a
+later non-dry-run source materialization. There is no separate recovery command
+or automatic recovery before discovery. After a process interruption in
+`OldMoved`, a missing import source can prevent discovery from reaching internal
+recovery; the backup and journal remain available for diagnosis.
 Configuration and migration backup staging use exact-path cleanup receipts
 under their respective locks. No filename-prefix sweep authorizes deletion:
 unknown leftovers require inspection and must be moved aside manually.

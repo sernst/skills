@@ -413,5 +413,7 @@ errors are NDJSON on stdout, so consumers can parse every output line.
 A committed filesystem change whose cleanup remains locked still emits its
 normal action and successful summary. A `diagnostic` warning with `message`
 identifies the committed destination, remaining cleanup error, and recovery
-journal. The next operation on that skill/source retries housekeeping under
-its existing lock. Successfully recovered transient errors add no events.
+journal. Housekeeping retries under the existing lock when a later operation
+applies that skill or materializes that cache outside a dry run. Commands that
+stop before entering recovery, including skill no-ops, do not retry cleanup.
+Successfully recovered transient errors add no events.

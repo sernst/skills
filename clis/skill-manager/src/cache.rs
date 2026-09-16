@@ -628,7 +628,7 @@ fn swap_cache(destination: &Path, staged: &Path, staging_root: &Path) -> Result<
         fs::remove_file(&paths.journal)
             .map_err(|error| SkillManagerError::io(&paths.journal, error))
     });
-    Ok(cleanup.err().map(|error| format!("cache refresh committed at {}; cleanup pending: {error}; recovery journal {}; the next source access retries cleanup", destination.display(), paths.journal.display())))
+    Ok(cleanup.err().map(|error| format!("cache refresh committed at {}; cleanup pending: {error}; recovery journal {}; a later non-dry-run source access retries cleanup", destination.display(), paths.journal.display())))
 }
 
 fn write_cache_journal(path: &Path, journal: &CacheJournal) -> Result<()> {
