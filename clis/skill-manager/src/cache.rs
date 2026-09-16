@@ -112,7 +112,12 @@ impl ReqwestGitHubTransport {
     ///
     /// Returns an error when the bounded HTTP client cannot be constructed.
     pub fn new() -> Result<Self> {
+        let tls_config = mozilla_tls_config().map_err(|error| SkillManagerError::GitHub {
+            reference: "github.com".into(),
+            message: format!("failed to configure bundled Mozilla TLS roots: {error}"),
+        })?;
         let client = Client::builder()
+            .tls_backend_preconfigured(tls_config)
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_mins(2))
             .user_agent(concat!("skill-manager/", env!("CARGO_PKG_VERSION")))
@@ -174,6 +179,29 @@ impl ReqwestGitHubTransport {
             }
         }
     }
+}
+
+fn ring_tls_config(
+    roots: rustls::RootCertStore,
+) -> std::result::Result<rustls::ClientConfig, rustls::Error> {
+    Ok(rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(roots)
+    .with_no_client_auth())
+}
+
+fn mozilla_root_store() -> std::result::Result<rustls::RootCertStore, rustls::Error> {
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+        roots.add(certificate.clone())?;
+    }
+    Ok(roots)
+}
+
+fn mozilla_tls_config() -> std::result::Result<rustls::ClientConfig, rustls::Error> {
+    ring_tls_config(mozilla_root_store()?)
 }
 
 impl GitHubTransport for ReqwestGitHubTransport {
@@ -862,17 +890,25 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::path::Path;
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
     use chrono::{DateTime, TimeZone, Utc};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose,
+    };
     use reqwest::StatusCode;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
     use super::{
         CacheJournal, CacheMetadata, CacheSwapState, Clock, GitHubTransport, MAX_COMPRESSED_BYTES,
         ReqwestGitHubTransport, cache_is_fresh, cache_swap_paths, is_transient_status,
-        read_metadata, recover_cache_swap, resolved_cached, select_repo_path, swap_cache,
-        validate_relative_path, write_cache_journal, write_metadata,
+        mozilla_root_store, mozilla_tls_config, read_metadata, recover_cache_swap, resolved_cached,
+        ring_tls_config, select_repo_path, swap_cache, validate_relative_path, write_cache_journal,
+        write_metadata,
     };
     use crate::config::source_from_reference;
 
@@ -939,6 +975,9 @@ mod tests {
     fn test_transport(base: &str, token: Option<&str>) -> ReqwestGitHubTransport {
         ReqwestGitHubTransport {
             client: reqwest::blocking::Client::builder()
+                .tls_backend_preconfigured(
+                    mozilla_tls_config().unwrap_or_else(|error| unreachable!("{error}")),
+                )
                 .timeout(Duration::from_secs(2))
                 .build()
                 .unwrap_or_else(|error| unreachable!("{error}")),
@@ -946,6 +985,94 @@ mod tests {
             api_base: base.into(),
             codeload_base: base.into(),
         }
+    }
+
+    fn test_ca(name: &str) -> (CertificateDer<'static>, Issuer<'static, KeyPair>) {
+        let mut params =
+            CertificateParams::new(Vec::new()).unwrap_or_else(|error| unreachable!("{error}"));
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.distinguished_name.push(DnType::CommonName, name);
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let key = KeyPair::generate().unwrap_or_else(|error| unreachable!("{error}"));
+        let certificate = params
+            .self_signed(&key)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        (certificate.der().clone(), Issuer::new(params, key))
+    }
+
+    fn test_server_certificate(
+        issuer: &Issuer<'static, KeyPair>,
+    ) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+        let mut params = CertificateParams::new(vec!["127.0.0.1".into()])
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "127.0.0.1");
+        params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+        params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ServerAuth);
+        let key = KeyPair::generate().unwrap_or_else(|error| unreachable!("{error}"));
+        let certificate = params
+            .signed_by(&key, issuer)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        (
+            certificate.der().clone(),
+            PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+        )
+    }
+
+    fn tls_server(
+        certificate: CertificateDer<'static>,
+        private_key: PrivateKeyDer<'static>,
+    ) -> (String, thread::JoinHandle<bool>) {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").unwrap_or_else(|error| unreachable!("{error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let config =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap_or_else(|error| unreachable!("{error}"))
+                .with_no_client_auth()
+                .with_single_cert(vec![certificate], private_key)
+                .unwrap_or_else(|error| unreachable!("{error}"));
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener
+                .accept()
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            let connection = ServerConnection::new(Arc::new(config))
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            let mut tls = StreamOwned::new(connection, stream);
+            let mut request = [0_u8; 1024];
+            if tls.read(&mut request).is_err() {
+                return false;
+            }
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .is_ok()
+        });
+        (format!("https://{address}"), handle)
+    }
+
+    fn tls_client(roots: rustls::RootCertStore) -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .tls_backend_preconfigured(
+                ring_tls_config(roots).unwrap_or_else(|error| unreachable!("{error}")),
+            )
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap_or_else(|error| unreachable!("{error}"))
     }
 
     #[test]
@@ -1225,5 +1352,45 @@ mod tests {
         let _requests = handle.join().unwrap_or_else(|_| unreachable!("server"));
 
         ReqwestGitHubTransport::new().unwrap_or_else(|error| unreachable!("{error}"));
+    }
+
+    #[test]
+    fn bundled_tls_accepts_an_explicit_fixture_root_and_rejects_it_in_production() {
+        let production_roots = mozilla_root_store().unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            production_roots.len(),
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS.len()
+        );
+
+        let (trusted_ca, issuer) = test_ca("trusted test root");
+        let (server_certificate, server_key) = test_server_certificate(&issuer);
+        let mut trusted_roots = rustls::RootCertStore::empty();
+        trusted_roots
+            .add(trusted_ca)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let trusted_client = tls_client(trusted_roots);
+        let (url, trusted_server) = tls_server(server_certificate.clone(), server_key.clone_key());
+        let body = trusted_client
+            .get(&url)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .and_then(reqwest::blocking::Response::text)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(body, "ok");
+        assert!(
+            trusted_server
+                .join()
+                .unwrap_or_else(|_| unreachable!("server"))
+        );
+
+        let production_transport =
+            ReqwestGitHubTransport::new().unwrap_or_else(|error| unreachable!("{error}"));
+        let (url, untrusted_server) = tls_server(server_certificate, server_key);
+        assert!(production_transport.client.get(&url).send().is_err());
+        assert!(
+            !untrusted_server
+                .join()
+                .unwrap_or_else(|_| unreachable!("server"))
+        );
     }
 }
