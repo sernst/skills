@@ -9345,12 +9345,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn import_cleanup_failure_reports_committed_action_warning_and_success_summary() {
-        struct CleanupBlocked;
-        impl crate::transaction::TransactionHook for CleanupBlocked {
+    fn import_with_blocked_record_or_cleanup(
+        commit_blocked: bool,
+    ) -> (Result<bool>, RecordingReporter) {
+        struct Blocked(bool);
+        impl crate::transaction::TransactionHook for Blocked {
             fn after_state(&self, _: crate::transaction::TransactionState) -> Result<()> {
                 Ok(())
+            }
+            fn before_commit(&self) -> Result<()> {
+                if self.0 {
+                    Err(SkillManagerError::InvalidInput(
+                        "commit record unavailable".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
             }
             fn before_cleanup(&self) -> Result<()> {
                 Err(SkillManagerError::InvalidInput(
@@ -9398,27 +9408,56 @@ mod tests {
         let repository = FileConfigRepository::new(home.path());
         let mut prompt = TestPrompt::default();
         let mut reporter = RecordingReporter::default();
+        let hook = Blocked(commit_blocked);
         let mut app = Application::new(
             &repository,
             &NoNetwork,
             &mut prompt,
             &mut reporter,
-            &CleanupBlocked,
+            &hook,
             false,
             home.path().to_path_buf(),
         );
-        assert!(
-            app.apply_import(
-                &candidate,
-                &resolved,
-                &destination,
-                "source",
-                false,
-                &[],
-                crate::review::RenderStyle::plain()
-            )
-            .unwrap_or_else(|error| unreachable!("{error}"))
+        let result = app.apply_import(
+            &candidate,
+            &resolved,
+            &destination,
+            "source",
+            false,
+            &[],
+            crate::review::RenderStyle::plain(),
         );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("SKILL.md"))
+                .ok()
+                .as_deref(),
+            Some("new")
+        );
+        (result, reporter)
+    }
+
+    #[test]
+    fn import_commit_record_failure_emits_no_committed_action_or_success_summary() {
+        let (result, reporter) = import_with_blocked_record_or_cleanup(true);
+        assert!(result.is_err());
+        assert!(
+            !reporter
+                .events
+                .iter()
+                .any(|event| event == "skill.imported" || event == "summary")
+        );
+        assert!(
+            !reporter
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("change committed"))
+        );
+    }
+
+    #[test]
+    fn import_cleanup_failure_reports_committed_action_warning_and_success_summary() {
+        let (result, reporter) = import_with_blocked_record_or_cleanup(false);
+        assert!(result.unwrap_or_else(|error| unreachable!("{error}")));
         assert!(
             reporter
                 .events
@@ -9438,12 +9477,6 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("change committed")
                     && warning.contains("cleanup pending"))
-        );
-        assert_eq!(
-            std::fs::read_to_string(destination.join("SKILL.md"))
-                .ok()
-                .as_deref(),
-            Some("new")
         );
     }
 

@@ -580,6 +580,11 @@ solely to reapply already committed content; preserve any edits made after
 that commit. Recovery itself
 only finishes housekeeping and does not replay the committed replacement.
 
+If replacement data is installed but recording the committed state fails, the
+command reports an interrupted operation instead of success. Preserve its
+reported journal and backup: recovery of the recorded prior state may restore
+prior content.
+
 There is no separate recovery command or automatic recovery before discovery.
 If a process stops after moving an import source to its backup, the missing
 source can prevent subsequent discovery from reaching internal recovery.

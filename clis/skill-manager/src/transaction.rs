@@ -21,6 +21,14 @@ pub trait TransactionHook {
     /// Test implementations may return an injected failure.
     fn after_state(&self, state: TransactionState) -> Result<()>;
 
+    /// Called after replacement placement, immediately before its commit record.
+    ///
+    /// # Errors
+    /// Test implementations may simulate a failed commit-record write.
+    fn before_commit(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Called before committed cleanup, for deterministic cleanup failure tests.
     ///
     /// # Errors
@@ -194,12 +202,14 @@ fn replace_directory<H: TransactionHook>(
         return Err(SkillManagerError::io(&staged_content, error));
     }
     journal.state = TransactionState::Committed;
-    let recorded = write_journal(&paths.journal, &journal);
-    if recorded.is_ok() {
-        hook.after_state(TransactionState::Committed)?;
-    }
-    let cleanup_pending = recorded
-        .and_then(|()| hook.before_cleanup())
+    hook.before_commit().and_then(|()| write_journal(&paths.journal, &journal))
+        .map_err(|error| SkillManagerError::InvalidInput(format!(
+            "replacement data is installed at {}, but recording committed state failed: {error}; operation interrupted; recovery journal {} retains the prior state and recovery may restore prior content",
+            destination.display(), paths.journal.display()
+        )))?;
+    hook.after_state(TransactionState::Committed)?;
+    let cleanup_pending = hook
+        .before_cleanup()
         .and_then(|()| cleanup_committed(&paths.journal, &journal))
         .err()
         .map(|error| cleanup_warning(destination, &paths.journal, &error));
@@ -646,6 +656,56 @@ mod tests {
         assert!(paths.backup.join("keep").exists());
         assert!(outside.join("keep").exists());
         std::fs::remove_dir(staging).unwrap_or_else(|error| unreachable!("{error}"));
+    }
+
+    #[test]
+    fn import_commit_record_failure_is_interrupted_and_retains_prior_journal() {
+        struct CommitBlocked;
+        impl TransactionHook for CommitBlocked {
+            fn after_state(&self, state: TransactionState) -> Result<()> {
+                assert_ne!(state, TransactionState::Committed);
+                Ok(())
+            }
+            fn before_commit(&self) -> Result<()> {
+                Err(SkillManagerError::InvalidInput(
+                    "commit record unavailable".into(),
+                ))
+            }
+        }
+        let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let deployment = root.path().join("deployment");
+        let destination = root.path().join("source").join("demo");
+        for path in [&deployment, &destination] {
+            std::fs::create_dir_all(path).unwrap_or_else(|error| unreachable!("{error}"));
+        }
+        std::fs::write(deployment.join("SKILL.md"), "new")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        std::fs::write(destination.join("SKILL.md"), "old")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let error = import_skill(&deployment, &destination, root.path(), &CommitBlocked)
+            .err()
+            .unwrap_or_else(|| unreachable!("commit recording must fail"));
+        assert!(error.to_string().contains("data is installed"));
+        assert!(error.to_string().contains("operation interrupted"));
+        let paths = transaction_paths(&root.path().join("source"), root.path(), "demo");
+        let journal: Journal = serde_json::from_slice(
+            &std::fs::read(&paths.journal).unwrap_or_else(|error| unreachable!("{error}")),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(journal.state, TransactionState::OldMoved);
+        assert!(journal.staging_root.is_some_and(|path| path.exists()));
+        assert_eq!(
+            std::fs::read_to_string(destination.join("SKILL.md"))
+                .ok()
+                .as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.backup.join("SKILL.md"))
+                .ok()
+                .as_deref(),
+            Some("old")
+        );
     }
 
     #[test]

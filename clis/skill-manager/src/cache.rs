@@ -600,6 +600,15 @@ fn cache_swap_paths(destination: &Path) -> Result<CacheSwapPaths> {
 }
 
 fn swap_cache(destination: &Path, staged: &Path, staging_root: &Path) -> Result<Option<String>> {
+    swap_cache_with_commit_hook(destination, staged, staging_root, || Ok(()))
+}
+
+fn swap_cache_with_commit_hook(
+    destination: &Path,
+    staged: &Path,
+    staging_root: &Path,
+    before_commit: impl FnOnce() -> Result<()>,
+) -> Result<Option<String>> {
     let paths = cache_swap_paths(destination)?;
     let mut journal = CacheJournal {
         state: CacheSwapState::Prepared,
@@ -622,12 +631,17 @@ fn swap_cache(destination: &Path, staged: &Path, staging_root: &Path) -> Result<
         return Err(SkillManagerError::io(staged, error));
     }
     journal.state = CacheSwapState::Committed;
-    let cleanup = write_cache_journal(&paths.journal, &journal).and_then(|()| {
+    before_commit().and_then(|()| write_cache_journal(&paths.journal, &journal))
+        .map_err(|error| SkillManagerError::InvalidInput(format!(
+            "cache data is installed at {}, but recording committed state failed: {error}; refresh interrupted; recovery journal {} retains the prior state and recovery may restore prior content",
+            destination.display(), paths.journal.display()
+        )))?;
+    let cleanup = (|| {
         crate::staging::remove_tree(&paths.backup)?;
         cleanup_cache_staging(staging_root, destination)?;
         fs::remove_file(&paths.journal)
             .map_err(|error| SkillManagerError::io(&paths.journal, error))
-    });
+    })();
     Ok(cleanup.err().map(|error| format!("cache refresh committed at {}; cleanup pending: {error}; recovery journal {}; a later non-dry-run source access retries cleanup", destination.display(), paths.journal.display())))
 }
 
@@ -1233,6 +1247,48 @@ mod tests {
         assert!(select_repo_path(&content, &source).is_err());
         source.repo_path = Some("missing".into());
         assert!(resolved_cached(&source, &content).is_err());
+    }
+
+    #[test]
+    fn cache_commit_record_failure_is_interrupted_and_retains_prior_journal() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let destination = root.path().join("src_example");
+        let staging_root = root.path().join(".src_example.stage-pending");
+        let staged = staging_root.join("cache");
+        fs::create_dir_all(&staged).unwrap_or_else(|error| unreachable!("{error}"));
+        fs::create_dir_all(&destination).unwrap_or_else(|error| unreachable!("{error}"));
+        fs::write(destination.join("value"), "old").unwrap_or_else(|error| unreachable!("{error}"));
+        fs::write(staged.join("value"), "new").unwrap_or_else(|error| unreachable!("{error}"));
+        let result =
+            super::swap_cache_with_commit_hook(&destination, &staged, &staging_root, || {
+                Err(crate::error::SkillManagerError::InvalidInput(
+                    "commit record unavailable".into(),
+                ))
+            });
+        let error = result
+            .err()
+            .unwrap_or_else(|| unreachable!("commit recording must fail"));
+        assert!(error.to_string().contains("data is installed"));
+        assert!(error.to_string().contains("refresh interrupted"));
+        let paths = cache_swap_paths(&destination).unwrap_or_else(|error| unreachable!("{error}"));
+        let journal: CacheJournal = serde_json::from_slice(
+            &fs::read(&paths.journal).unwrap_or_else(|error| unreachable!("{error}")),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(matches!(journal.state, CacheSwapState::OldMoved));
+        assert!(staging_root.exists());
+        assert_eq!(
+            fs::read_to_string(destination.join("value"))
+                .ok()
+                .as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            fs::read_to_string(paths.backup.join("value"))
+                .ok()
+                .as_deref(),
+            Some("old")
+        );
     }
 
     #[test]

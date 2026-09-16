@@ -77,6 +77,8 @@ for deletion. Missing paths, existing-path conflicts, validation, and parsing
 failures do not trigger retries. Manager advisory-lock contention retains its
 separate ten-second timeout. Stream reads/writes advance normally, preserving
 bytes already transferred; atomic persist retries retain the same staged file.
+Exhausted interrupted stream errors cannot restart the retry budget through
+standard-library or archive helpers. Filesystem APIs restore the original error.
 
 Deployment and cache journals record staging ownership before populating the
 scratch directory. New deployment records retain `stage` and `staging_root`
@@ -84,6 +86,10 @@ through commit; legacy records remain readable. Recovery validates all paths
 and rejects links/reparse points before mutating any backup or stage. A
 committed operation returns its result with a warning if cleanup is still
 pending, retaining its journal for recovery under the same lock. Transaction
+success requires a persisted `Committed` record. Failure to persist that record
+after placing the replacement is an interrupted operation, not pending cleanup;
+the error identifies the installed data and retained prior-state journal.
+Recovery of that prior state may restore prior content. Transaction
 recovery runs when a later operation enters the transaction API; commands that
 stop at discovery or a no-op do not reach it. Cache recovery runs during a
 later non-dry-run source materialization. There is no separate recovery command

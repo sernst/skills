@@ -117,7 +117,7 @@ pub fn open(path: impl AsRef<Path>) -> io::Result<File> {
 pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
     let mut file = Retrying(open(path)?);
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    file.read_to_end(&mut bytes).map_err(original_error)?;
     Ok(bytes)
 }
 
@@ -136,7 +136,9 @@ pub fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
 /// Returns the original final open or write error.
 pub fn write(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> io::Result<()> {
     let file = retry(|| File::create(path.as_ref()))?;
-    Retrying(file).write_all(bytes.as_ref())
+    Retrying(file)
+        .write_all(bytes.as_ref())
+        .map_err(original_error)
 }
 
 /// Copy bytes without restarting a partially completed copy.
@@ -147,7 +149,8 @@ pub fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u64> {
     let source = open(from.as_ref())?;
     let permissions = retry(|| source.metadata())?.permissions();
     let destination = retry(|| File::create(to.as_ref()))?;
-    let length = io::copy(&mut Retrying(source), &mut Retrying(&destination))?;
+    let length =
+        io::copy(&mut Retrying(source), &mut Retrying(&destination)).map_err(original_error)?;
     retry(|| destination.set_permissions(permissions.clone()))?;
     Ok(length)
 }
@@ -178,6 +181,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
             .ok_or_else(|| io::Error::other("missing staged file"))?;
         Retrying(file.as_file_mut())
             .write_all(bytes)
+            .map_err(original_error)
             .and_then(|()| retry(|| file.as_file().sync_all()))
     };
     let result = prepared.and_then(|()| {
@@ -195,26 +199,70 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         })
     });
     if let Some(file) = staged {
-        // Disable silent Drop cleanup: preserve exact identity and report an exhausted deletion.
-        let (_, retained) = file.keep().map_err(|error| error.error)?;
-        if let Err(cleanup) = remove_file(&retained) {
-            return Err(io::Error::new(
-                cleanup.kind(),
-                format!(
-                    "{}; temporary-file cleanup pending at {}: {cleanup}",
-                    result
-                        .err()
-                        .map_or_else(|| "write failed".to_owned(), |error| error.to_string()),
-                    staged_path.display()
-                ),
-            ));
-        }
+        return cleanup_failed_write(file, &staged_path, result, |path| remove_file(path));
+    }
+    result
+}
+
+fn cleanup_failed_write(
+    mut file: tempfile::NamedTempFile,
+    path: &Path,
+    result: io::Result<()>,
+    remove: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    // This transfer cannot fail, unlike keep(). Drop closes the file handle
+    // without silently deleting the path, which remains explicitly owned here.
+    file.disable_cleanup(true);
+    drop(file);
+    if let Err(cleanup) = remove(path) {
+        return Err(io::Error::new(
+            cleanup.kind(),
+            format!(
+                "{}; temporary-file cleanup pending at {}: {cleanup}",
+                result
+                    .err()
+                    .map_or_else(|| "write failed".to_owned(), |error| error.to_string()),
+                path.display()
+            ),
+        ));
     }
     result
 }
 
 /// Adapter which retries only a failed read/write primitive, preserving stream position.
 pub(crate) struct Retrying<T>(pub(crate) T);
+
+/// Standard stream helpers automatically retry Interrupted. Keep exhaustion
+/// non-retryable inside those helpers, retaining the exact original error.
+#[derive(Debug)]
+struct InterruptedExhausted(io::Error);
+
+impl std::fmt::Display for InterruptedExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for InterruptedExhausted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+fn stream_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::Interrupted {
+        io::Error::other(InterruptedExhausted(error))
+    } else {
+        error
+    }
+}
+
+fn original_error(error: io::Error) -> io::Error {
+    match error.downcast::<InterruptedExhausted>() {
+        Ok(InterruptedExhausted(original)) => original,
+        Err(error) => error,
+    }
+}
 
 /// Invocation-scoped scratch directory with bounded cleanup at the final owner drop.
 /// Its path comes directly from exclusive temporary-directory creation, never a scan.
@@ -258,22 +306,130 @@ impl Drop for TemporaryDirectory {
 
 impl<T: Read> Read for Retrying<T> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        retry(|| self.0.read(buffer))
+        retry(|| self.0.read(buffer)).map_err(stream_error)
     }
 }
 
 impl<T: Write> Write for Retrying<T> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        retry(|| self.0.write(buffer))
+        retry(|| self.0.write(buffer)).map_err(stream_error)
     }
     fn flush(&mut self) -> io::Result<()> {
-        retry(|| self.0.flush())
+        retry(|| self.0.flush()).map_err(stream_error)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct InterruptedStream {
+        attempts: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Read for InterruptedStream {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.attempts += 1;
+            if self.attempts == 1 {
+                buffer[0] = b'x';
+                Ok(1)
+            } else {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "held read"))
+            }
+        }
+    }
+
+    impl Write for InterruptedStream {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.attempts += 1;
+            if self.attempts == 1 {
+                self.bytes.push(buffer[0]);
+                Ok(1)
+            } else {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "held write"))
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn interrupted_high_level_streams_stop_after_one_budget_without_replaying_progress() {
+        let mut source = InterruptedStream::default();
+        let mut bytes = Vec::new();
+        let error = Retrying(&mut source)
+            .read_to_end(&mut bytes)
+            .map_err(original_error)
+            .err()
+            .unwrap_or_else(|| unreachable!("interrupted read must stop"));
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(error.to_string(), "held read");
+        assert_eq!(source.attempts, 7);
+        assert_eq!(bytes, b"x");
+
+        let mut destination = InterruptedStream::default();
+        let error = Retrying(&mut destination)
+            .write_all(b"xy")
+            .map_err(original_error)
+            .err()
+            .unwrap_or_else(|| unreachable!("interrupted write must stop"));
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(destination.attempts, 7);
+        assert_eq!(destination.bytes, b"x");
+
+        let mut source = InterruptedStream::default();
+        let mut copied = Vec::new();
+        let error = io::copy(&mut Retrying(&mut source), &mut copied)
+            .map_err(original_error)
+            .err()
+            .unwrap_or_else(|| unreachable!("interrupted copy must stop"));
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(source.attempts, 7);
+        assert_eq!(copied, b"x");
+    }
+
+    #[test]
+    fn compressed_stream_does_not_restart_exhausted_read_budget() {
+        let mut source = InterruptedStream {
+            attempts: 1,
+            bytes: Vec::new(),
+        };
+        let mut decoder = flate2::read::GzDecoder::new(Retrying(&mut source));
+        let error = io::copy(&mut decoder, &mut Vec::new())
+            .err()
+            .unwrap_or_else(|| unreachable!("interrupted archive must stop"));
+        assert_eq!(error.to_string(), "held read");
+        assert_eq!(source.attempts, 7);
+    }
+
+    #[test]
+    fn failed_atomic_write_retains_original_error_and_exact_owned_cleanup_path() {
+        let directory = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let file = tempfile::NamedTempFile::new_in(directory.path())
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let path = file.path().to_path_buf();
+        let result = cleanup_failed_write(
+            file,
+            &path,
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "original persist failure",
+            )),
+            |_| Err(io::Error::new(io::ErrorKind::WouldBlock, "held cleanup")),
+        );
+        let message = result
+            .err()
+            .unwrap_or_else(|| unreachable!("cleanup must report retained file"))
+            .to_string();
+        assert!(message.contains("original persist failure"));
+        assert!(message.contains("held cleanup"));
+        assert!(message.contains(&path.display().to_string()));
+        assert!(path.exists(), "drop must not silently remove retained file");
+        remove_file(path).unwrap_or_else(|error| unreachable!("{error}"));
+    }
 
     #[test]
     fn first_success_and_permanent_errors_never_sleep() {
