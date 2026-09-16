@@ -1,6 +1,6 @@
 //! Strict JSON invocation input and CLI-over-recipe overlay behavior.
 
-use std::fs;
+use crate::fs_retry as fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 

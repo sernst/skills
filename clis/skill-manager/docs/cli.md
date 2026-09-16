@@ -562,3 +562,28 @@ and its `configs.copy.item`/`summary` events.
 
 See [configuration and migration](configuration.md) for storage and backup
 details, and [the JSON contract](json.md) for automation.
+
+## Temporary filesystem locks and cleanup
+
+Brief filesystem sharing/locking failures are retried silently, with an
+immediate first attempt and at most 775ms of backoff per primitive. A lasting
+failure names its filesystem path and underlying error. Normal permission and
+validation problems are not fixed by retrying.
+
+A committed import, deployment, removal, or cache refresh can succeed while
+cleanup remains blocked. The warning explicitly says the change committed,
+names the recovery journal, and explains that the next operation on the same
+skill/source retries cleanup. Do not repeat an import solely to reapply already
+committed content; preserve any edits made after that commit. Recovery itself
+only finishes housekeeping and does not replay the committed replacement.
+
+A staging directory or backup without an ownership journal/receipt is never
+swept by its name. Inspect any reported unowned path and move it aside before
+retrying. Older unjournaled temporary directories are not automatically deleted.
+
+Dry-run remote sources use invocation-owned system temporary directories, with
+bounded cleanup when the final reference is released. An exhausted finalizer
+reports the exact scratch path on stderr, keeping NDJSON stdout intact. No
+manager-home cleanup record is written by that dry-run finalizer. Abrupt process
+termination can still leave unowned system-temp or atomic-write temporary files;
+these are not removed based only on a filename prefix.

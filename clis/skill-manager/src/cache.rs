@@ -1,7 +1,7 @@
 //! GitHub transport, bounded archive extraction, and persistent source caching.
 
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use crate::fs_retry::{self as fs, File};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -46,6 +46,7 @@ pub struct CacheMetadata {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum CacheSwapState {
+    Staging,
     Prepared,
     OldMoved,
     Committed,
@@ -258,11 +259,11 @@ impl GitHubTransport for ReqwestGitHubTransport {
                 message: format!("archive exceeds {MAX_COMPRESSED_BYTES} compressed bytes"),
             });
         }
-        let mut output =
-            File::create(destination).map_err(|error| SkillManagerError::io(destination, error))?;
+        let mut output = fs::retry(|| File::create(destination))
+            .map_err(|error| SkillManagerError::io(destination, error))?;
         let copied = std::io::copy(
             &mut response.by_ref().take(MAX_COMPRESSED_BYTES + 1),
-            &mut output,
+            &mut fs::Retrying(&mut output),
         )
         .map_err(|error| SkillManagerError::GitHub {
             reference: source.clone(),
@@ -274,9 +275,7 @@ impl GitHubTransport for ReqwestGitHubTransport {
                 message: format!("archive exceeds {MAX_COMPRESSED_BYTES} compressed bytes"),
             });
         }
-        output
-            .sync_all()
-            .map_err(|error| SkillManagerError::io(destination, error))
+        fs::retry(|| output.sync_all()).map_err(|error| SkillManagerError::io(destination, error))
     }
 }
 
@@ -327,6 +326,7 @@ pub fn materialize_source_with_clock<R: ConfigRepository, G: GitHubTransport, C:
             })?,
             from_cache: false,
             temporary: None,
+            cleanup_pending: None,
         }),
         SourceType::GitHub => {
             materialize_github(repository, github, clock, source, refresh, dry_run)
@@ -366,7 +366,8 @@ fn materialize_github<R: ConfigRepository, G: GitHubTransport, C: Clock>(
             return resolved_cached(source, &content);
         }
         let temporary = Arc::new(
-            tempfile::tempdir().map_err(|error| SkillManagerError::io("<temporary>", error))?,
+            fs::TemporaryDirectory::new()
+                .map_err(|error| SkillManagerError::io("<temporary>", error))?,
         );
         let reference = source
             .r#ref
@@ -387,6 +388,7 @@ fn materialize_github<R: ConfigRepository, G: GitHubTransport, C: Clock>(
             path: selected,
             from_cache: false,
             temporary: Some(temporary),
+            cleanup_pending: None,
         });
     }
 
@@ -403,16 +405,61 @@ fn materialize_github<R: ConfigRepository, G: GitHubTransport, C: Clock>(
     }
     fs::create_dir_all(repository.cache_root())
         .map_err(|error| SkillManagerError::io(repository.cache_root(), error))?;
-    let staging = tempfile::Builder::new()
-        .prefix(&format!(".{}.stage-", source.id))
-        .tempdir_in(repository.cache_root())
-        .map_err(|error| SkillManagerError::io(repository.cache_root(), error))?;
+    let staging = repository
+        .cache_root()
+        .join(format!(".{}.stage-pending", source.id));
+    crate::staging::reject_link(repository.cache_root())?;
+    if fs::symlink_metadata(&staging).is_ok() {
+        return Err(SkillManagerError::InvalidInput(format!(
+            "unowned cache staging directory {}; inspect and move it aside before retrying",
+            staging.display()
+        )));
+    }
+    write_cache_journal(
+        &swap_paths.journal,
+        &CacheJournal {
+            state: CacheSwapState::Staging,
+            destination: source_cache.clone(),
+            backup: swap_paths.backup.clone(),
+            staging_root: staging.clone(),
+        },
+    )?;
+    fs::create_dir(&staging).map_err(|error| SkillManagerError::io(&staging, error))?;
+    let preparation = prepare_cache(github, clock, source, source_ref, owner, repo, &staging);
+    let staged_cache = match preparation {
+        Ok(path) => path,
+        Err(error) => {
+            return match recover_cache_swap(&source_cache, &swap_paths.backup, &swap_paths.journal)
+            {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(SkillManagerError::InvalidInput(format!(
+                    "{error}; cache staging cleanup pending in {}: {cleanup}; retry to recover",
+                    swap_paths.journal.display()
+                ))),
+            };
+        }
+    };
+    let cleanup_pending = swap_cache(&source_cache, &staged_cache, &staging)?;
+    let mut resolved = resolved_cached(source, &content)?;
+    resolved.cleanup_pending = cleanup_pending;
+    Ok(resolved)
+}
+
+fn prepare_cache<G: GitHubTransport, C: Clock>(
+    github: &G,
+    clock: &C,
+    source: &SourceEntry,
+    source_ref: String,
+    owner: &str,
+    repo: &str,
+    staging: &Path,
+) -> Result<PathBuf> {
     let reference = source
         .r#ref
         .clone()
         .map_or_else(|| github.default_branch(owner, repo), Ok)?;
-    let archive = staging.path().join("source.tar.gz");
-    let new_content = staging.path().join("content");
+    let archive = staging.join("source.tar.gz");
+    let new_content = staging.join("content");
     github.download_archive(owner, repo, &reference, &archive)?;
     extract_archive(
         &archive,
@@ -427,7 +474,7 @@ fn materialize_github<R: ConfigRepository, G: GitHubTransport, C: Clock>(
             message: "configured repository path does not exist".into(),
         });
     }
-    let staged_cache = staging.path().join("cache");
+    let staged_cache = staging.join("cache");
     fs::create_dir(&staged_cache).map_err(|error| SkillManagerError::io(&staged_cache, error))?;
     fs::rename(&new_content, staged_cache.join("content"))
         .map_err(|error| SkillManagerError::io(&new_content, error))?;
@@ -442,8 +489,7 @@ fn materialize_github<R: ConfigRepository, G: GitHubTransport, C: Clock>(
             repo_path: source.repo_path.clone(),
         },
     )?;
-    swap_cache(&source_cache, &staged_cache, staging.path())?;
-    resolved_cached(source, &content)
+    Ok(staged_cache)
 }
 
 fn cache_can_be_reused<C: Clock>(
@@ -500,6 +546,7 @@ fn resolved_cached(source: &SourceEntry, content: &Path) -> Result<ResolvedSourc
         path,
         from_cache: true,
         temporary: None,
+        cleanup_pending: None,
     })
 }
 
@@ -552,9 +599,8 @@ fn cache_swap_paths(destination: &Path) -> Result<CacheSwapPaths> {
     Ok(CacheSwapPaths { backup, journal })
 }
 
-fn swap_cache(destination: &Path, staged: &Path, staging_root: &Path) -> Result<()> {
+fn swap_cache(destination: &Path, staged: &Path, staging_root: &Path) -> Result<Option<String>> {
     let paths = cache_swap_paths(destination)?;
-    recover_cache_swap(destination, &paths.backup, &paths.journal)?;
     let mut journal = CacheJournal {
         state: CacheSwapState::Prepared,
         destination: destination.to_path_buf(),
@@ -576,34 +622,29 @@ fn swap_cache(destination: &Path, staged: &Path, staging_root: &Path) -> Result<
         return Err(SkillManagerError::io(staged, error));
     }
     journal.state = CacheSwapState::Committed;
-    write_cache_journal(&paths.journal, &journal)?;
-    if paths.backup.exists() {
-        fs::remove_dir_all(&paths.backup)
-            .map_err(|error| SkillManagerError::io(&paths.backup, error))?;
-    }
-    cleanup_cache_staging(staging_root, destination)?;
-    fs::remove_file(&paths.journal).map_err(|error| SkillManagerError::io(&paths.journal, error))
+    let cleanup = write_cache_journal(&paths.journal, &journal).and_then(|()| {
+        crate::staging::remove_tree(&paths.backup)?;
+        cleanup_cache_staging(staging_root, destination)?;
+        fs::remove_file(&paths.journal)
+            .map_err(|error| SkillManagerError::io(&paths.journal, error))
+    });
+    Ok(cleanup.err().map(|error| format!("cache refresh committed at {}; cleanup pending: {error}; recovery journal {}; the next source access retries cleanup", destination.display(), paths.journal.display())))
 }
 
 fn write_cache_journal(path: &Path, journal: &CacheJournal) -> Result<()> {
     let mut data = serde_json::to_vec(journal)
         .map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
     data.push(b'\n');
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| SkillManagerError::io(path, error))?;
-    file.write_all(&data)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| SkillManagerError::io(path, error))
+    fs::atomic_write(path, &data).map_err(|error| SkillManagerError::io(path, error))
 }
 
 fn recover_cache_swap(destination: &Path, backup: &Path, journal: &Path) -> Result<()> {
     if !journal.exists() {
         if backup.exists() {
-            fs::remove_dir_all(backup).map_err(|error| SkillManagerError::io(backup, error))?;
+            return Err(SkillManagerError::InvalidInput(format!(
+                "unowned cache backup {}; inspect and move it aside before retrying; no recovery journal exists",
+                backup.display()
+            )));
         }
         return Ok(());
     }
@@ -620,12 +661,26 @@ fn recover_cache_swap(destination: &Path, backup: &Path, journal: &Path) -> Resu
             journal.display()
         )));
     }
-    if !matches!(record.state, CacheSwapState::Committed)
-        && backup.exists()
+    validate_cache_staging(&record.staging_root, destination)?;
+    for managed in [
+        destination.parent(),
+        Some(journal),
+        Some(backup),
+        Some(record.staging_root.as_path()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        crate::staging::reject_link(managed)?;
+    }
+    if !matches!(
+        record.state,
+        CacheSwapState::Committed | CacheSwapState::Staging
+    ) && backup.exists()
         && !destination.exists()
     {
         fs::rename(backup, destination).map_err(|error| SkillManagerError::io(backup, error))?;
-    } else if backup.exists() {
+    } else if backup.exists() && !matches!(record.state, CacheSwapState::Staging) {
         fs::remove_dir_all(backup).map_err(|error| SkillManagerError::io(backup, error))?;
     }
     cleanup_cache_staging(&record.staging_root, destination)?;
@@ -633,9 +688,11 @@ fn recover_cache_swap(destination: &Path, backup: &Path, journal: &Path) -> Resu
 }
 
 fn cleanup_cache_staging(staging_root: &Path, destination: &Path) -> Result<()> {
-    if !staging_root.exists() {
-        return Ok(());
-    }
+    validate_cache_staging(staging_root, destination)?;
+    crate::staging::remove_tree(staging_root)
+}
+
+fn validate_cache_staging(staging_root: &Path, destination: &Path) -> Result<()> {
     let parent = destination.parent().ok_or_else(|| {
         SkillManagerError::InvalidInput(format!(
             "cache destination has no parent: {}",
@@ -658,7 +715,7 @@ fn cleanup_cache_staging(staging_root: &Path, destination: &Path) -> Result<()> 
             staging_root.display()
         )));
     }
-    fs::remove_dir_all(staging_root).map_err(|error| SkillManagerError::io(staging_root, error))
+    Ok(())
 }
 
 fn extract_archive(
@@ -673,8 +730,8 @@ fn extract_archive(
         .map(|path| validate_relative_path(Path::new(path), source))
         .transpose()?;
     let archive_file =
-        File::open(archive_path).map_err(|error| SkillManagerError::io(archive_path, error))?;
-    let decoder = GzDecoder::new(archive_file);
+        fs::open(archive_path).map_err(|error| SkillManagerError::io(archive_path, error))?;
+    let decoder = GzDecoder::new(fs::Retrying(archive_file));
     let mut archive = Archive::new(decoder);
     let entries = archive
         .entries()
@@ -724,13 +781,16 @@ fn extract_archive(
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent).map_err(|error| SkillManagerError::io(parent, error))?;
         }
-        let mut file =
-            File::create(&output).map_err(|error| SkillManagerError::io(&output, error))?;
-        let copied = std::io::copy(&mut entry.by_ref().take(MAX_FILE_BYTES + 1), &mut file)
-            .map_err(|error| SkillManagerError::GitHub {
-                reference: source.to_owned(),
-                message: error.to_string(),
-            })?;
+        let mut file = fs::retry(|| File::create(&output))
+            .map_err(|error| SkillManagerError::io(&output, error))?;
+        let copied = std::io::copy(
+            &mut entry.by_ref().take(MAX_FILE_BYTES + 1),
+            &mut fs::Retrying(&mut file),
+        )
+        .map_err(|error| SkillManagerError::GitHub {
+            reference: source.to_owned(),
+            message: error.to_string(),
+        })?;
         if copied > MAX_FILE_BYTES {
             return archive_error(source, "archive file exceeds per-file limit");
         }
@@ -741,8 +801,8 @@ fn extract_archive(
 
 fn validate_raw_archive(archive_path: &Path, source: &str) -> Result<()> {
     let archive_file =
-        File::open(archive_path).map_err(|error| SkillManagerError::io(archive_path, error))?;
-    let decoder = GzDecoder::new(archive_file);
+        fs::open(archive_path).map_err(|error| SkillManagerError::io(archive_path, error))?;
+    let decoder = GzDecoder::new(fs::Retrying(archive_file));
     let mut archive = Archive::new(decoder);
     let entries = archive
         .entries()
@@ -864,7 +924,7 @@ fn preserve_executable_permission<R: Read>(entry: &tar::Entry<'_, R>, output: &P
     use std::os::unix::fs::PermissionsExt;
 
     let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
-    fs::set_permissions(output, fs::Permissions::from_mode(mode))
+    fs::set_permissions(output, &fs::Permissions::from_mode(mode))
         .map_err(|error| SkillManagerError::io(output, error))
 }
 
@@ -1223,14 +1283,13 @@ mod tests {
     }
 
     #[test]
-    fn recovery_rejects_corrupt_paths_and_cleans_orphan_backup_without_journal() {
+    fn recovery_rejects_corrupt_paths_and_preserves_unowned_backup() {
         let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
         let destination = root.path().join("src_example");
         let paths = cache_swap_paths(&destination).unwrap_or_else(|error| unreachable!("{error}"));
         fs::create_dir(&paths.backup).unwrap_or_else(|error| unreachable!("{error}"));
-        recover_cache_swap(&destination, &paths.backup, &paths.journal)
-            .unwrap_or_else(|error| unreachable!("{error}"));
-        assert!(!paths.backup.exists());
+        assert!(recover_cache_swap(&destination, &paths.backup, &paths.journal).is_err());
+        assert!(paths.backup.exists());
 
         fs::write(&paths.journal, "{broken").unwrap_or_else(|error| unreachable!("{error}"));
         assert!(recover_cache_swap(&destination, &paths.backup, &paths.journal).is_err());

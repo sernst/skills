@@ -65,3 +65,25 @@ Add a source transport behind the source-materialization port, a renderer
 behind the reporter port, or a target policy behind target selection. Keep Clap
 and terminal concerns at the boundary, preserve event ordering, and record
 intentional public semantic changes in the deviation ledger.
+
+## Filesystem reliability
+
+`fs_retry` retries individual filesystem primitives, never an entire import,
+transaction, archive download, or partially completed stream. The first attempt
+is immediate; eligible failures wait 25, 50, 100, 200, and 400ms (775ms total).
+Interrupted/would-block errors qualify everywhere; Windows sharing, locking,
+busy, and access-denied errors also qualify. Directory-not-empty qualifies only
+for deletion. Missing paths, existing-path conflicts, validation, and parsing
+failures do not trigger retries. Manager advisory-lock contention retains its
+separate ten-second timeout. Stream reads/writes advance normally, preserving
+bytes already transferred; atomic persist retries retain the same staged file.
+
+Deployment and cache journals record staging ownership before populating the
+scratch directory. New deployment records retain `stage` and `staging_root`
+through commit; legacy records remain readable. Recovery validates all paths
+and rejects links/reparse points before mutating any backup or stage. A
+committed operation returns its result with a warning if cleanup is still
+pending, retaining its journal for the next operation under the same lock.
+Configuration and migration backup staging use exact-path cleanup receipts
+under their respective locks. No filename-prefix sweep authorizes deletion:
+unknown leftovers require inspection and must be moved aside manually.

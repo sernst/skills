@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Executable boundary for skill-manager.
 
-use std::fs;
+use skill_manager::fs_retry as fs;
 use std::io;
 use std::process::ExitCode;
 
