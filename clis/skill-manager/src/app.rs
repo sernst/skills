@@ -9346,6 +9346,108 @@ mod tests {
     }
 
     #[test]
+    fn import_cleanup_failure_reports_committed_action_warning_and_success_summary() {
+        struct CleanupBlocked;
+        impl crate::transaction::TransactionHook for CleanupBlocked {
+            fn after_state(&self, _: crate::transaction::TransactionState) -> Result<()> {
+                Ok(())
+            }
+            fn before_cleanup(&self) -> Result<()> {
+                Err(SkillManagerError::InvalidInput(
+                    "held cleanup handle".into(),
+                ))
+            }
+        }
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let source_root = home.path().join("source");
+        let destination = source_root.join("demo");
+        let deployment = home.path().join("target").join("demo");
+        for path in [&destination, &deployment] {
+            std::fs::create_dir_all(path).unwrap_or_else(|error| unreachable!("{error}"));
+        }
+        std::fs::write(destination.join("SKILL.md"), "old")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        std::fs::write(deployment.join("SKILL.md"), "new")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let entry = source_from_reference(&source_root.to_string_lossy(), None, home.path())
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let candidate = SkillCandidate {
+            name: "demo".into(),
+            path: destination.clone(),
+            source: ResolvedSource {
+                entry,
+                path: source_root,
+                from_cache: false,
+                temporary: None,
+                cleanup_pending: None,
+            },
+        };
+        let resolved = super::ImportCandidate {
+            target: crate::domain::Target {
+                name: "test".into(),
+                label: "Test".into(),
+                path: home.path().join("target"),
+                enabled: true,
+                builtin: false,
+                legacy_override: false,
+            },
+            scope: Scope::Global,
+            deployment,
+            stat: crate::plan::DiffStat::default(),
+        };
+        let repository = FileConfigRepository::new(home.path());
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let mut app = Application::new(
+            &repository,
+            &NoNetwork,
+            &mut prompt,
+            &mut reporter,
+            &CleanupBlocked,
+            false,
+            home.path().to_path_buf(),
+        );
+        assert!(
+            app.apply_import(
+                &candidate,
+                &resolved,
+                &destination,
+                "source",
+                false,
+                &[],
+                crate::review::RenderStyle::plain()
+            )
+            .unwrap_or_else(|error| unreachable!("{error}"))
+        );
+        assert!(
+            reporter
+                .events
+                .iter()
+                .any(|event| event == "skill.imported")
+        );
+        assert!(
+            !reporter
+                .events
+                .iter()
+                .any(|event| event == "command.failed")
+        );
+        assert_eq!(reporter.events.last().map(String::as_str), Some("summary"));
+        assert!(
+            reporter
+                .diagnostics
+                .iter()
+                .any(|warning| warning.contains("change committed")
+                    && warning.contains("cleanup pending"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("SKILL.md"))
+                .ok()
+                .as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
     fn dry_run_detection_and_pattern_normalization_cover_command_families() {
         let sync = SyncArgs {
             dry_run: true,

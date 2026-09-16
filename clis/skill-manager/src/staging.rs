@@ -47,6 +47,14 @@ pub(crate) fn remove_tree(path: &Path) -> Result<()> {
     }
 }
 
+pub(crate) fn exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(SkillManagerError::io(path, error)),
+    }
+}
+
 /// A durable receipt is written before creating/populating a disposable directory.
 /// The caller holds the corresponding config, migration, source, or target lock.
 pub(crate) fn with_directory<T>(
@@ -79,7 +87,7 @@ pub(crate) fn with_directory<T>(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(SkillManagerError::io(&receipt, error)),
     }
-    if fs::symlink_metadata(&directory).is_ok() {
+    if exists(&directory)? {
         return Err(SkillManagerError::InvalidInput(format!(
             "unowned staging directory {}; inspect and move it aside before retrying; no cleanup receipt exists",
             directory.display()

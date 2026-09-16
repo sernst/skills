@@ -132,7 +132,7 @@ fn replace_directory<H: TransactionHook>(
     reject_link(destination)?;
     recover_journal(&paths.journal)?;
 
-    if fs::symlink_metadata(&paths.backup).is_ok() {
+    if crate::staging::exists(&paths.backup)? {
         return Err(SkillManagerError::InvalidInput(format!(
             "unowned transaction backup {}; inspect and move it aside before retrying; no recovery journal exists",
             paths.backup.display()
@@ -145,7 +145,7 @@ fn replace_directory<H: TransactionHook>(
     let staging = staging_parent.join(format!("{name}-pending"));
     reject_link(&staging_parent)?;
     reject_link(&staging)?;
-    if fs::symlink_metadata(&staging).is_ok() {
+    if crate::staging::exists(&staging)? {
         return Err(SkillManagerError::InvalidInput(format!(
             "unowned staging directory {}; inspect and move it aside before retrying; no transaction journal owns it",
             staging.display()
@@ -255,6 +255,12 @@ pub fn remove_skill<H: TransactionHook>(
     recover_journal(&paths.journal)?;
     let destination = target_root.join(name);
     reject_link(&destination)?;
+    if crate::staging::exists(&paths.backup)? {
+        return Err(SkillManagerError::InvalidInput(format!(
+            "unowned transaction backup {}; inspect and move it aside before retrying; no recovery journal exists",
+            paths.backup.display()
+        )));
+    }
     if !destination.exists() {
         return Ok(TransactionOutcome {
             value: false,
@@ -381,6 +387,7 @@ pub fn recover_journal(path: &Path) -> Result<()> {
     }
     for managed in [
         Some(path),
+        Some(journal.destination.as_path()),
         Some(journal.backup.as_path()),
         journal.stage.as_deref(),
         journal.stage.as_deref().and_then(Path::parent),

@@ -409,7 +409,7 @@ fn materialize_github<R: ConfigRepository, G: GitHubTransport, C: Clock>(
         .cache_root()
         .join(format!(".{}.stage-pending", source.id));
     crate::staging::reject_link(repository.cache_root())?;
-    if fs::symlink_metadata(&staging).is_ok() {
+    if crate::staging::exists(&staging)? {
         return Err(SkillManagerError::InvalidInput(format!(
             "unowned cache staging directory {}; inspect and move it aside before retrying",
             staging.display()
@@ -663,6 +663,7 @@ fn recover_cache_swap(destination: &Path, backup: &Path, journal: &Path) -> Resu
     }
     validate_cache_staging(&record.staging_root, destination)?;
     for managed in [
+        Some(destination),
         destination.parent(),
         Some(journal),
         Some(backup),
