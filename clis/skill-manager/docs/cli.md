@@ -6,6 +6,9 @@ Running without a command is `status`; `ls` and `list` are aliases. `--json`
 emits NDJSON and implies `--no-input`. `--verbose` adds advanced human details
 and full import paths without changing JSON. `--color auto` colors only a TTY
 and honors `NO_COLOR`; `always` colors even redirected output; `never` is plain.
+Interactive terminals use radio and checklist controls where a command exposes
+a genuine selection editor. `--plain-prompts` keeps the accessible numbered
+line interface; redirected streams and `TERM=dumb` use it automatically.
 `--home DIR` overrides the manager home for the whole invocation, ahead of
 `SKILL_MANAGER_HOME` and the operating system home; a relative value (and a
 relative `SKILL_MANAGER_HOME`) is normalized to an absolute, lexically clean

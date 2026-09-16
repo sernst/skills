@@ -22,7 +22,8 @@ fn help_lists_all_top_level_commands() {
         .stdout(predicate::str::contains("status"))
         .stdout(predicate::str::contains("resolve"))
         .stdout(predicate::str::contains("source"))
-        .stdout(predicate::str::contains("target"));
+        .stdout(predicate::str::contains("target"))
+        .stdout(predicate::str::contains("--plain-prompts"));
 }
 
 /// Version is the release version and remains available without configuration.

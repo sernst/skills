@@ -30,6 +30,8 @@ mode; `configs.restore` optionally accepts the strict `backup` field.
 they require `source`/`path` and `name`, never infer positional roles, and do
 not accept `yes`. The direct argv commands retain `--yes` only as a way to
 declare that prompting is unavailable; it cannot resolve ambiguous roles.
+Terminal radio and checklist editors are human-input surfaces only; no JSON,
+recipe, or `--no-input` path may start one.
 
 ## Event stream
 

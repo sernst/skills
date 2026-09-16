@@ -7,6 +7,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 /// Manage reusable agent skills across AI development tools.
 #[derive(Clone, Debug, Parser)]
 #[command(name = "skill-manager", version, about)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent global CLI switches are clearer as direct booleans"
+)]
 pub struct Cli {
     /// Emit NDJSON; `--json=OBJECT` also supplies a recipe object.
     #[arg(
@@ -26,6 +30,9 @@ pub struct Cli {
     /// Disable interactive prompts.
     #[arg(long, global = true)]
     pub no_input: bool,
+    /// Use accessible line prompts instead of terminal widgets.
+    #[arg(long, global = true)]
+    pub plain_prompts: bool,
     /// Color policy for human output.
     #[arg(long, global = true, value_enum, default_value_t = ColorChoice::Auto)]
     pub color: ColorChoice,

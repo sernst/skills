@@ -4,6 +4,9 @@ All notable changes to the downloadable CLIs are documented here.
 
 ## 0.1.5 - 2026-09-16
 
+- Adds reusable terminal radio and checklist prompts with accessible line
+  fallbacks, safe cancellation, deterministic keyboard behavior, and strict
+  isolation from noninteractive modes.
 - Retries transient filesystem errors across deployment, import, removal,
   configuration, migration, source caching, discovery, and file output. Every
   primitive starts immediately and waits at most 775ms in bounded backoff;
