@@ -129,6 +129,7 @@ pub struct RelocationPlan {
     after: Vec<u8>,
     next_config: Config,
     single: bool,
+    protected_paths: Vec<PathBuf>,
 }
 
 /// Construct an exact copy selection without changing files or config.
@@ -185,7 +186,7 @@ pub fn plan(
         }
     }
     let mut selected = BTreeSet::new();
-    let mut copies = Vec::new();
+    let mut mappings = Vec::new();
     for name in names {
         let key = fold(name);
         let (actual, source_path) = candidates
@@ -199,10 +200,18 @@ pub fn plan(
         } else {
             destination.join(actual)
         };
+        mappings.push((source_path.clone(), target));
+    }
+    let protected_paths = manager_protected_paths(config_path)?;
+    for (_, target) in &mappings {
+        reject_manager_overlap(target, &protected_paths)?;
+    }
+    let mut copies = Vec::new();
+    for (source_path, target) in mappings {
         reject_fold_collision(&target)?;
         copies.push(RelocationCopy {
             source: source_path.clone(),
-            source_image: tree_image(source_path)?,
+            source_image: tree_image(&source_path)?,
             before: optional_tree(&target)?,
             destination: target,
         });
@@ -225,6 +234,7 @@ pub fn plan(
         after,
         next_config,
         single,
+        protected_paths,
     })
 }
 
@@ -704,6 +714,7 @@ fn recheck(plan: &RelocationPlan) -> Result<()> {
     }
     for copy in &plan.copies {
         safe_path(&copy.source)?;
+        reject_manager_overlap(&copy.destination, &plan.protected_paths)?;
         reject_fold_collision(&copy.destination)?;
         if tree_image(&copy.source)? != copy.source_image
             || optional_tree(&copy.destination)? != copy.before
@@ -714,6 +725,45 @@ fn recheck(plan: &RelocationPlan) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn manager_protected_paths(config_path: &Path) -> Result<Vec<PathBuf>> {
+    let storage_root = parent(config_path)?;
+    [
+        config_path.to_path_buf(),
+        storage_root.join("cache"),
+        storage_root.join("backups"),
+        storage_root.join("locks"),
+    ]
+    .into_iter()
+    .map(|path| projected_entry(&path))
+    .collect()
+}
+
+fn reject_manager_overlap(destination: &Path, protected_paths: &[PathBuf]) -> Result<()> {
+    let destination = projected_entry(destination)?;
+    if protected_paths
+        .iter()
+        .any(|protected| destination.starts_with(protected) || protected.starts_with(&destination))
+    {
+        return Err(invalid(format!(
+            "relocation destination overlaps active skill-manager state: {}",
+            destination.display()
+        )));
+    }
+    Ok(())
+}
+
+fn projected_entry(path: &Path) -> Result<PathBuf> {
+    safe_path(path)?;
+    if exists(path)? {
+        return fs::canonicalize(path).map_err(|error| SkillManagerError::io(path, error));
+    }
+    let canonical = projected_entry(parent(path)?)?;
+    Ok(canonical.join(
+        path.file_name()
+            .ok_or_else(|| invalid("path has no name"))?,
+    ))
 }
 
 fn journal_paths(destination: &Path) -> Result<(PathBuf, PathBuf)> {

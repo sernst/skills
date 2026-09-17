@@ -1709,7 +1709,9 @@ where
             } else {
                 self.render_relocation_candidates(&previous, destination, &candidates)?;
                 if args.dry_run {
-                    return self.reporter.human("Selection unresolved. Use --copy for missing skills, --all or --skill/--filter for explicit copies, or --no-copy for a location change only.");
+                    self.reporter.human("Selection unresolved. Use --copy for missing skills, --all or --skill/--filter for explicit copies, or --no-copy for a location change only.")?;
+                    self.reporter.human("")?;
+                    return self.reporter.human("Dry run — no changes were made.");
                 }
                 if args.yes || self.no_input || self.reporter.is_json() {
                     return Err(SkillManagerError::InteractionRequired("source locate requires an explicit copy policy: --copy, --all, --missing, --skill, --filter, or --no-copy; --yes only authorizes a resolved plan".into()));
@@ -1763,6 +1765,8 @@ where
         set_source_location(&mut proposed, &replacement);
         self.render_relocation_plan(&previous, &proposed, batch.as_ref(), args)?;
         if args.dry_run {
+            self.reporter.human("")?;
+            self.reporter.human("Dry run — no changes were made.")?;
             return Ok(());
         }
         if !args.yes {
@@ -1856,28 +1860,33 @@ where
         for line in render_plan(&view, self.render_style()) {
             self.reporter.human(&line)?;
         }
-        self.reporter.event(
-            "plan",
-            Level::Info,
-            plan_event_data(
-                &view,
-                0,
-                args.dry_run,
-                PlanAuthorization {
-                    kind: "binary",
-                    mode: if args.dry_run {
-                        "dry-run"
-                    } else if args.yes {
-                        "yes"
-                    } else {
-                        "prompt"
-                    },
-                    default: plan.prompting.then_some(false),
+        let mut data = plan_event_data(
+            &view,
+            0,
+            args.dry_run,
+            PlanAuthorization {
+                kind: "binary",
+                mode: if args.dry_run {
+                    "dry-run"
+                } else if args.yes {
+                    "yes"
+                } else {
+                    "prompt"
                 },
-                &PlanSelection::default(),
-            ),
-        )?;
+                default: plan.prompting.then_some(false),
+            },
+            &PlanSelection::default(),
+        );
+        data["source"] = json!({ "id": source.id, "name": source.name });
+        data["recovery"] = json!({
+            "journal": journal,
+            "effect": effect,
+            "next": "prepare-and-review-fresh-relocation-plan",
+        });
+        self.reporter.event("plan", Level::Info, data)?;
         if args.dry_run {
+            self.reporter.human("")?;
+            self.reporter.human("Dry run — no changes were made.")?;
             return Ok(false);
         }
         if args.yes {
@@ -1988,29 +1997,44 @@ where
         for line in render_plan(&view, style) {
             self.reporter.human(&line)?;
         }
-        self.reporter.event(
-            "plan",
-            Level::Info,
-            plan_event_data(
-                &view,
-                0,
-                args.dry_run,
-                PlanAuthorization {
-                    kind: "binary",
-                    mode: if args.dry_run {
-                        "dry-run"
-                    } else if args.yes {
-                        "yes"
-                    } else if self.no_input || self.reporter.is_json() {
-                        "noninteractive"
-                    } else {
-                        "prompt"
-                    },
-                    default: plan.prompting.then_some(false),
+        let mut data = plan_event_data(
+            &view,
+            0,
+            args.dry_run,
+            PlanAuthorization {
+                kind: "binary",
+                mode: if args.dry_run {
+                    "dry-run"
+                } else if args.yes {
+                    "yes"
+                } else if self.no_input || self.reporter.is_json() {
+                    "noninteractive"
+                } else {
+                    "prompt"
                 },
-                &PlanSelection::default(),
-            ),
-        )
+                default: plan.prompting.then_some(false),
+            },
+            &PlanSelection::default(),
+        );
+        let from = source_reference(previous);
+        let to = source_reference(proposed);
+        let effect = plan
+            .metadata
+            .iter()
+            .find_map(|(label, value)| (label == "Effect").then_some(value))
+            .cloned()
+            .unwrap_or_default();
+        data["source"] = json!({ "id": previous.id, "name": previous.name });
+        data["from"] = json!(from);
+        data["to"] = json!(to);
+        data["configuration_effect"] = json!({
+            "operation": "set-source-location",
+            "from": from,
+            "to": to,
+        });
+        data["effect"] = json!(effect);
+        data["originals_retained"] = json!(true);
+        self.reporter.event("plan", Level::Info, data)
     }
 
     fn source_alternate(

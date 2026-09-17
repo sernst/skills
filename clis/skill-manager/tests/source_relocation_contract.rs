@@ -319,6 +319,77 @@ fn cancellation_and_resolved_dry_run_leave_config_and_destination_exact() {
                 .iter()
                 .any(|(name, _)| name == "source.location-set")
         );
+        if dry_run {
+            assert_eq!(
+                reporter.lines.iter().rev().take(2).collect::<Vec<_>>(),
+                ["Dry run — no changes were made.", ""]
+            );
+        }
+    }
+}
+
+#[test]
+fn resolved_relocation_json_and_human_previews_are_complete() {
+    for no_copy in [false, true] {
+        let fixture = Fixture::new();
+        let mut command = fixture.cli();
+        command
+            .args(["--json", "source", "locate", "physical"])
+            .arg(&fixture.destination)
+            .arg("--dry-run");
+        if no_copy {
+            command.arg("--no-copy");
+        } else {
+            command.arg("--all");
+        }
+        let output = command.output().expect("JSON preview");
+        assert!(output.status.success());
+        let events = String::from_utf8(output.stdout)
+            .expect("JSON")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("event"))
+            .collect::<Vec<_>>();
+        let plan = &events
+            .iter()
+            .find(|event| event["event"] == "plan")
+            .expect("plan")["data"];
+        assert_eq!(plan["source"], json!({"id":"physical", "name":"physical"}));
+        assert_eq!(plan["from"], fixture.source.display().to_string());
+        assert_eq!(plan["to"], fixture.destination.display().to_string());
+        assert_eq!(
+            plan["configuration_effect"]["operation"],
+            "set-source-location"
+        );
+        assert_eq!(plan["configuration_effect"]["from"], plan["from"]);
+        assert_eq!(plan["configuration_effect"]["to"], plan["to"]);
+        assert!(
+            plan["effect"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(plan["originals_retained"], true);
+        assert_eq!(
+            plan["entries"].as_array().expect("entries").is_empty(),
+            no_copy
+        );
+
+        let fixture = Fixture::new();
+        let mut command = fixture.cli();
+        command
+            .args(["source", "locate", "physical"])
+            .arg(&fixture.destination)
+            .arg("--dry-run");
+        if no_copy {
+            command.arg("--no-copy");
+        } else {
+            command.arg("--all");
+        }
+        command
+            .assert()
+            .success()
+            .stdout(predicates::str::ends_with(
+                "\nDry run — no changes were made.\n",
+            ));
     }
 }
 
@@ -506,6 +577,66 @@ fn unresolved_json_dry_run_contains_candidate_effects_and_changes_nothing() {
         fs::read(fixture.repository.config_path()).expect("config"),
         fixture.before
     );
+}
+
+#[test]
+fn unresolved_human_dry_run_ends_with_standard_conclusion() {
+    let fixture = Fixture::new();
+    fixture
+        .cli()
+        .args(["source", "locate", "physical"])
+        .arg(&fixture.destination)
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicates::str::ends_with(
+            "\nDry run — no changes were made.\n",
+        ));
+}
+
+#[test]
+fn single_skill_copy_rejects_manager_state_before_destination_traversal() {
+    let home = tempfile::tempdir().expect("scratch home");
+    let repository = FileConfigRepository::new(home.path());
+    let source = home.path().join("single");
+    fs::create_dir(&source).expect("single source");
+    fs::write(
+        source.join("SKILL.md"),
+        "---\nname: single\ndescription: test\n---\n",
+    )
+    .expect("skill");
+    let config: Config = serde_json::from_value(json!({
+        "schema_version": 2,
+        "sources": [{"id":"single", "name":"single", "mode":"single", "path":source}]
+    }))
+    .expect("config");
+    repository
+        .save(repository.config_path(), &config)
+        .expect("save config");
+    let config_before = fs::read(repository.config_path()).expect("config image");
+    let source_before = image(&source);
+    let marker = repository.storage_root().join("ordinary.txt");
+    fs::write(&marker, "manager state").expect("marker");
+
+    let mut command = Process::cargo_bin("skill-manager").expect("binary");
+    command
+        .arg("--home")
+        .arg(home.path())
+        .current_dir(home.path())
+        .args(["source", "locate", "single"])
+        .arg(repository.storage_root())
+        .args(["--all", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "relocation destination overlaps active skill-manager state",
+        ));
+    assert_eq!(
+        fs::read(repository.config_path()).expect("config"),
+        config_before
+    );
+    assert_eq!(image(&source), source_before);
+    assert_eq!(fs::read_to_string(marker).expect("marker"), "manager state");
 }
 
 #[test]
@@ -715,6 +846,26 @@ fn pending_rollback_is_previewed_without_writes_then_recovers_after_authorizatio
             .lines
             .iter()
             .any(|line| line.contains("Pending relocation recovery plan"))
+    );
+    assert_eq!(
+        preview.lines.iter().rev().take(2).collect::<Vec<_>>(),
+        ["Dry run — no changes were made.", ""]
+    );
+    let recovery = &preview
+        .events
+        .iter()
+        .find(|(name, _)| name == "plan")
+        .expect("recovery plan")
+        .1;
+    assert_eq!(
+        recovery["source"],
+        json!({"id":"physical", "name":"physical"})
+    );
+    assert!(recovery["recovery"]["journal"].as_str().is_some());
+    assert!(recovery["recovery"]["effect"].as_str().is_some());
+    assert_eq!(
+        recovery["recovery"]["next"],
+        "prepare-and-review-fresh-relocation-plan"
     );
     assert_eq!(image(&fixture.destination), pending);
     drop(hook);

@@ -51,13 +51,17 @@ physical skill: `source_id`, `source_name`, `skill`, `from`, `to`, `effect`
 (`create` or `replace-if-different`), `default_selected`,
 `selection_resolved:false`, and `originals_retained:true`. These are candidate
 effects, not an authorized `plan`. Resolved relocation uses the shared `plan`
-schema with source/from/to/effect metadata and selected destination actions;
+schema plus top-level `source` (`id` and `name`), `from`, `to`, `effect`,
+`configuration_effect` (`operation: "set-source-location"` with `from` and
+`to`), and `originals_retained` fields alongside selected destination actions;
 unchanged selections have `operation: "skip"`. Configuration-only plans have no
 copy entries and explicitly state their location-only effect. A successful
 `source.location-set` can include nonzero `copied` and `unchanged` counts and
 `originals_retained:true`. No success event precedes durable batch commitment.
-Pending recovery has a distinct `:recovery` plan identity, is authorized before
-recovery writes, and is followed by a freshly prepared relocation plan.
+Pending recovery has a distinct `:recovery` plan identity, a top-level `source`,
+and a `recovery` object containing `journal`, `effect`, and `next`. It is
+authorized before recovery writes and followed by a freshly prepared relocation
+plan.
 
 Every semantic stdout line is a JSON object with this envelope:
 
