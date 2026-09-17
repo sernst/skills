@@ -1034,7 +1034,7 @@ mod tests {
 
     impl Fixture {
         fn new() -> Result<Self> {
-            let home = tempfile::tempdir().map_err(|error| invalid(error.to_string()))?;
+            let home = physical_tempdir()?;
             let repository = FileConfigRepository::new(home.path());
             let source = home.path().join("source");
             let destination = home.path().join("destination");
@@ -1111,6 +1111,14 @@ mod tests {
             assert!(!journal_paths(&projected(&self.destination)?)?.0.exists());
             Ok(())
         }
+    }
+
+    fn physical_tempdir() -> Result<tempfile::TempDir> {
+        // macOS exposes its physical temporary directory through the linked /var alias.
+        let root = crate::config::portable_path(
+            &fs::canonicalize(std::env::temp_dir()).map_err(|error| invalid(error.to_string()))?,
+        );
+        tempfile::tempdir_in(root).map_err(|error| invalid(error.to_string()))
     }
 
     struct FailConfig<'a>(&'a Fixture);

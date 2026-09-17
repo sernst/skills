@@ -20,6 +20,14 @@ use skill_manager::prompt::{Prompt, PromptChoice, PromptOutcome};
 use skill_manager::relocation::{NoopRelocationHook, RelocationHook};
 use skill_manager::transaction::NoopTransactionHook;
 
+fn physical_tempdir() -> tempfile::TempDir {
+    // macOS exposes its physical temporary directory through the linked /var alias.
+    let root = skill_manager::config::portable_path(
+        &fs::canonicalize(std::env::temp_dir()).expect("physical system temp root"),
+    );
+    tempfile::tempdir_in(root).expect("scratch home")
+}
+
 struct Fixture {
     home: tempfile::TempDir,
     repository: FileConfigRepository,
@@ -31,7 +39,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let home = tempfile::tempdir().expect("scratch home");
+        let home = physical_tempdir();
         let repository = FileConfigRepository::new(home.path());
         let source = home.path().join("source");
         let destination = home.path().join("destination");
@@ -354,8 +362,18 @@ fn resolved_relocation_json_and_human_previews_are_complete() {
             .find(|event| event["event"] == "plan")
             .expect("plan")["data"];
         assert_eq!(plan["source"], json!({"id":"physical", "name":"physical"}));
-        assert_eq!(plan["from"], fixture.source.display().to_string());
-        assert_eq!(plan["to"], fixture.destination.display().to_string());
+        assert_eq!(
+            plan["from"],
+            skill_manager::config::portable_path(&fixture.source)
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            plan["to"],
+            skill_manager::config::portable_path(&fixture.destination)
+                .display()
+                .to_string()
+        );
         assert_eq!(
             plan["configuration_effect"]["operation"],
             "set-source-location"
@@ -596,7 +614,7 @@ fn unresolved_human_dry_run_ends_with_standard_conclusion() {
 
 #[test]
 fn single_skill_copy_rejects_manager_state_before_destination_traversal() {
-    let home = tempfile::tempdir().expect("scratch home");
+    let home = physical_tempdir();
     let repository = FileConfigRepository::new(home.path());
     let source = home.path().join("single");
     fs::create_dir(&source).expect("single source");

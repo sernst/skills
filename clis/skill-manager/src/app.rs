@@ -1818,8 +1818,13 @@ where
             let copied = batch.copies.iter().filter(|copy| !copy.unchanged()).count();
             let unchanged = batch.copies.len() - copied;
             if copied > 0 {
+                let directories = if copied == 1 {
+                    "directory"
+                } else {
+                    "directories"
+                };
                 self.reporter.human(&format!(
-                    "Copied {copied} physical skill directories; retained source originals."
+                    "Copied {copied} physical skill {directories}; retained source originals."
                 ))?;
                 data["copied"] = json!(copied);
             }
@@ -6398,7 +6403,8 @@ fn relocation_change_plan(
             format!("Change source location only; all {unchanged} selected physical skills are already identical.")
         } else {
             let kept = if unchanged > 0 { format!(" {unchanged} selected skills are already identical.") } else { String::new() };
-            format!("Copy {copied} physical skill directories, retaining originals; change source location after the entire batch commits.{kept}")
+            let directories = if copied == 1 { "directory" } else { "directories" };
+            format!("Copy {copied} physical skill {directories}, retaining originals; change source location after the entire batch commits.{kept}")
         }
     });
     Ok(ChangePlan {
