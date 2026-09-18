@@ -5,6 +5,27 @@ Update it only for a semantic change or a new verified baseline. A no-op review
 reports its check date outside the repository; do not create timestamp-only
 churn here.
 
+## Policy isolation and prescriptive routing — 2026-09-18
+
+**Decision.** Codex now routes only to the self-contained `gpt-codex.md`; the
+existing non-Codex policy moved to `shared-harness-policy.md`. The non-Codex
+four-attempt judged loop is preserved. Codex fixes Luna < Terra < Sol, prohibits
+Astra workers, and permits two judged attempts per deliverable.
+
+**Evidence and validation actually run.** The local collaboration schema exposed
+explicit `model` and `reasoning_effort` with fresh/limited forks; it controls
+dispatch. The Codex subagents page was fetched this session. Terra/high
+independently accepted seven reasoning-only scenario dry-runs and verified
+normalized non-Codex preservation (header, relative link, GPT removal, and
+profile-count repair only), including the Claude profile and four-attempt loop.
+Local Markdown-link and `git diff --check` passed. The existing snapshot
+provenance was checked: semantic retrieval 2026-09-11, DeepSWE 1.1, and
+CursorBench 4.0. Generated data, `model-selection.md`, CLI files, and changelog
+files were not modified.
+
+**Gaps.** No live comparative ROI trial or external pricing verification was
+run; no measured cost claim is made.
+
 ## Baseline — 2026-09-16
 
 **Scope and decision.** Reviewed the GPT/Codex profile in

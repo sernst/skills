@@ -1,9 +1,11 @@
 # Maintaining GPT/Codex maestro guidance
 
-Use this playbook to keep the GPT/Codex profile in
-[`running-as-maestro`](../skills/running-as-maestro/SKILL.md) current without
-changing the Claude or other harness profiles. It is an agent-session entrypoint,
-not a PR, deployment, or automation runbook.
+Use this playbook to keep the self-contained Codex policy at
+[`gpt-codex.md`](../skills/running-as-maestro/references/gpt-codex.md) current
+without changing the shared non-Codex policy at
+[`shared-harness-policy.md`](../skills/running-as-maestro/references/shared-harness-policy.md).
+Keep the router small and Codex isolated from shared-policy overrides. It is an
+agent-session entrypoint, not a PR, deployment, or automation runbook.
 
 ## When to review
 
@@ -60,7 +62,7 @@ not select a model or rewrite a profile by themselves.
 
 ## Review workflow
 
-1. Compare the current GPT/Codex profile and the last review record with the
+1. Compare the current Codex policy and the last review record with the
    requested trigger and known baseline.
 2. Inspect the live tool schema or roster once; capture only controls actually
    exposed in this environment. Then make bounded checks of the sources above.
@@ -69,9 +71,11 @@ not select a model or rewrite a profile by themselves.
 4. For a substantive proposed change, ask an independent semantic reviewer to
    decide whether it is warranted, preserving the profile boundary and recording
    uncertainty. A no-change triage needs no second reviewer.
-5. If needed, make the smallest GPT/Codex-profile edit. Preserve byte-for-byte
-   Claude and other harness sections outside that profile unless separately
-   authorized.
+5. If needed, make the smallest Codex-policy edit. Luna < Terra < Sol and the
+   defaults are user-prescribed classes, not live model identifiers; preserve
+   them, the Astra worker prohibition, and explicit live-control routing unless
+   the user explicitly changes them. Preserve the shared non-Codex policy
+   byte-for-byte unless separately authorized.
 6. Validate the actual proposed guidance against realistic scenarios, including
    a tiny edit, risky small change, large design, correction, unavailable model
    or knob, and a Claude-profile regression check. Distinguish actual evidence
@@ -84,12 +88,12 @@ not select a model or rewrite a profile by themselves.
 ## Copy-paste agent prompt
 
 ```text
-Review and, only if warranted, update the GPT/Codex profile of
-skills/running-as-maestro/SKILL.md. This is a bounded maintenance session, not
-a deployment or automation task.
+Review and, only if warranted, update the self-contained Codex policy at
+skills/running-as-maestro/references/gpt-codex.md. This is a bounded maintenance
+session, not a deployment or automation task.
 
 First read docs/maestro-guidance-review.md if it exists and compare its last
-verified baseline with the current GPT/Codex profile, relevant references, and
+verified baseline with the current Codex policy, relevant references, and
 the reported trigger. Inspect the live harness tool schema/available controls
 once. It is the authority for what can be selected or passed today; official
 documentation is next. Do not hardcode remembered model names, tiers, defaults,
@@ -104,8 +108,11 @@ inconclusive; do not claim a green verification or invent a replacement.
 Check ChatGPT subscription pricing only if subscription billing is in scope;
 check OpenAI API pricing only if API billing is in scope.
 
-Keep the Claude and every other harness profile byte-for-byte unchanged outside
-the GPT/Codex profile. Preserve benchmark generated input and workflow: inspect
+Keep the shared non-Codex policy byte-for-byte unchanged. Keep the router small:
+Codex must remain isolated from shared-policy overrides. Preserve the
+user-prescribed Luna < Terra < Sol defaults and Astra's worker prohibition unless
+the user explicitly changes them.
+Preserve benchmark generated input and workflow: inspect
 the existing selection reference/snapshot when relevant, but do not refresh it
 for instruction maintenance and never manually edit generated benchmark data or
 output. A mechanical content difference is only an alert. Obtain an independent
