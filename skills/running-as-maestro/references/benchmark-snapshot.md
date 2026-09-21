@@ -4,9 +4,9 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-09-11T13:34:05Z`
+- Retrieved after semantic change: `2026-09-21T15:53:25Z`
 - Parser version: `6`
-- Normalized SHA-256: `644351be08660fe73bac1d3c61b9fd5a1d16a998bdb4835f7c0d76bd2a807b22`
+- Normalized SHA-256: `dfa6091dd234497c321f6af1d38994e6f15513f63870fcaa0a1f6e69e6507c72`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
@@ -92,7 +92,7 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 
 ## CursorBench
 
-Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-09-10` · normalized SHA-256 `08acbd0f50323e0f691979cb91d82f9a50326c5d5ac06d0fb55fe639efca9beb`
+Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-09-10` · normalized SHA-256 `3146695f27e842901f26cd813fcd88c2e985eb5a2eefc190c17b17bd427175d0`
 
 Metric: `score` · Ambiguous, multi-file tasks from real Cursor sessions. No uncertainty or sample count is published; small score differences may not be meaningful.
 
@@ -105,12 +105,15 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 | Fable 5.1 | High | 49.20% | $9.080 | — | ★ |
 | Fable 5.1 | Medium | 46.80% | $7.050 | — | ★ |
 | Opus 5 | Max | 46.60% | $11.950 | — |  |
+| Grok 4.7 | Extra High | 46.30% | $6.010 | — | ★ |
 | Opus 5 | Extra High | 46.10% | $11.430 | — |  |
 | Fable 5.1 | Low | 45.10% | $5.440 | — | ★ |
 | Opus 5 | High | 44.70% | $9.000 | — |  |
+| Grok 4.7 | High | 43.90% | $4.690 | — | ★ |
 | Opus 5 | Medium | 43.30% | $6.940 | — |  |
 | GPT-5.6 Sol | Max | 41.70% | $8.230 | — |  |
 | Muse Spark 1.3 | Max | 41.60% | $2.640 | — | ★ |
+| Grok 4.7 | Medium | 41.60% | $3.490 | — |  |
 | Grok 4.6 | Extra High | 41.40% | $6.100 | — |  |
 | GPT-5.6 Terra | Max | 41.30% | $5.140 | — |  |
 | Opus 5 | Low | 40.70% | $4.870 | — |  |
@@ -126,6 +129,7 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 | GPT-5.6 Terra | Extra High | 33.60% | $1.810 | — |  |
 | Muse Spark 1.3 | High | 33.40% | $1.660 | — |  |
 | Grok 4.6 | Low | 33.40% | $2.250 | — |  |
+| Grok 4.7 | Low | 33.10% | $1.580 | — |  |
 | GPT-5.6 Luna | Extra High | 33.00% | $0.440 | — | ★ |
 | Muse Spark 1.3 | Medium | 32.60% | $1.490 | — |  |
 | Sonnet 5 | Extra High | 32.00% | $4.550 | — |  |
