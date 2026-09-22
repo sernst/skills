@@ -4,14 +4,14 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-09-21T15:53:25Z`
+- Retrieved after semantic change: `2026-09-22T14:02:14Z`
 - Parser version: `6`
-- Normalized SHA-256: `dfa6091dd234497c321f6af1d38994e6f15513f63870fcaa0a1f6e69e6507c72`
+- Normalized SHA-256: `93c722f3ab0fdffce03c970de27ca80d7f22bb9b0f65f6f1abefcc86401b1c2e`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
 
-Source: [DeepSWE](https://deepswe.datacurve.ai/) · version `1.1` · source updated `2026-09-03T22:24:37Z` · tasks `113` · normalized SHA-256 `f2705f16933f703765010c9f0313a2bd0165444c070de3fb9fec204fe98e4a9d`
+Source: [DeepSWE](https://deepswe.datacurve.ai/) · version `1.1` · source updated `2026-09-22T06:27:15Z` · tasks `113` · normalized SHA-256 `805f99dc7170a64143cc6145e7b437e6e212caf9cd9b0a2e3d47f144728e6b34`
 
 Metric: `pass@1` · Autonomous software-engineering rollouts; score is attempt pass@1. Confidence intervals are run-to-run estimates; provider, verifier, and network errors are excluded.
 
@@ -19,14 +19,14 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 
 | model | effort | score | avg cost/task | uncertainty / sample | Pareto |
 | --- | --- | ---: | ---: | --- | :---: |
-| gpt-6-astra | xhigh | 74.12% | $6.524 | 95% CI 71.25–76.98%; n=452; runs=4 | ★ |
+| gpt-6-astra | xhigh | 74.12% | $4.429 | 95% CI 71.25–76.98%; n=452; runs=4 | ★ |
 | gemini-3-8-flash | high | 73.83% | $2.362 | 95% CI 72.41–75.24%; n=447; runs=4 | ★ |
 | claude-opus-5 | max | 73.65% | $11.838 | 95% CI 69.78–77.52%; n=444; runs=4 |  |
-| gpt-6-astra | high | 73.23% | $5.724 | 95% CI 69.81–76.65%; n=452; runs=4 |  |
-| gpt-6-astra | max | 73.23% | $12.369 | 95% CI 72.40–74.06%; n=452; runs=4 |  |
+| gpt-6-astra | high | 73.23% | $3.924 | 95% CI 69.81–76.65%; n=452; runs=4 |  |
+| gpt-6-astra | max | 73.23% | $7.498 | 95% CI 72.40–74.06%; n=452; runs=4 |  |
 | claude-opus-5 | xhigh | 73.15% | $9.072 | 95% CI 70.09–76.22%; n=447; runs=4 |  |
 | claude-opus-5 | high | 72.83% | $6.076 | 95% CI 70.88–74.77%; n=449; runs=4 |  |
-| gpt-6-astra | medium | 72.79% | $4.380 | 95% CI 70.20–75.38%; n=452; runs=4 |  |
+| gpt-6-astra | medium | 72.79% | $3.075 | 95% CI 70.20–75.38%; n=452; runs=4 |  |
 | gpt-5-6-sol | max | 72.67% | $8.386 | 95% CI 69.84–75.50%; n=450; runs=4 |  |
 | gemini-3-8-flash | medium | 71.02% | $1.967 | 95% CI 68.74–73.30%; n=452; runs=4 | ★ |
 | gpt-5-6-sol | xhigh | 70.73% | $4.704 | 95% CI 69.91–71.55%; n=451; runs=4 |  |
@@ -40,7 +40,7 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 | kimi-k3 | max | 68.51% | $4.655 | 95% CI 63.98–73.05%; n=451; runs=4 |  |
 | grok-4-6 | medium | 67.48% | $3.449 | 95% CI 65.20–69.76%; n=452; runs=4 |  |
 | gpt-5-6-luna | max | 67.19% | $3.028 | 95% CI 63.20–71.18%; n=448; runs=4 |  |
-| gpt-6-astra | low | 67.04% | $2.189 | 95% CI 65.73–68.34%; n=452; runs=4 |  |
+| gpt-6-astra | low | 67.04% | $1.595 | 95% CI 65.73–68.34%; n=452; runs=4 | ★ |
 | gpt-5-5 | xhigh | 67.04% | $7.226 | 95% CI 60.57–73.50%; n=452; runs=4 |  |
 | grok-4-6 | xhigh | 66.74% | $5.498 | 95% CI 64.56–68.92%; n=451; runs=4 |  |
 | gemini-3-7-flash | medium | 65.49% | $2.025 | 95% CI 62.40–68.57%; n=452; runs=4 |  |
