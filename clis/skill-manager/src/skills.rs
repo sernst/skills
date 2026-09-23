@@ -1,7 +1,7 @@
 //! Safe deterministic skill discovery, filtering, collision handling, and hashing.
 
+use crate::fs_retry as fs;
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
@@ -809,6 +809,7 @@ mod tests {
             path: alias.join("collection"),
             from_cache: false,
             temporary: None,
+            cleanup_pending: None,
         };
 
         let found = detect_skill_dirs(&resolved).unwrap_or_else(|error| unreachable!("{error}"));

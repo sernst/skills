@@ -1,7 +1,7 @@
 //! Application service and command orchestration.
 
+use crate::fs_retry as fs;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
@@ -715,7 +715,7 @@ where
             // it is deliberately NOT a per-handle TOCTOU guarantee.
             reject_linked_ancestors(&to, &row.item.destination)?;
             reject_links_in_tree(&row.item.destination)?;
-            std::fs::create_dir_all(&row.item.destination)
+            crate::fs_retry::create_dir_all(&row.item.destination)
                 .map_err(|error| SkillManagerError::io(&row.item.destination, error))?;
             merge_copy_tree(&row.item.source, &row.item.destination, row.item.excluded)?;
             let verb = if row.existed { "Merged" } else { "Copied" };
@@ -1955,13 +1955,7 @@ where
             } else {
                 for word in &promoted_sources {
                     let entry = configured_source_or_reference(config, word, None, &self.home)?;
-                    sources.push(materialize_source(
-                        self.repository,
-                        self.github,
-                        &entry,
-                        args.refresh,
-                        args.dry_run,
-                    )?);
+                    sources.push(self.materialize_source(&entry, args.refresh, args.dry_run)?);
                 }
             }
             discovery = discover_skills(&sources, &[], &config.exclude)?;
@@ -2289,12 +2283,15 @@ where
                 continue;
             }
             if !run.args.dry_run {
-                deploy_skill(
+                let outcome = deploy_skill(
                     &step.candidate.path,
                     &step.target.path,
                     self.repository.cache_root(),
                     self.hook,
                 )?;
+                if let Some(warning) = outcome.cleanup_pending {
+                    self.emit_message_diagnostic(&warning)?;
+                }
                 // A uniform scope is already stated once above the plan, so
                 // repeating it on every progress line would add no information.
                 let scope = if uniform_scope.is_some() {
@@ -2469,12 +2466,15 @@ where
                 continue;
             }
             if !run.args.dry_run {
-                deploy_skill(
+                let outcome = deploy_skill(
                     &step.candidate.path,
                     &step.target.path,
                     self.repository.cache_root(),
                     self.hook,
                 )?;
+                if let Some(warning) = outcome.cleanup_pending {
+                    self.emit_message_diagnostic(&warning)?;
+                }
                 // load's scope is decided once for the whole run, so the
                 // progress line never needs a per-step scope suffix.
                 let verb = if step.existed { "Overwrote" } else { "Loaded" };
@@ -2740,13 +2740,7 @@ where
     #[allow(clippy::too_many_lines)]
     fn run_copy(&mut self, config: &Config, args: &CopyArgs) -> Result<bool> {
         let entry = configured_source_or_reference(config, &args.source, None, &self.home)?;
-        let resolved = materialize_source(
-            self.repository,
-            self.github,
-            &entry,
-            args.refresh,
-            args.dry_run,
-        )?;
+        let resolved = self.materialize_source(&entry, args.refresh, args.dry_run)?;
         let discovery = discover_skills(&[resolved], &args.filters, &config.exclude)?;
         let destination = absolute_path(args.destination.clone())?;
 
@@ -2819,12 +2813,15 @@ where
         for candidate in &candidates {
             let output = target.path.join(&candidate.name);
             let existed = output.is_dir();
-            deploy_skill(
+            let outcome = deploy_skill(
                 &candidate.path,
                 &target.path,
                 self.repository.cache_root(),
                 self.hook,
             )?;
+            if let Some(warning) = outcome.cleanup_pending {
+                self.emit_message_diagnostic(&warning)?;
+            }
             let verb = if existed { "Overwrote" } else { "Copied" };
             self.reporter.human(&format!(
                 "{verb} {} -> {}",
@@ -3589,12 +3586,15 @@ where
         deployed: &[ImportDeployment],
         style: RenderStyle,
     ) -> Result<bool> {
-        import_skill(
+        let outcome = import_skill(
             &resolved.deployment,
             destination,
             self.repository.cache_root(),
             self.hook,
         )?;
+        if let Some(warning) = outcome.cleanup_pending {
+            self.emit_message_diagnostic(&warning)?;
+        }
         self.reporter.human(&format!(
             "Imported {} from {} · {} into {source_label} (source).",
             candidate.name,
@@ -3647,12 +3647,15 @@ where
                     )?;
                     continue;
                 }
-                deploy_skill(
+                let outcome = deploy_skill(
                     &resolved.deployment,
                     &entry.target.path,
                     self.repository.cache_root(),
                     self.hook,
                 )?;
+                if let Some(warning) = outcome.cleanup_pending {
+                    self.emit_message_diagnostic(&warning)?;
+                }
                 updated += 1;
                 self.reporter.human(&format!(
                     "Updated {} -> {} ({})",
@@ -3779,6 +3782,7 @@ where
                         entry,
                         from_cache: false,
                         temporary: None,
+                        cleanup_pending: None,
                     };
                     for skill in detect_skill_dirs(&resolved)? {
                         let name = skill_name(&skill)?;
@@ -4041,12 +4045,15 @@ where
         for item in items {
             let destination = item.root.join(&item.skill);
             if !dry_run {
-                remove_skill(
+                let outcome = remove_skill(
                     &item.skill,
                     &item.root,
                     self.repository.cache_root(),
                     self.hook,
                 )?;
+                if let Some(warning) = outcome.cleanup_pending {
+                    self.emit_message_diagnostic(&warning)?;
+                }
                 self.reporter.human(&format!(
                     "Removed {} from {} ({})",
                     item.skill,
@@ -4214,7 +4221,7 @@ where
         let mut resolved = Vec::new();
         let mut materialization_misses = Vec::new();
         for source in &config.sources {
-            match materialize_source(self.repository, self.github, source, false, false) {
+            match self.materialize_source(source, false, false) {
                 Ok(value) => resolved.push(value),
                 Err(error) => materialization_misses.push(format!(
                     "could not inspect source '{}': {error}",
@@ -4964,13 +4971,20 @@ where
         }
         let mut resolved = Vec::with_capacity(entries.len());
         for entry in entries {
-            resolved.push(materialize_source(
-                self.repository,
-                self.github,
-                &entry,
-                refresh,
-                dry_run,
-            )?);
+            resolved.push(self.materialize_source(&entry, refresh, dry_run)?);
+        }
+        Ok(resolved)
+    }
+
+    fn materialize_source(
+        &mut self,
+        source: &SourceEntry,
+        refresh: bool,
+        dry_run: bool,
+    ) -> Result<ResolvedSource> {
+        let resolved = materialize_source(self.repository, self.github, source, refresh, dry_run)?;
+        if let Some(warning) = &resolved.cleanup_pending {
+            self.emit_message_diagnostic(warning)?;
         }
         Ok(resolved)
     }
@@ -6325,7 +6339,7 @@ fn reject_links_in_tree(root: &Path) -> Result<()> {
 /// is valid. Junctions and mount points remain link-like and are still rejected
 /// anywhere they could redirect a write outside `<TO>` (finding C).
 fn reject_link(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
+    match crate::fs_retry::symlink_metadata(path) {
         Ok(metadata) if is_link_like(&metadata) => Err(SkillManagerError::InvalidInput(format!(
             "seed destination path must not be a link: {}",
             path.display()
@@ -6343,7 +6357,7 @@ fn reject_link(path: &Path) -> Result<()> {
 /// that blocks traversal even when that component would not survive into the
 /// normalized path handed to physical canonicalization.
 fn validate_seed_destination_component(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
+    match crate::fs_retry::symlink_metadata(path) {
         Ok(metadata) if is_link_like(&metadata) => Err(SkillManagerError::InvalidInput(format!(
             "seed destination path must not be a link: {}",
             path.display()
@@ -6400,7 +6414,7 @@ fn is_link_like(metadata: &std::fs::Metadata) -> bool {
 /// link-skip (documented in `docs/cli.md`, "A configured source ROOT that is a
 /// symlink or reparse point ... is never descended").
 fn is_descendable_dir(path: &Path) -> bool {
-    match std::fs::symlink_metadata(path) {
+    match crate::fs_retry::symlink_metadata(path) {
         Ok(metadata) => metadata.is_dir() && !is_link_like(&metadata),
         Err(_) => false,
     }
@@ -6420,7 +6434,7 @@ enum SourceRootKind {
 
 /// Classify a copy source root without ever following a link (findings G/K).
 fn classify_source_root(path: &Path) -> Result<SourceRootKind> {
-    match std::fs::symlink_metadata(path) {
+    match crate::fs_retry::symlink_metadata(path) {
         Ok(metadata) if is_link_like(&metadata) => Ok(SourceRootKind::Link),
         Ok(metadata) if metadata.is_dir() => Ok(SourceRootKind::Directory),
         Ok(_) => Ok(SourceRootKind::Absent),
@@ -6450,7 +6464,7 @@ fn reject_seed_conflicts(item: &SeedItem) -> Result<()> {
         for (index, part) in parts.iter().enumerate() {
             current = current.join(part);
             let is_last = index + 1 == parts.len();
-            match std::fs::symlink_metadata(&current) {
+            match crate::fs_retry::symlink_metadata(&current) {
                 Ok(metadata) if is_link_like(&metadata) => {
                     return Err(SkillManagerError::InvalidInput(format!(
                         "seed destination path must not be a link: {}",
@@ -6512,7 +6526,7 @@ fn seed_source_entries(root: &Path, excluded_top_level: &[&str]) -> Result<BTree
         });
     for item in walker {
         let item = item.map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
-        let metadata = std::fs::symlink_metadata(item.path())
+        let metadata = crate::fs_retry::symlink_metadata(item.path())
             .map_err(|error| SkillManagerError::io(item.path(), error))?;
         if is_link_like(&metadata) || !(metadata.is_file() || metadata.is_dir()) {
             continue;
@@ -6593,14 +6607,14 @@ fn read_seed_config(home: &Path) -> Result<Option<Config>> {
         return Ok(None);
     }
     let path = config_root.join("config.json");
-    match std::fs::symlink_metadata(&path) {
+    match crate::fs_retry::symlink_metadata(&path) {
         Ok(metadata) if is_link_like(&metadata) => return Ok(None),
         Ok(metadata) if !metadata.is_file() => return Ok(None),
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(SkillManagerError::io(&path, error)),
     }
-    let bytes = match std::fs::read(&path) {
+    let bytes = match crate::fs_retry::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(SkillManagerError::io(&path, error)),
@@ -6756,7 +6770,7 @@ fn merge_directory_files(
         });
     for item in walker {
         let item = item.map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
-        let metadata = std::fs::symlink_metadata(item.path())
+        let metadata = crate::fs_retry::symlink_metadata(item.path())
             .map_err(|error| SkillManagerError::io(item.path(), error))?;
         if is_link_like(&metadata) || !metadata.is_file() {
             continue;
@@ -6785,7 +6799,7 @@ fn merge_copy_tree(source: &Path, destination: &Path, excluded_top_level: &[&str
     // copy descend outside `<FROM>`. Preflight would have skipped a linked root,
     // so reaching one here means it was planted mid-flight — an error, matching
     // the apply-time destination-link recheck.
-    match std::fs::symlink_metadata(source) {
+    match crate::fs_retry::symlink_metadata(source) {
         Ok(metadata) if is_link_like(&metadata) => {
             return Err(SkillManagerError::InvalidInput(format!(
                 "seed source path must not be a link: {}",
@@ -6815,7 +6829,7 @@ fn merge_copy_tree(source: &Path, destination: &Path, excluded_top_level: &[&str
         });
     for item in walker {
         let item = item.map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
-        let metadata = std::fs::symlink_metadata(item.path())
+        let metadata = crate::fs_retry::symlink_metadata(item.path())
             .map_err(|error| SkillManagerError::io(item.path(), error))?;
         if is_link_like(&metadata) {
             continue;
@@ -6826,11 +6840,11 @@ fn merge_copy_tree(source: &Path, destination: &Path, excluded_top_level: &[&str
         let target = destination.join(relative);
         if metadata.is_dir() {
             reject_link(&target)?;
-            std::fs::create_dir_all(&target)
+            crate::fs_retry::create_dir_all(&target)
                 .map_err(|error| SkillManagerError::io(&target, error))?;
         } else if metadata.is_file() {
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)
+                crate::fs_retry::create_dir_all(parent)
                     .map_err(|error| SkillManagerError::io(parent, error))?;
             }
             // Traversal-safe write (defect 3): never follow a destination
@@ -6839,7 +6853,7 @@ fn merge_copy_tree(source: &Path, destination: &Path, excluded_top_level: &[&str
             // any that appeared since, matching how deployment writes to fresh
             // inodes rather than through a link.
             reject_link(&target)?;
-            std::fs::copy(item.path(), &target)
+            crate::fs_retry::copy(item.path(), &target)
                 .map_err(|error| SkillManagerError::io(&target, error))?;
         }
     }
@@ -8826,7 +8840,7 @@ fn canonicalize_verified_seed_destination(anchor: &Path, path: &Path) -> Result<
             }
             std::path::Component::Normal(name) => {
                 let candidate = existing.join(name);
-                match std::fs::symlink_metadata(&candidate) {
+                match crate::fs_retry::symlink_metadata(&candidate) {
                     Ok(metadata) if is_link_like(&metadata) => {
                         return Err(SkillManagerError::InvalidInput(format!(
                             "seed destination path must not be a link: {}",
@@ -8976,7 +8990,7 @@ fn resolve_seed_ambient_prefix(
     mut expression: PathBuf,
 ) -> Result<(PathBuf, PathBuf)> {
     loop {
-        match std::fs::symlink_metadata(&ambient) {
+        match crate::fs_retry::symlink_metadata(&ambient) {
             Ok(_) => {
                 let anchor = ambient
                     .canonicalize()
@@ -9331,6 +9345,141 @@ mod tests {
         }
     }
 
+    fn import_with_blocked_record_or_cleanup(
+        commit_blocked: bool,
+    ) -> (Result<bool>, RecordingReporter) {
+        struct Blocked(bool);
+        impl crate::transaction::TransactionHook for Blocked {
+            fn after_state(&self, _: crate::transaction::TransactionState) -> Result<()> {
+                Ok(())
+            }
+            fn before_commit(&self) -> Result<()> {
+                if self.0 {
+                    Err(SkillManagerError::InvalidInput(
+                        "commit record unavailable".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            fn before_cleanup(&self) -> Result<()> {
+                Err(SkillManagerError::InvalidInput(
+                    "held cleanup handle".into(),
+                ))
+            }
+        }
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let source_root = home.path().join("source");
+        let destination = source_root.join("demo");
+        let deployment = home.path().join("target").join("demo");
+        for path in [&destination, &deployment] {
+            std::fs::create_dir_all(path).unwrap_or_else(|error| unreachable!("{error}"));
+        }
+        std::fs::write(destination.join("SKILL.md"), "old")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        std::fs::write(deployment.join("SKILL.md"), "new")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let entry = source_from_reference(&source_root.to_string_lossy(), None, home.path())
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let candidate = SkillCandidate {
+            name: "demo".into(),
+            path: destination.clone(),
+            source: ResolvedSource {
+                entry,
+                path: source_root,
+                from_cache: false,
+                temporary: None,
+                cleanup_pending: None,
+            },
+        };
+        let resolved = super::ImportCandidate {
+            target: crate::domain::Target {
+                name: "test".into(),
+                label: "Test".into(),
+                path: home.path().join("target"),
+                enabled: true,
+                builtin: false,
+                legacy_override: false,
+            },
+            scope: Scope::Global,
+            deployment,
+            stat: crate::plan::DiffStat::default(),
+        };
+        let repository = FileConfigRepository::new(home.path());
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let hook = Blocked(commit_blocked);
+        let mut app = Application::new(
+            &repository,
+            &NoNetwork,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            false,
+            home.path().to_path_buf(),
+        );
+        let result = app.apply_import(
+            &candidate,
+            &resolved,
+            &destination,
+            "source",
+            false,
+            &[],
+            crate::review::RenderStyle::plain(),
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("SKILL.md"))
+                .ok()
+                .as_deref(),
+            Some("new")
+        );
+        (result, reporter)
+    }
+
+    #[test]
+    fn import_commit_record_failure_emits_no_committed_action_or_success_summary() {
+        let (result, reporter) = import_with_blocked_record_or_cleanup(true);
+        assert!(result.is_err());
+        assert!(
+            !reporter
+                .events
+                .iter()
+                .any(|event| event == "skill.imported" || event == "summary")
+        );
+        assert!(
+            !reporter
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("change committed"))
+        );
+    }
+
+    #[test]
+    fn import_cleanup_failure_reports_committed_action_warning_and_success_summary() {
+        let (result, reporter) = import_with_blocked_record_or_cleanup(false);
+        assert!(result.unwrap_or_else(|error| unreachable!("{error}")));
+        assert!(
+            reporter
+                .events
+                .iter()
+                .any(|event| event == "skill.imported")
+        );
+        assert!(
+            !reporter
+                .events
+                .iter()
+                .any(|event| event == "command.failed")
+        );
+        assert_eq!(reporter.events.last().map(String::as_str), Some("summary"));
+        assert!(
+            reporter
+                .diagnostics
+                .iter()
+                .any(|warning| warning.contains("change committed")
+                    && warning.contains("cleanup pending"))
+        );
+    }
+
     #[test]
     fn dry_run_detection_and_pattern_normalization_cover_command_families() {
         let sync = SyncArgs {
@@ -9437,6 +9586,7 @@ mod tests {
                 path: root.path().to_path_buf(),
                 from_cache: false,
                 temporary: None,
+                cleanup_pending: None,
             },
         };
         assert!(source_matches(&entry, "PRIMARY-SOURCE", root.path()));
@@ -9472,6 +9622,7 @@ mod tests {
                 path: root.path().to_path_buf(),
                 from_cache: true,
                 temporary: None,
+                cleanup_pending: None,
             },
         };
         let target = resolved_targets(&Config::default(), root.path())
@@ -10022,6 +10173,7 @@ mod tests {
                     path: home.path().join("plain-dir"),
                     from_cache: false,
                     temporary: None,
+                    cleanup_pending: None,
                 },
             },
         );
@@ -10081,6 +10233,7 @@ mod tests {
                     path: home.path().join("plain-dir"),
                     from_cache: false,
                     temporary: None,
+                    cleanup_pending: None,
                 },
             },
         );
