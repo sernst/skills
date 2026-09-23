@@ -4,9 +4,9 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-09-22T14:02:14Z`
+- Retrieved after semantic change: `2026-09-23T14:13:52Z`
 - Parser version: `6`
-- Normalized SHA-256: `93c722f3ab0fdffce03c970de27ca80d7f22bb9b0f65f6f1abefcc86401b1c2e`
+- Normalized SHA-256: `328439d955dd4a9fe7e588134c621730f8172b8fbca76993a931b053c961a3b2`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
@@ -92,7 +92,7 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 
 ## CursorBench
 
-Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-09-10` · normalized SHA-256 `3146695f27e842901f26cd813fcd88c2e985eb5a2eefc190c17b17bd427175d0`
+Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-09-10` · normalized SHA-256 `c8ce59ee3d7ace0e6043d2e41e75f50ee6f6053f474e4ff4f5d55f2cd181e39b`
 
 Metric: `score` · Ambiguous, multi-file tasks from real Cursor sessions. No uncertainty or sample count is published; small score differences may not be meaningful.
 
@@ -100,19 +100,24 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 
 | model | effort | score | avg cost/task | uncertainty / sample | Pareto |
 | --- | --- | ---: | ---: | --- | :---: |
-| Fable 5.1 | Max | 51.80% | $17.280 | — | ★ |
-| Fable 5.1 | Extra High | 51.60% | $13.010 | — | ★ |
-| Fable 5.1 | High | 49.20% | $9.080 | — | ★ |
-| Fable 5.1 | Medium | 46.80% | $7.050 | — | ★ |
+| Opus 5.5 | Max | 57.80% | $13.430 | — | ★ |
+| Opus 5.5 | High | 56.00% | $3.970 | — | ★ |
+| Opus 5.5 | Extra High | 56.00% | $6.980 | — |  |
+| Opus 5.5 | Medium | 52.50% | $2.910 | — | ★ |
+| Fable 5.1 | Max | 51.80% | $17.280 | — |  |
+| Fable 5.1 | Extra High | 51.60% | $13.010 | — |  |
+| Fable 5.1 | High | 49.20% | $9.080 | — |  |
+| Fable 5.1 | Medium | 46.80% | $7.050 | — |  |
 | Opus 5 | Max | 46.60% | $11.950 | — |  |
-| Grok 4.7 | Extra High | 46.30% | $6.010 | — | ★ |
+| Grok 4.7 | Extra High | 46.30% | $6.010 | — |  |
 | Opus 5 | Extra High | 46.10% | $11.430 | — |  |
-| Fable 5.1 | Low | 45.10% | $5.440 | — | ★ |
+| Fable 5.1 | Low | 45.10% | $5.440 | — |  |
 | Opus 5 | High | 44.70% | $9.000 | — |  |
-| Grok 4.7 | High | 43.90% | $4.690 | — | ★ |
+| Grok 4.7 | High | 43.90% | $4.690 | — |  |
+| Opus 5.5 | Low | 43.70% | $1.170 | — | ★ |
 | Opus 5 | Medium | 43.30% | $6.940 | — |  |
 | GPT-5.6 Sol | Max | 41.70% | $8.230 | — |  |
-| Muse Spark 1.3 | Max | 41.60% | $2.640 | — | ★ |
+| Muse Spark 1.3 | Max | 41.60% | $2.640 | — |  |
 | Grok 4.7 | Medium | 41.60% | $3.490 | — |  |
 | Grok 4.6 | Extra High | 41.40% | $6.100 | — |  |
 | GPT-5.6 Terra | Max | 41.30% | $5.140 | — |  |
@@ -120,7 +125,7 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 | Grok 4.6 | High | 40.40% | $5.200 | — |  |
 | Gemini 3.8 Flash | High | 39.60% | $4.700 | — |  |
 | GPT-5.6 Sol | Extra High | 37.70% | $4.400 | — |  |
-| Muse Spark 1.3 | Extra High | 37.50% | $2.100 | — | ★ |
+| Muse Spark 1.3 | Extra High | 37.50% | $2.100 | — |  |
 | Gemini 3.8 Flash | Medium | 37.30% | $4.060 | — |  |
 | Grok 4.6 | Medium | 36.10% | $3.480 | — |  |
 | GPT-5.6 Luna | Max | 35.90% | $1.030 | — | ★ |
