@@ -36,6 +36,31 @@ other multi-token input are forbidden — a prompt is either a yes/no question
 or a numbered single-choice list, never both at once and never two questions
 merged into one line.
 
+Interactive terminals MAY present a numbered single-choice list as a radio
+widget. Moving the cursor and submitting one row is the terminal equivalent of
+entering that row's single token; the selected row immediately applies, with no
+trailing confirmation. A radio widget MUST initially rest on an explicit
+`Cancel` row so Enter alone can never authorize a destructive choice. Escape
+and Ctrl-C cancel cleanly. `--plain-prompts`, redirected input or diagnostics,
+and `TERM=dumb` retain the numbered one-token line prompt.
+
+### Input editor exception
+
+A checklist MAY resolve which inputs should enter a plan when a command cannot
+construct the exact plan until that set is known. This is an editor, not an
+authorization prompt. Before opening it, the command MUST render every
+candidate and the effect of including it. The checklist itself contains only
+selection controls and candidate labels; it MUST NOT hide consequence details
+inside a transient widget. Submitting zero selections is valid.
+
+After the editor closes, the command MUST compute and render the exact semantic
+plan for the submitted set and use the ordinary authorization model before any
+mutation. Terminal checklists use arrows, Space, and Enter. Plain and piped
+checklists show `[ ]`/`[x]` state and accept exactly one token per line: one
+index toggles a row, `d` submits, and `c` cancels. JSON, recipes, and
+`--no-input` MUST never enter either editor and instead require command-specific
+include/exclude inputs.
+
 Before every prompt after the first, the command MUST re-render the plan,
 narrowed by every answer already given. The final prompt's answer authorizes
 and immediately applies the fully resolved plan; it is a selection, not a
@@ -68,7 +93,9 @@ Imported importing-meeting-notes from shared · global into personal (source).
 — source copy, then propagation mode — because a multi-copy import cannot
 safely infer either. Every other command in this design resolves in at most
 one prompt: a new command should default to one and treat two as the
-exception it is for `import`, not the norm.
+exception it is for `import`, not the norm. An input editor does not count as
+an authorization prompt: it supplies the inputs needed to construct the exact
+plan that the later prompt authorizes.
 
 ## Inference versus selection (invariant, with a guard rule)
 

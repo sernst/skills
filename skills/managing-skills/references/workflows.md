@@ -165,7 +165,7 @@ For metadata/location changes, preflight and then use the narrowest command:
 
 ```json
 {"command":"source.update","source":"team","label":"Platform skills"}
-{"command":"source.locate","source":"team","location":"../skills"}
+{"command":"source.locate","source":"team","location":"../skills","no_copy":true,"yes":true}
 {"command":"source.alternate","source":"team","location":"owner/repo/skills"}
 {"command":"source.swap","source":"team"}
 ```

@@ -22,7 +22,8 @@ fn help_lists_all_top_level_commands() {
         .stdout(predicate::str::contains("status"))
         .stdout(predicate::str::contains("resolve"))
         .stdout(predicate::str::contains("source"))
-        .stdout(predicate::str::contains("target"));
+        .stdout(predicate::str::contains("target"))
+        .stdout(predicate::str::contains("--plain-prompts"));
 }
 
 /// Version is the release version and remains available without configuration.
@@ -33,7 +34,7 @@ fn version_is_available_without_configuration() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.1.4"));
+        .stdout(predicate::str::contains("0.1.5"));
 }
 
 /// Parser misuse follows Clap's conventional usage exit code and stderr stream.
@@ -173,4 +174,64 @@ fn source_add_name_forms_are_positional_or_flag_but_not_both() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn source_branch_help_and_local_source_errors_are_actionable_with_an_explicit_home() {
+    let home = tempfile::tempdir().expect("isolated home");
+    let home_text = home.path().to_str().expect("UTF-8 home");
+    let source = home.path().join("source");
+    std::fs::create_dir(&source).expect("create local source");
+    let source_text = source.to_str().expect("UTF-8 source");
+
+    let mut help = Command::cargo_bin("skill-manager").expect("test binary");
+    help.args(["--home", home_text, "source", "branch", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SOURCE"))
+        .stdout(predicate::str::contains("BRANCH"))
+        .stdout(predicate::str::contains("--default"))
+        .stdout(predicate::str::contains("--alternate"))
+        .stdout(predicate::str::contains("--dry-run"))
+        .stdout(predicate::str::contains("--yes"));
+
+    let mut add = Command::cargo_bin("skill-manager").expect("test binary");
+    add.current_dir(home.path())
+        .args([
+            "--home",
+            home_text,
+            "--json",
+            "source",
+            "add",
+            source_text,
+            "--name",
+            "local",
+        ])
+        .assert()
+        .success();
+
+    let mut local_branch = Command::cargo_bin("skill-manager").expect("test binary");
+    local_branch
+        .current_dir(home.path())
+        .args([
+            "--home", home_text, "source", "branch", "local", "main", "--yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no GitHub location"));
+
+    let mut missing_default = Command::cargo_bin("skill-manager").expect("test binary");
+    missing_default
+        .current_dir(home.path())
+        .args([
+            "--home",
+            home_text,
+            "source",
+            "branch",
+            "local",
+            "--default",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("required"));
 }
