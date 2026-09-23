@@ -1,7 +1,7 @@
 //! Application service and command orchestration.
 
+use crate::fs_retry as fs;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
@@ -9,12 +9,13 @@ use serde_json::{Map, Value, json};
 
 use crate::authorize::selection_range;
 use crate::authorize::{Authorization, Authorizer, SelectionOption};
-use crate::cache::{GitHubTransport, materialize_source};
+use crate::cache::{GitHubTransport, materialize_source, validate_git_branch_name};
 use crate::cli::{
     Command, ConfigsAction, ConfigsArgs, ConfigsCopyArgs, CopyArgs, DescribeAction, DescribeArgs,
     DescribeSelection, ImportArgs, RemoveArgs, ResolveArgs, ScopeSelection, SourceAction,
-    SourceAddArgs, SourceAlternateArgs, SourceLocateArgs, SourceModeArg, SourceSelection,
-    SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction, TargetSelection,
+    SourceAddArgs, SourceAlternateArgs, SourceBranchArgs, SourceLocateArgs, SourceModeArg,
+    SourceSelection, SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction,
+    TargetSelection,
 };
 use crate::config::{
     CONFIG_SCHEMA_VERSION, Config, ConfigBackup, ConfigRepository, FileConfigRepository,
@@ -26,8 +27,8 @@ use crate::config::{
     source_reference,
 };
 use crate::domain::{
-    ResolvedSource, Scope, ScopedTarget, SkillCandidate, SkillDiscovery, SourceEntry,
-    SourceLocation, SourceMode, SourceType, Target, TargetEntry,
+    GitHubBranchDefault, ResolvedSource, Scope, ScopedTarget, SkillCandidate, SkillDiscovery,
+    SourceEntry, SourceLocation, SourceMode, SourceType, Target, TargetEntry,
 };
 use crate::error::{Result, SkillManagerError};
 use crate::event::{Level, Reporter};
@@ -94,6 +95,12 @@ struct ImportDeployment {
 struct ScopeContext {
     project_root: PathBuf,
     project_available: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceBranchSlot {
+    Active,
+    Alternate,
 }
 
 /// Normalized selection shared by the three `describe` entry points.
@@ -715,7 +722,7 @@ where
             // it is deliberately NOT a per-handle TOCTOU guarantee.
             reject_linked_ancestors(&to, &row.item.destination)?;
             reject_links_in_tree(&row.item.destination)?;
-            std::fs::create_dir_all(&row.item.destination)
+            crate::fs_retry::create_dir_all(&row.item.destination)
                 .map_err(|error| SkillManagerError::io(&row.item.destination, error))?;
             merge_copy_tree(&row.item.source, &row.item.destination, row.item.excluded)?;
             let verb = if row.existed { "Merged" } else { "Copied" };
@@ -1266,6 +1273,7 @@ where
             SourceAction::Locate(args) => self.source_locate(config, active_path, &args),
             SourceAction::Alternate(args) => self.source_alternate(config, active_path, args),
             SourceAction::Swap(args) => self.source_swap(config, active_path, &args),
+            SourceAction::Branch(args) => self.source_branch(config, active_path, &args),
         }
     }
 
@@ -1728,6 +1736,285 @@ where
         )
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Branch selection, remote validation, review, and mutation remain auditable together."
+    )]
+    fn source_branch(
+        &mut self,
+        config: &mut Config,
+        active_path: &Path,
+        args: &SourceBranchArgs,
+    ) -> Result<()> {
+        if args
+            .branch
+            .as_ref()
+            .is_some_and(|branch| branch.trim().is_empty())
+        {
+            return Err(SkillManagerError::InvalidInput(
+                "branch name must not be blank".into(),
+            ));
+        }
+        let index = source_selector_index(config, &args.source, &self.home)?;
+        let previous = config.sources[index].clone();
+        let active = source_location(&previous)?;
+        let (slot, selected) = select_source_branch_location(&previous, active, args.alternate)?;
+        let SourceLocation::GitHub {
+            owner,
+            repo,
+            r#ref: old_ref,
+            repo_path,
+            branch_default: saved_default,
+        } = selected
+        else {
+            return Err(SkillManagerError::InvalidInput(format!(
+                "the selected {} location for source '{}' is local; choose a GitHub location",
+                source_branch_slot_name(slot),
+                previous.name
+            )));
+        };
+        let legacy_default = saved_default
+            .clone()
+            .unwrap_or_else(|| branch_default_from_ref(old_ref.as_deref()));
+        let next_default = if args.default {
+            GitHubBranchDefault::Branch {
+                name: args.branch.clone().ok_or_else(|| {
+                    SkillManagerError::InvalidInput("--default requires an explicit BRANCH".into())
+                })?,
+            }
+        } else {
+            legacy_default.clone()
+        };
+        let (new_ref, resolved_branch) = match args.branch.as_ref() {
+            Some(branch) => (Some(branch.clone()), branch.clone()),
+            None => match &legacy_default {
+                GitHubBranchDefault::RepositoryDefault => {
+                    (None, self.github.default_branch(&owner, &repo)?)
+                }
+                GitHubBranchDefault::Branch { name } => (Some(name.clone()), name.clone()),
+            },
+        };
+        validate_git_branch_name(&resolved_branch)?;
+        self.github
+            .validate_branch(&owner, &repo, &resolved_branch)?;
+
+        let branch_changed = old_ref != new_ref;
+        let default_changed = args.default && saved_default.as_ref() != Some(&next_default);
+        let next_cache_generation = if branch_changed {
+            previous.cache_generation.checked_add(1).ok_or_else(|| {
+                SkillManagerError::InvalidInput(format!(
+                    "source '{}' cache generation cannot advance further",
+                    previous.name
+                ))
+            })?
+        } else {
+            previous.cache_generation
+        };
+        if !branch_changed && !default_changed {
+            let branch = branch_display(new_ref.as_deref(), Some(&resolved_branch));
+            self.reporter.human(&format!(
+                "Source {} already uses {branch} at its {} location; nothing changed.",
+                previous.name,
+                source_branch_slot_name(slot)
+            ))?;
+            self.reporter.event(
+                "source.branch-unchanged",
+                Level::Info,
+                json!({
+                    "source": previous.name,
+                    "source_id": previous.id,
+                    "slot": source_branch_slot_name(slot),
+                    "branch": new_ref,
+                    "resolved_branch": resolved_branch,
+                    "default": next_default,
+                    "changed": false,
+                }),
+            )?;
+            return self.report_source_branch_summary(false, false, args.dry_run);
+        }
+
+        let persisted_default = if saved_default.is_none() || args.default {
+            Some(next_default.clone())
+        } else {
+            saved_default.clone()
+        };
+        let plan = json!({
+            "command": "source.branch",
+            "revision": 0,
+            "items": [{
+                "source": previous.name,
+                "source_id": previous.id,
+                "slot": source_branch_slot_name(slot),
+                "inactive": slot == SourceBranchSlot::Alternate,
+                "owner": owner,
+                "repo": repo,
+                "repo_path": repo_path,
+                "old_branch": old_ref,
+                "new_branch": new_ref,
+                "resolved_branch": resolved_branch,
+                "default_before": saved_default,
+                "default_after": persisted_default,
+                "cache_refresh": branch_changed,
+            }],
+            "summary": {
+                "sources": 1,
+                "branch_changes": usize::from(branch_changed),
+                "default_changes": usize::from(default_changed),
+            },
+            "authorization": source_branch_authorization(args, self.no_input),
+        });
+        self.reporter.event("plan", Level::Info, plan)?;
+        self.render_source_branch_plan(
+            &previous,
+            slot,
+            &owner,
+            &repo,
+            repo_path.as_deref(),
+            old_ref.as_deref(),
+            new_ref.as_deref(),
+            &resolved_branch,
+            saved_default.as_ref(),
+            persisted_default.as_ref(),
+            branch_changed,
+        )?;
+
+        if args.dry_run {
+            return self.report_source_branch_summary(true, false, true);
+        }
+        if !args.yes {
+            if self.no_input {
+                return Err(SkillManagerError::InteractionRequired(
+                    "applying this source branch plan noninteractively requires --yes".into(),
+                ));
+            } else if !Authorizer::new(self.prompt)
+                .confirm("Apply this source branch plan?", false)?
+                .is_approved()
+            {
+                self.report_cancelled("source.branch")?;
+                self.report_source_branch_summary(true, false, false)?;
+                return Err(SkillManagerError::Cancelled);
+            }
+        }
+
+        let mut proposed = previous.clone();
+        proposed.cache_generation = next_cache_generation;
+        let replacement = SourceLocation::GitHub {
+            owner,
+            repo,
+            r#ref: new_ref,
+            repo_path,
+            branch_default: persisted_default,
+        };
+        match slot {
+            SourceBranchSlot::Active => set_source_location(&mut proposed, &replacement),
+            SourceBranchSlot::Alternate => proposed.alternate = Some(replacement),
+        }
+        config.sources[index] = proposed.clone();
+        self.repository.save(active_path, config)?;
+        self.reporter.human(&format!(
+            "Updated source {} {} branch.{}",
+            proposed.name,
+            source_branch_slot_name(slot),
+            if branch_changed {
+                " Its remote cache will refresh on next use."
+            } else {
+                ""
+            }
+        ))?;
+        self.reporter.event(
+            "source.branch-set",
+            Level::Info,
+            json!({
+                "source": proposed.name,
+                "source_id": proposed.id,
+                "slot": source_branch_slot_name(slot),
+                "branch": match slot {
+                    SourceBranchSlot::Active => proposed.r#ref.clone(),
+                    SourceBranchSlot::Alternate => proposed.alternate.as_ref().and_then(|location| match location {
+                        SourceLocation::GitHub { r#ref, .. } => r#ref.clone(),
+                        SourceLocation::Local { .. } => None,
+                    }),
+                },
+                "resolved_branch": resolved_branch,
+                "default": next_default,
+                "cache_refresh": branch_changed,
+                "changed": true,
+            }),
+        )?;
+        self.report_source_branch_summary(true, true, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_source_branch_plan(
+        &mut self,
+        source: &SourceEntry,
+        slot: SourceBranchSlot,
+        owner: &str,
+        repo: &str,
+        repo_path: Option<&str>,
+        old_ref: Option<&str>,
+        new_ref: Option<&str>,
+        resolved_branch: &str,
+        default_before: Option<&GitHubBranchDefault>,
+        default_after: Option<&GitHubBranchDefault>,
+        cache_refresh: bool,
+    ) -> Result<()> {
+        self.reporter.human("Source branch plan")?;
+        self.reporter.human("")?;
+        self.reporter
+            .human(&format!("  Source      {}", source.name))?;
+        let inactive = if slot == SourceBranchSlot::Alternate {
+            " (inactive)"
+        } else {
+            ""
+        };
+        self.reporter.human(&format!(
+            "  Location    {}{inactive}",
+            source_branch_slot_name(slot)
+        ))?;
+        let path = repo_path.map_or_else(String::new, |path| format!("/{path}"));
+        self.reporter
+            .human(&format!("  Repository  {owner}/{repo}{path}"))?;
+        self.reporter.human(&format!(
+            "  Branch      {} → {}",
+            branch_display(old_ref, None),
+            branch_display(new_ref, Some(resolved_branch))
+        ))?;
+        self.reporter.human(&format!(
+            "  Default     {} → {}",
+            branch_default_display(default_before, old_ref),
+            branch_default_display(default_after, new_ref)
+        ))?;
+        self.reporter.human(&format!(
+            "  Cache       {}",
+            if cache_refresh {
+                "refresh required on next use"
+            } else {
+                "existing cache remains eligible"
+            }
+        ))
+    }
+
+    fn report_source_branch_summary(
+        &mut self,
+        planned: bool,
+        applied: bool,
+        dry_run: bool,
+    ) -> Result<()> {
+        let action = "source.branch";
+        self.reporter.event(
+            "summary",
+            Level::Info,
+            json!({
+                "action": action,
+                "planned": usize::from(planned),
+                "applied": usize::from(applied),
+                "unchanged": usize::from(!planned),
+                "dry_run": dry_run,
+            }),
+        )
+    }
+
     // Lifecycle policy is intentionally kept in one match so every target state
     // transition remains auditable together.
     #[allow(clippy::too_many_lines)]
@@ -1955,13 +2242,7 @@ where
             } else {
                 for word in &promoted_sources {
                     let entry = configured_source_or_reference(config, word, None, &self.home)?;
-                    sources.push(materialize_source(
-                        self.repository,
-                        self.github,
-                        &entry,
-                        args.refresh,
-                        args.dry_run,
-                    )?);
+                    sources.push(self.materialize_source(&entry, args.refresh, args.dry_run)?);
                 }
             }
             discovery = discover_skills(&sources, &[], &config.exclude)?;
@@ -2289,12 +2570,15 @@ where
                 continue;
             }
             if !run.args.dry_run {
-                deploy_skill(
+                let outcome = deploy_skill(
                     &step.candidate.path,
                     &step.target.path,
                     self.repository.cache_root(),
                     self.hook,
                 )?;
+                if let Some(warning) = outcome.cleanup_pending {
+                    self.emit_message_diagnostic(&warning)?;
+                }
                 // A uniform scope is already stated once above the plan, so
                 // repeating it on every progress line would add no information.
                 let scope = if uniform_scope.is_some() {
@@ -2469,12 +2753,15 @@ where
                 continue;
             }
             if !run.args.dry_run {
-                deploy_skill(
+                let outcome = deploy_skill(
                     &step.candidate.path,
                     &step.target.path,
                     self.repository.cache_root(),
                     self.hook,
                 )?;
+                if let Some(warning) = outcome.cleanup_pending {
+                    self.emit_message_diagnostic(&warning)?;
+                }
                 // load's scope is decided once for the whole run, so the
                 // progress line never needs a per-step scope suffix.
                 let verb = if step.existed { "Overwrote" } else { "Loaded" };
@@ -2740,13 +3027,7 @@ where
     #[allow(clippy::too_many_lines)]
     fn run_copy(&mut self, config: &Config, args: &CopyArgs) -> Result<bool> {
         let entry = configured_source_or_reference(config, &args.source, None, &self.home)?;
-        let resolved = materialize_source(
-            self.repository,
-            self.github,
-            &entry,
-            args.refresh,
-            args.dry_run,
-        )?;
+        let resolved = self.materialize_source(&entry, args.refresh, args.dry_run)?;
         let discovery = discover_skills(&[resolved], &args.filters, &config.exclude)?;
         let destination = absolute_path(args.destination.clone())?;
 
@@ -2819,12 +3100,15 @@ where
         for candidate in &candidates {
             let output = target.path.join(&candidate.name);
             let existed = output.is_dir();
-            deploy_skill(
+            let outcome = deploy_skill(
                 &candidate.path,
                 &target.path,
                 self.repository.cache_root(),
                 self.hook,
             )?;
+            if let Some(warning) = outcome.cleanup_pending {
+                self.emit_message_diagnostic(&warning)?;
+            }
             let verb = if existed { "Overwrote" } else { "Copied" };
             self.reporter.human(&format!(
                 "{verb} {} -> {}",
@@ -3589,12 +3873,15 @@ where
         deployed: &[ImportDeployment],
         style: RenderStyle,
     ) -> Result<bool> {
-        import_skill(
+        let outcome = import_skill(
             &resolved.deployment,
             destination,
             self.repository.cache_root(),
             self.hook,
         )?;
+        if let Some(warning) = outcome.cleanup_pending {
+            self.emit_message_diagnostic(&warning)?;
+        }
         self.reporter.human(&format!(
             "Imported {} from {} · {} into {source_label} (source).",
             candidate.name,
@@ -3647,12 +3934,15 @@ where
                     )?;
                     continue;
                 }
-                deploy_skill(
+                let outcome = deploy_skill(
                     &resolved.deployment,
                     &entry.target.path,
                     self.repository.cache_root(),
                     self.hook,
                 )?;
+                if let Some(warning) = outcome.cleanup_pending {
+                    self.emit_message_diagnostic(&warning)?;
+                }
                 updated += 1;
                 self.reporter.human(&format!(
                     "Updated {} -> {} ({})",
@@ -3779,6 +4069,7 @@ where
                         entry,
                         from_cache: false,
                         temporary: None,
+                        cleanup_pending: None,
                     };
                     for skill in detect_skill_dirs(&resolved)? {
                         let name = skill_name(&skill)?;
@@ -4041,12 +4332,15 @@ where
         for item in items {
             let destination = item.root.join(&item.skill);
             if !dry_run {
-                remove_skill(
+                let outcome = remove_skill(
                     &item.skill,
                     &item.root,
                     self.repository.cache_root(),
                     self.hook,
                 )?;
+                if let Some(warning) = outcome.cleanup_pending {
+                    self.emit_message_diagnostic(&warning)?;
+                }
                 self.reporter.human(&format!(
                     "Removed {} from {} ({})",
                     item.skill,
@@ -4214,7 +4508,7 @@ where
         let mut resolved = Vec::new();
         let mut materialization_misses = Vec::new();
         for source in &config.sources {
-            match materialize_source(self.repository, self.github, source, false, false) {
+            match self.materialize_source(source, false, false) {
                 Ok(value) => resolved.push(value),
                 Err(error) => materialization_misses.push(format!(
                     "could not inspect source '{}': {error}",
@@ -4964,13 +5258,20 @@ where
         }
         let mut resolved = Vec::with_capacity(entries.len());
         for entry in entries {
-            resolved.push(materialize_source(
-                self.repository,
-                self.github,
-                &entry,
-                refresh,
-                dry_run,
-            )?);
+            resolved.push(self.materialize_source(&entry, refresh, dry_run)?);
+        }
+        Ok(resolved)
+    }
+
+    fn materialize_source(
+        &mut self,
+        source: &SourceEntry,
+        refresh: bool,
+        dry_run: bool,
+    ) -> Result<ResolvedSource> {
+        let resolved = materialize_source(self.repository, self.github, source, refresh, dry_run)?;
+        if let Some(warning) = &resolved.cleanup_pending {
+            self.emit_message_diagnostic(warning)?;
         }
         Ok(resolved)
     }
@@ -5536,6 +5837,90 @@ fn describe_source_data(source: &SourceEntry) -> Value {
     value
 }
 
+fn select_source_branch_location(
+    source: &SourceEntry,
+    active: SourceLocation,
+    alternate_requested: bool,
+) -> Result<(SourceBranchSlot, SourceLocation)> {
+    if alternate_requested {
+        return source
+            .alternate
+            .clone()
+            .map(|location| (SourceBranchSlot::Alternate, location))
+            .ok_or_else(|| {
+                SkillManagerError::InvalidInput(format!(
+                    "source '{}' has no alternate location; omit --alternate or configure one first",
+                    source.name
+                ))
+            });
+    }
+    if matches!(active, SourceLocation::GitHub { .. }) {
+        return Ok((SourceBranchSlot::Active, active));
+    }
+    if let Some(alternate @ SourceLocation::GitHub { .. }) = source.alternate.clone() {
+        return Ok((SourceBranchSlot::Alternate, alternate));
+    }
+    Err(SkillManagerError::InvalidInput(format!(
+        "source '{}' has no GitHub location whose branch can be changed",
+        source.name
+    )))
+}
+
+const fn source_branch_slot_name(slot: SourceBranchSlot) -> &'static str {
+    match slot {
+        SourceBranchSlot::Active => "active",
+        SourceBranchSlot::Alternate => "alternate",
+    }
+}
+
+fn branch_default_from_ref(reference: Option<&str>) -> GitHubBranchDefault {
+    reference.map_or(GitHubBranchDefault::RepositoryDefault, |name| {
+        GitHubBranchDefault::Branch {
+            name: name.to_owned(),
+        }
+    })
+}
+
+fn branch_display(reference: Option<&str>, resolved: Option<&str>) -> String {
+    reference.map_or_else(
+        || {
+            resolved.map_or_else(
+                || "repository default".into(),
+                |name| format!("repository default ({name})"),
+            )
+        },
+        ToOwned::to_owned,
+    )
+}
+
+fn branch_default_display(value: Option<&GitHubBranchDefault>, legacy_ref: Option<&str>) -> String {
+    match value {
+        Some(GitHubBranchDefault::RepositoryDefault) => "repository default".into(),
+        Some(GitHubBranchDefault::Branch { name }) => name.clone(),
+        None => format!(
+            "not recorded (currently {})",
+            branch_display(legacy_ref, None)
+        ),
+    }
+}
+
+fn source_branch_authorization(args: &SourceBranchArgs, no_input: bool) -> Value {
+    let mode = if args.dry_run {
+        "dry-run"
+    } else if args.yes {
+        "yes"
+    } else if no_input {
+        "noninteractive"
+    } else {
+        "prompt"
+    };
+    json!({
+        "kind": "binary",
+        "mode": mode,
+        "default": (!args.dry_run && !args.yes && !no_input).then_some(true),
+    })
+}
+
 fn command_dry_run(command: &Command) -> bool {
     match command {
         Command::Load(args) => args.sync.dry_run,
@@ -5543,6 +5928,9 @@ fn command_dry_run(command: &Command) -> bool {
         Command::Import(args) => args.dry_run,
         Command::Copy(args) => args.dry_run,
         Command::Remove(args) => args.dry_run,
+        Command::Source(crate::cli::SourceArgs {
+            action: SourceAction::Branch(args),
+        }) => args.dry_run,
         _ => false,
     }
 }
@@ -6325,7 +6713,7 @@ fn reject_links_in_tree(root: &Path) -> Result<()> {
 /// is valid. Junctions and mount points remain link-like and are still rejected
 /// anywhere they could redirect a write outside `<TO>` (finding C).
 fn reject_link(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
+    match crate::fs_retry::symlink_metadata(path) {
         Ok(metadata) if is_link_like(&metadata) => Err(SkillManagerError::InvalidInput(format!(
             "seed destination path must not be a link: {}",
             path.display()
@@ -6343,7 +6731,7 @@ fn reject_link(path: &Path) -> Result<()> {
 /// that blocks traversal even when that component would not survive into the
 /// normalized path handed to physical canonicalization.
 fn validate_seed_destination_component(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
+    match crate::fs_retry::symlink_metadata(path) {
         Ok(metadata) if is_link_like(&metadata) => Err(SkillManagerError::InvalidInput(format!(
             "seed destination path must not be a link: {}",
             path.display()
@@ -6400,7 +6788,7 @@ fn is_link_like(metadata: &std::fs::Metadata) -> bool {
 /// link-skip (documented in `docs/cli.md`, "A configured source ROOT that is a
 /// symlink or reparse point ... is never descended").
 fn is_descendable_dir(path: &Path) -> bool {
-    match std::fs::symlink_metadata(path) {
+    match crate::fs_retry::symlink_metadata(path) {
         Ok(metadata) => metadata.is_dir() && !is_link_like(&metadata),
         Err(_) => false,
     }
@@ -6420,7 +6808,7 @@ enum SourceRootKind {
 
 /// Classify a copy source root without ever following a link (findings G/K).
 fn classify_source_root(path: &Path) -> Result<SourceRootKind> {
-    match std::fs::symlink_metadata(path) {
+    match crate::fs_retry::symlink_metadata(path) {
         Ok(metadata) if is_link_like(&metadata) => Ok(SourceRootKind::Link),
         Ok(metadata) if metadata.is_dir() => Ok(SourceRootKind::Directory),
         Ok(_) => Ok(SourceRootKind::Absent),
@@ -6450,7 +6838,7 @@ fn reject_seed_conflicts(item: &SeedItem) -> Result<()> {
         for (index, part) in parts.iter().enumerate() {
             current = current.join(part);
             let is_last = index + 1 == parts.len();
-            match std::fs::symlink_metadata(&current) {
+            match crate::fs_retry::symlink_metadata(&current) {
                 Ok(metadata) if is_link_like(&metadata) => {
                     return Err(SkillManagerError::InvalidInput(format!(
                         "seed destination path must not be a link: {}",
@@ -6512,7 +6900,7 @@ fn seed_source_entries(root: &Path, excluded_top_level: &[&str]) -> Result<BTree
         });
     for item in walker {
         let item = item.map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
-        let metadata = std::fs::symlink_metadata(item.path())
+        let metadata = crate::fs_retry::symlink_metadata(item.path())
             .map_err(|error| SkillManagerError::io(item.path(), error))?;
         if is_link_like(&metadata) || !(metadata.is_file() || metadata.is_dir()) {
             continue;
@@ -6593,14 +6981,14 @@ fn read_seed_config(home: &Path) -> Result<Option<Config>> {
         return Ok(None);
     }
     let path = config_root.join("config.json");
-    match std::fs::symlink_metadata(&path) {
+    match crate::fs_retry::symlink_metadata(&path) {
         Ok(metadata) if is_link_like(&metadata) => return Ok(None),
         Ok(metadata) if !metadata.is_file() => return Ok(None),
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(SkillManagerError::io(&path, error)),
     }
-    let bytes = match std::fs::read(&path) {
+    let bytes = match crate::fs_retry::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(SkillManagerError::io(&path, error)),
@@ -6756,7 +7144,7 @@ fn merge_directory_files(
         });
     for item in walker {
         let item = item.map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
-        let metadata = std::fs::symlink_metadata(item.path())
+        let metadata = crate::fs_retry::symlink_metadata(item.path())
             .map_err(|error| SkillManagerError::io(item.path(), error))?;
         if is_link_like(&metadata) || !metadata.is_file() {
             continue;
@@ -6785,7 +7173,7 @@ fn merge_copy_tree(source: &Path, destination: &Path, excluded_top_level: &[&str
     // copy descend outside `<FROM>`. Preflight would have skipped a linked root,
     // so reaching one here means it was planted mid-flight — an error, matching
     // the apply-time destination-link recheck.
-    match std::fs::symlink_metadata(source) {
+    match crate::fs_retry::symlink_metadata(source) {
         Ok(metadata) if is_link_like(&metadata) => {
             return Err(SkillManagerError::InvalidInput(format!(
                 "seed source path must not be a link: {}",
@@ -6815,7 +7203,7 @@ fn merge_copy_tree(source: &Path, destination: &Path, excluded_top_level: &[&str
         });
     for item in walker {
         let item = item.map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
-        let metadata = std::fs::symlink_metadata(item.path())
+        let metadata = crate::fs_retry::symlink_metadata(item.path())
             .map_err(|error| SkillManagerError::io(item.path(), error))?;
         if is_link_like(&metadata) {
             continue;
@@ -6826,11 +7214,11 @@ fn merge_copy_tree(source: &Path, destination: &Path, excluded_top_level: &[&str
         let target = destination.join(relative);
         if metadata.is_dir() {
             reject_link(&target)?;
-            std::fs::create_dir_all(&target)
+            crate::fs_retry::create_dir_all(&target)
                 .map_err(|error| SkillManagerError::io(&target, error))?;
         } else if metadata.is_file() {
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)
+                crate::fs_retry::create_dir_all(parent)
                     .map_err(|error| SkillManagerError::io(parent, error))?;
             }
             // Traversal-safe write (defect 3): never follow a destination
@@ -6839,7 +7227,7 @@ fn merge_copy_tree(source: &Path, destination: &Path, excluded_top_level: &[&str
             // any that appeared since, matching how deployment writes to fresh
             // inodes rather than through a link.
             reject_link(&target)?;
-            std::fs::copy(item.path(), &target)
+            crate::fs_retry::copy(item.path(), &target)
                 .map_err(|error| SkillManagerError::io(&target, error))?;
         }
     }
@@ -8826,7 +9214,7 @@ fn canonicalize_verified_seed_destination(anchor: &Path, path: &Path) -> Result<
             }
             std::path::Component::Normal(name) => {
                 let candidate = existing.join(name);
-                match std::fs::symlink_metadata(&candidate) {
+                match crate::fs_retry::symlink_metadata(&candidate) {
                     Ok(metadata) if is_link_like(&metadata) => {
                         return Err(SkillManagerError::InvalidInput(format!(
                             "seed destination path must not be a link: {}",
@@ -8976,7 +9364,7 @@ fn resolve_seed_ambient_prefix(
     mut expression: PathBuf,
 ) -> Result<(PathBuf, PathBuf)> {
     loop {
-        match std::fs::symlink_metadata(&ambient) {
+        match crate::fs_retry::symlink_metadata(&ambient) {
             Ok(_) => {
                 let anchor = ambient
                     .canonicalize()
@@ -9138,9 +9526,11 @@ pub fn production_repository(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
 
+    use clap::Parser as _;
     use indexmap::IndexMap;
 
     use super::{
@@ -9151,20 +9541,39 @@ mod tests {
     };
     use crate::cache::GitHubTransport;
     use crate::cli::{
-        Command, CopyArgs, DescribeArgs, DescribeSelection, ImportArgs, LoadArgs, RemoveArgs,
-        SourceAction, SourceAddArgs, SourceArgs, SourceModeArg, SourceRemoveArgs, SourceUpdateArgs,
-        StatusArgs, SyncArgs, TargetAction, TargetAddArgs, TargetArgs, TargetNameArgs,
-        TargetPathArgs, UpdateArgs,
+        Cli, Command, CopyArgs, DescribeArgs, DescribeSelection, ImportArgs, LoadArgs, RemoveArgs,
+        SourceAction, SourceAddArgs, SourceArgs, SourceBranchArgs, SourceModeArg, SourceRemoveArgs,
+        SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction, TargetAddArgs,
+        TargetArgs, TargetNameArgs, TargetPathArgs, UpdateArgs,
     };
     use crate::config::{
-        Config, FileConfigRepository, portable_canonicalize, resolved_targets,
-        source_from_reference,
+        Config, ConfigRepository, FileConfigRepository, location_from_reference,
+        portable_canonicalize, resolved_targets, source_from_reference,
     };
-    use crate::domain::{ResolvedSource, Scope, SkillCandidate, SkillDiscovery, TargetEntry};
+    use crate::domain::{
+        GitHubBranchDefault, ResolvedSource, Scope, SkillCandidate, SkillDiscovery, SourceLocation,
+        SourceType, TargetEntry,
+    };
     use crate::error::{Result, SkillManagerError};
     use crate::event::{Level, Reporter};
     use crate::prompt::Prompt;
+    use crate::recipe::apply_recipe;
     use crate::transaction::NoopTransactionHook;
+
+    fn source_branch_recipe(value: &serde_json::Value) -> SourceBranchArgs {
+        let argument = format!("--json={value}");
+        let mut cli = Cli::try_parse_from(["skill-manager", argument.as_str()])
+            .unwrap_or_else(|error| unreachable!("parse source branch recipe: {error}"));
+        apply_recipe(&mut cli)
+            .unwrap_or_else(|error| unreachable!("apply source branch recipe: {error}"));
+        let Some(Command::Source(SourceArgs {
+            action: SourceAction::Branch(args),
+        })) = cli.command
+        else {
+            unreachable!("recipe must produce source branch arguments");
+        };
+        args
+    }
 
     #[cfg(unix)]
     fn create_directory_symlink(target: &Path, link: &Path) -> bool {
@@ -9261,6 +9670,12 @@ mod tests {
             ))
         }
 
+        fn validate_branch(&self, _owner: &str, _repo: &str, _branch: &str) -> Result<()> {
+            Err(SkillManagerError::InvalidInput(
+                "network must not be used".into(),
+            ))
+        }
+
         fn download_archive(
             &self,
             _owner: &str,
@@ -9274,14 +9689,50 @@ mod tests {
         }
     }
 
+    struct BranchNetwork {
+        default: String,
+        reject: bool,
+        validations: RefCell<Vec<String>>,
+    }
+
+    impl GitHubTransport for BranchNetwork {
+        fn default_branch(&self, _owner: &str, _repo: &str) -> Result<String> {
+            Ok(self.default.clone())
+        }
+
+        fn validate_branch(&self, _owner: &str, _repo: &str, branch: &str) -> Result<()> {
+            self.validations.borrow_mut().push(branch.to_owned());
+            if self.reject {
+                Err(SkillManagerError::InvalidInput(format!(
+                    "branch is not accessible: {branch}"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn download_archive(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _reference: &str,
+            _destination: &std::path::Path,
+        ) -> Result<()> {
+            Err(SkillManagerError::InvalidInput(
+                "archive download is outside this test".into(),
+            ))
+        }
+    }
+
     #[derive(Default)]
     struct TestPrompt {
         texts: VecDeque<String>,
+        confirmations: VecDeque<bool>,
     }
 
     impl Prompt for TestPrompt {
         fn confirm(&mut self, _message: &str, default: bool) -> Result<bool> {
-            Ok(default)
+            Ok(self.confirmations.pop_front().unwrap_or(default))
         }
 
         fn text(&mut self, _message: &str, default: Option<&str>) -> Result<String> {
@@ -9307,6 +9758,7 @@ mod tests {
         event_data: Vec<serde_json::Value>,
         human: Vec<String>,
         diagnostics: Vec<String>,
+        json: bool,
     }
 
     impl Reporter for RecordingReporter {
@@ -9327,8 +9779,143 @@ mod tests {
         }
 
         fn is_json(&self) -> bool {
-            false
+            self.json
         }
+    }
+
+    fn import_with_blocked_record_or_cleanup(
+        commit_blocked: bool,
+    ) -> (Result<bool>, RecordingReporter) {
+        struct Blocked(bool);
+        impl crate::transaction::TransactionHook for Blocked {
+            fn after_state(&self, _: crate::transaction::TransactionState) -> Result<()> {
+                Ok(())
+            }
+            fn before_commit(&self) -> Result<()> {
+                if self.0 {
+                    Err(SkillManagerError::InvalidInput(
+                        "commit record unavailable".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            fn before_cleanup(&self) -> Result<()> {
+                Err(SkillManagerError::InvalidInput(
+                    "held cleanup handle".into(),
+                ))
+            }
+        }
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let source_root = home.path().join("source");
+        let destination = source_root.join("demo");
+        let deployment = home.path().join("target").join("demo");
+        for path in [&destination, &deployment] {
+            std::fs::create_dir_all(path).unwrap_or_else(|error| unreachable!("{error}"));
+        }
+        std::fs::write(destination.join("SKILL.md"), "old")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        std::fs::write(deployment.join("SKILL.md"), "new")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let entry = source_from_reference(&source_root.to_string_lossy(), None, home.path())
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let candidate = SkillCandidate {
+            name: "demo".into(),
+            path: destination.clone(),
+            source: ResolvedSource {
+                entry,
+                path: source_root,
+                from_cache: false,
+                temporary: None,
+                cleanup_pending: None,
+            },
+        };
+        let resolved = super::ImportCandidate {
+            target: crate::domain::Target {
+                name: "test".into(),
+                label: "Test".into(),
+                path: home.path().join("target"),
+                enabled: true,
+                builtin: false,
+                legacy_override: false,
+            },
+            scope: Scope::Global,
+            deployment,
+            stat: crate::plan::DiffStat::default(),
+        };
+        let repository = FileConfigRepository::new(home.path());
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let hook = Blocked(commit_blocked);
+        let mut app = Application::new(
+            &repository,
+            &NoNetwork,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            false,
+            home.path().to_path_buf(),
+        );
+        let result = app.apply_import(
+            &candidate,
+            &resolved,
+            &destination,
+            "source",
+            false,
+            &[],
+            crate::review::RenderStyle::plain(),
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("SKILL.md"))
+                .ok()
+                .as_deref(),
+            Some("new")
+        );
+        (result, reporter)
+    }
+
+    #[test]
+    fn import_commit_record_failure_emits_no_committed_action_or_success_summary() {
+        let (result, reporter) = import_with_blocked_record_or_cleanup(true);
+        assert!(result.is_err());
+        assert!(
+            !reporter
+                .events
+                .iter()
+                .any(|event| event == "skill.imported" || event == "summary")
+        );
+        assert!(
+            !reporter
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("change committed"))
+        );
+    }
+
+    #[test]
+    fn import_cleanup_failure_reports_committed_action_warning_and_success_summary() {
+        let (result, reporter) = import_with_blocked_record_or_cleanup(false);
+        assert!(result.unwrap_or_else(|error| unreachable!("{error}")));
+        assert!(
+            reporter
+                .events
+                .iter()
+                .any(|event| event == "skill.imported")
+        );
+        assert!(
+            !reporter
+                .events
+                .iter()
+                .any(|event| event == "command.failed")
+        );
+        assert_eq!(reporter.events.last().map(String::as_str), Some("summary"));
+        assert!(
+            reporter
+                .diagnostics
+                .iter()
+                .any(|warning| warning.contains("change committed")
+                    && warning.contains("cleanup pending"))
+        );
     }
 
     #[test]
@@ -9366,6 +9953,16 @@ mod tests {
             ..RemoveArgs::default()
         };
         assert!(command_dry_run(&Command::Remove(remove)));
+        assert!(command_dry_run(&Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "remote".into(),
+                branch: Some("feature/x".into()),
+                default: false,
+                alternate: false,
+                dry_run: true,
+                yes: false,
+            }),
+        })));
         assert!(!command_dry_run(&Command::Status(StatusArgs::default())));
 
         assert_eq!(
@@ -9378,6 +9975,641 @@ mod tests {
             ]),
             ["a*", "b?"]
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One lifecycle fixture proves legacy, saved-default, temporary, reset, and no-op transitions."
+    )]
+    fn source_branch_switches_slash_refs_then_restores_the_legacy_baseline() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+        let mut source = source_from_reference("owner/repo:main/skills", None, home.path())
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        source.name = "remote".into();
+        source.label = "Remote skills".into();
+        source.r#ref = Some("feature/x".into());
+        source.exclude = vec!["draft-*".into()];
+        let stable_id = source.id.clone();
+        repository
+            .save(
+                repository.config_path(),
+                &Config {
+                    sources: vec![source],
+                    ..Config::default()
+                },
+            )
+            .unwrap_or_else(|error| unreachable!("{error}"));
+
+        let network = BranchNetwork {
+            default: "main".into(),
+            reject: false,
+            validations: RefCell::new(Vec::new()),
+        };
+        let hook = NoopTransactionHook;
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let mut app = Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            false,
+            home.path().to_path_buf(),
+        );
+        app.run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "remote".into(),
+                branch: Some("release/y".into()),
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: true,
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        app.run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "remote".into(),
+                branch: None,
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: true,
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        app.run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "remote".into(),
+                branch: Some("stable".into()),
+                default: true,
+                alternate: false,
+                dry_run: false,
+                yes: true,
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        app.run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "remote".into(),
+                branch: Some("temporary/z".into()),
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: true,
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        app.run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "remote".into(),
+                branch: None,
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: true,
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+
+        let before_noop =
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}"));
+        app.run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "remote".into(),
+                branch: Some("stable".into()),
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: true,
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}")),
+            before_noop
+        );
+        drop(app);
+        assert_eq!(
+            reporter
+                .events
+                .iter()
+                .filter(|event| *event == "plan")
+                .count(),
+            5
+        );
+        assert!(
+            reporter
+                .events
+                .iter()
+                .any(|event| event == "source.branch-unchanged")
+        );
+
+        let loaded = repository
+            .load(false)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let restored = &loaded.config.sources[0];
+        assert_eq!(restored.id, stable_id);
+        assert_eq!(restored.name, "remote");
+        assert_eq!(restored.label, "Remote skills");
+        assert_eq!(restored.exclude, ["draft-*"]);
+        assert_eq!(restored.repo_path.as_deref(), Some("skills"));
+        assert_eq!(restored.r#ref.as_deref(), Some("stable"));
+        assert_eq!(restored.cache_generation, 5);
+        assert_eq!(
+            restored.branch_default,
+            Some(GitHubBranchDefault::Branch {
+                name: "stable".into()
+            })
+        );
+        assert_eq!(
+            network.validations.into_inner(),
+            [
+                "release/y",
+                "feature/x",
+                "stable",
+                "temporary/z",
+                "stable",
+                "stable"
+            ]
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One fixture proves every pre-save branch authorization path leaves identical bytes."
+    )]
+    fn source_branch_infers_remote_alternate_and_failed_authorization_never_saves() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let local = home.path().join("local");
+        std::fs::create_dir_all(&local).unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+        let mut source = source_from_reference(&local.to_string_lossy(), None, home.path())
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        source.name = "paired".into();
+        source.alternate = Some(
+            location_from_reference("owner/repo:main/skills", source.mode, home.path())
+                .unwrap_or_else(|error| unreachable!("{error}")),
+        );
+        repository
+            .save(
+                repository.config_path(),
+                &Config {
+                    sources: vec![source],
+                    ..Config::default()
+                },
+            )
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let original =
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}"));
+        let hook = NoopTransactionHook;
+
+        let network = BranchNetwork {
+            default: "main".into(),
+            reject: false,
+            validations: RefCell::new(Vec::new()),
+        };
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            false,
+            home.path().to_path_buf(),
+        )
+        .run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "paired".into(),
+                branch: Some("preview/x".into()),
+                default: false,
+                alternate: false,
+                dry_run: true,
+                yes: false,
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}")),
+            original
+        );
+        let plan_index = reporter
+            .events
+            .iter()
+            .position(|event| event == "plan")
+            .unwrap_or_else(|| unreachable!("plan event"));
+        assert_eq!(
+            reporter.event_data[plan_index]["items"][0]["inactive"],
+            true
+        );
+        assert!(
+            reporter
+                .human
+                .iter()
+                .any(|line| line.contains("alternate (inactive)"))
+        );
+
+        let mut prompt = TestPrompt {
+            confirmations: VecDeque::from([false]),
+            ..TestPrompt::default()
+        };
+        let mut reporter = RecordingReporter::default();
+        let cancelled = Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            false,
+            home.path().to_path_buf(),
+        )
+        .run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "paired".into(),
+                branch: Some("cancelled/x".into()),
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: false,
+            }),
+        }));
+        assert!(matches!(cancelled, Err(SkillManagerError::Cancelled)));
+        let plan_index = reporter
+            .events
+            .iter()
+            .position(|event| event == "plan")
+            .unwrap_or_else(|| unreachable!("plan event"));
+        assert_eq!(
+            reporter.event_data[plan_index]["authorization"]["mode"],
+            "prompt"
+        );
+        assert_eq!(
+            reporter.event_data[plan_index]["authorization"]["default"],
+            true
+        );
+        assert_eq!(
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}")),
+            original
+        );
+
+        let rejecting = BranchNetwork {
+            default: "main".into(),
+            reject: true,
+            validations: RefCell::new(Vec::new()),
+        };
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let rejected = Application::new(
+            &repository,
+            &rejecting,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            false,
+            home.path().to_path_buf(),
+        )
+        .run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "paired".into(),
+                branch: Some("missing/x".into()),
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: true,
+            }),
+        }));
+        assert!(rejected.is_err());
+        assert!(!reporter.events.iter().any(|event| event == "plan"));
+        assert_eq!(
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}")),
+            original
+        );
+
+        let validations_before = network.validations.borrow().len();
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let malformed = Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            true,
+            home.path().to_path_buf(),
+        )
+        .run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "paired".into(),
+                branch: Some(".".into()),
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: true,
+            }),
+        }));
+        assert!(matches!(malformed, Err(SkillManagerError::InvalidInput(_))));
+        assert_eq!(network.validations.borrow().len(), validations_before);
+        assert!(!reporter.events.iter().any(|event| event == "plan"));
+        assert_eq!(
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}")),
+            original
+        );
+
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let noninteractive = Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            true,
+            home.path().to_path_buf(),
+        )
+        .run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "paired".into(),
+                branch: Some("no-input/x".into()),
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: false,
+            }),
+        }));
+        assert!(matches!(
+            noninteractive,
+            Err(SkillManagerError::InteractionRequired(_))
+        ));
+        assert_eq!(
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}")),
+            original
+        );
+
+        for recipe in [
+            serde_json::json!({
+                "command": "source.branch",
+                "source": "paired",
+                "branch": "recipe-absent/x"
+            }),
+            serde_json::json!({
+                "command": "source.branch",
+                "source": "paired",
+                "branch": "recipe-false/x",
+                "yes": false
+            }),
+        ] {
+            let args = source_branch_recipe(&recipe);
+            let mut prompt = TestPrompt::default();
+            let mut reporter = RecordingReporter {
+                json: true,
+                ..RecordingReporter::default()
+            };
+            let unauthorized = Application::new(
+                &repository,
+                &network,
+                &mut prompt,
+                &mut reporter,
+                &hook,
+                true,
+                home.path().to_path_buf(),
+            )
+            .run(Command::Source(SourceArgs {
+                action: SourceAction::Branch(args),
+            }));
+            assert!(matches!(
+                unauthorized,
+                Err(SkillManagerError::InteractionRequired(_))
+            ));
+            assert!(reporter.events.iter().any(|event| event == "plan"));
+            assert!(
+                !reporter
+                    .events
+                    .iter()
+                    .any(|event| event == "source.branch-set")
+            );
+            assert_eq!(
+                std::fs::read(repository.config_path())
+                    .unwrap_or_else(|error| unreachable!("{error}")),
+                original
+            );
+        }
+
+        let args = source_branch_recipe(&serde_json::json!({
+            "command": "source.branch",
+            "source": "paired",
+            "branch": "machine/x",
+            "yes": true
+        }));
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter {
+            json: true,
+            ..RecordingReporter::default()
+        };
+        Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            true,
+            home.path().to_path_buf(),
+        )
+        .run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(args),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        let loaded = repository
+            .load(false)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let changed = &loaded.config.sources[0];
+        assert_eq!(changed.source_type, SourceType::Local);
+        assert_eq!(changed.cache_generation, 1);
+        assert!(matches!(
+            changed.alternate,
+            Some(SourceLocation::GitHub {
+                ref r#ref,
+                ref branch_default,
+                ..
+            }) if r#ref.as_deref() == Some("machine/x")
+                && branch_default == &Some(GitHubBranchDefault::Branch { name: "main".into() })
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One fixture proves repository-default restore, explicit alternate targeting, and baseline-preserving swap."
+    )]
+    fn source_branch_preserves_repository_default_sentinel_and_targets_requested_slot() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+        let mut source = source_from_reference("owner/primary", None, home.path())
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        source.name = "remote".into();
+        source.alternate = Some(
+            location_from_reference("owner/mirror:develop", source.mode, home.path())
+                .unwrap_or_else(|error| unreachable!("{error}")),
+        );
+        repository
+            .save(
+                repository.config_path(),
+                &Config {
+                    sources: vec![source],
+                    ..Config::default()
+                },
+            )
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let network = BranchNetwork {
+            default: "main".into(),
+            reject: false,
+            validations: RefCell::new(Vec::new()),
+        };
+        let hook = NoopTransactionHook;
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let mut app = Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            false,
+            home.path().to_path_buf(),
+        );
+        for (branch, alternate) in [
+            (Some("feature/x"), false),
+            (None, false),
+            (Some("release/y"), true),
+        ] {
+            app.run(Command::Source(SourceArgs {
+                action: SourceAction::Branch(SourceBranchArgs {
+                    source: "remote".into(),
+                    branch: branch.map(ToOwned::to_owned),
+                    default: false,
+                    alternate,
+                    dry_run: false,
+                    yes: true,
+                }),
+            }))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        }
+        let loaded = repository
+            .load(false)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let changed = &loaded.config.sources[0];
+        assert!(changed.r#ref.is_none());
+        assert_eq!(
+            changed.branch_default,
+            Some(GitHubBranchDefault::RepositoryDefault)
+        );
+        assert_eq!(changed.cache_generation, 3);
+        assert!(matches!(
+            changed.alternate,
+            Some(SourceLocation::GitHub {
+                ref r#ref,
+                ref branch_default,
+                ..
+            }) if r#ref.as_deref() == Some("release/y")
+                && branch_default == &Some(GitHubBranchDefault::Branch { name: "develop".into() })
+        ));
+
+        app.run(Command::Source(SourceArgs {
+            action: SourceAction::Swap(SourceSwapArgs {
+                source: "remote".into(),
+            }),
+        }))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        let swapped = repository
+            .load(false)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let swapped = &swapped.config.sources[0];
+        assert_eq!(swapped.r#ref.as_deref(), Some("release/y"));
+        assert_eq!(
+            swapped.branch_default,
+            Some(GitHubBranchDefault::Branch {
+                name: "develop".into()
+            })
+        );
+        assert!(matches!(
+            swapped.alternate,
+            Some(SourceLocation::GitHub {
+                ref r#ref,
+                ref branch_default,
+                ..
+            }) if r#ref.is_none()
+                && branch_default == &Some(GitHubBranchDefault::RepositoryDefault)
+        ));
+        assert_eq!(
+            network.validations.into_inner(),
+            ["feature/x", "main", "release/y"]
+        );
+    }
+
+    #[test]
+    fn source_branch_rejects_an_explicitly_selected_local_location() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let local = home.path().join("local");
+        std::fs::create_dir_all(&local).unwrap_or_else(|error| unreachable!("{error}"));
+        let repository = FileConfigRepository::new(home.path());
+        let mut source = source_from_reference("owner/repo:main", None, home.path())
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        source.name = "paired".into();
+        source.alternate = Some(SourceLocation::Local { path: local });
+        repository
+            .save(
+                repository.config_path(),
+                &Config {
+                    sources: vec![source],
+                    ..Config::default()
+                },
+            )
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let original =
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}"));
+        let network = BranchNetwork {
+            default: "main".into(),
+            reject: false,
+            validations: RefCell::new(Vec::new()),
+        };
+        let hook = NoopTransactionHook;
+        let mut prompt = TestPrompt::default();
+        let mut reporter = RecordingReporter::default();
+        let result = Application::new(
+            &repository,
+            &network,
+            &mut prompt,
+            &mut reporter,
+            &hook,
+            false,
+            home.path().to_path_buf(),
+        )
+        .run(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: "paired".into(),
+                branch: Some("feature/x".into()),
+                default: false,
+                alternate: true,
+                dry_run: false,
+                yes: true,
+            }),
+        }));
+        let Err(error) = result else {
+            unreachable!("selected local location must fail");
+        };
+        assert!(error.to_string().contains("selected alternate location"));
+        assert!(error.to_string().contains("choose a GitHub location"));
+        assert_eq!(
+            std::fs::read(repository.config_path()).unwrap_or_else(|error| unreachable!("{error}")),
+            original
+        );
+        assert!(network.validations.into_inner().is_empty());
+        assert!(!reporter.events.iter().any(|event| event == "plan"));
     }
 
     #[test]
@@ -9437,6 +10669,7 @@ mod tests {
                 path: root.path().to_path_buf(),
                 from_cache: false,
                 temporary: None,
+                cleanup_pending: None,
             },
         };
         assert!(source_matches(&entry, "PRIMARY-SOURCE", root.path()));
@@ -9472,6 +10705,7 @@ mod tests {
                 path: root.path().to_path_buf(),
                 from_cache: true,
                 temporary: None,
+                cleanup_pending: None,
             },
         };
         let target = resolved_targets(&Config::default(), root.path())
@@ -9802,6 +11036,7 @@ mod tests {
         let hook = NoopTransactionHook;
         let mut prompt = TestPrompt {
             texts: VecDeque::from(["prompted-source".into()]),
+            ..TestPrompt::default()
         };
         let mut reporter = RecordingReporter::default();
         let mut app = Application::new(
@@ -10022,6 +11257,7 @@ mod tests {
                     path: home.path().join("plain-dir"),
                     from_cache: false,
                     temporary: None,
+                    cleanup_pending: None,
                 },
             },
         );
@@ -10081,6 +11317,7 @@ mod tests {
                     path: home.path().join("plain-dir"),
                     from_cache: false,
                     temporary: None,
+                    cleanup_pending: None,
                 },
             },
         );

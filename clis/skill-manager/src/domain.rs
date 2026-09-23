@@ -66,6 +66,19 @@ pub enum SourceMode {
     Single,
 }
 
+/// Manager-local baseline used by `source branch` for one GitHub location.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum GitHubBranchDefault {
+    /// Resolve the repository's current default branch when restoring.
+    RepositoryDefault,
+    /// Restore one explicitly saved branch name.
+    Branch {
+        /// Saved branch name.
+        name: String,
+    },
+}
+
 /// One local or GitHub location associated with a source.
 ///
 /// The nested representation is deliberately closed even though [`SourceEntry`]
@@ -90,6 +103,9 @@ pub enum SourceLocation {
         /// Path within the GitHub repository.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo_path: Option<String>,
+        /// Manager-local branch baseline for this repository location.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_default: Option<GitHubBranchDefault>,
     },
 }
 
@@ -132,12 +148,26 @@ pub struct SourceEntry {
     /// Path within the GitHub repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_path: Option<String>,
+    /// Manager-local branch baseline for the active GitHub location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_default: Option<GitHubBranchDefault>,
+    /// Monotonic cache identity generation.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_generation: u64,
     /// Inactive location that can be exchanged with the active location.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alternate: Option<SourceLocation>,
     /// Unknown fields preserved across configuration updates.
     #[serde(flatten)]
     pub extra: IndexMap<String, serde_json::Value>,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "Serde skip_serializing_if callbacks receive a reference."
+)]
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// A source materialized into the local filesystem.
@@ -150,7 +180,9 @@ pub struct ResolvedSource {
     /// Whether the root belongs to the persistent remote cache.
     pub from_cache: bool,
     /// Keeps invocation-scoped materialization alive without persistent cache writes.
-    pub temporary: Option<Arc<tempfile::TempDir>>,
+    pub temporary: Option<Arc<crate::fs_retry::TemporaryDirectory>>,
+    /// A committed cache refresh whose journal still owns pending cleanup.
+    pub cleanup_pending: Option<String>,
 }
 
 /// A discovered source skill.

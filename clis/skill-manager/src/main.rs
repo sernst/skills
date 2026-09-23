@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Executable boundary for skill-manager.
 
-use std::fs;
+use skill_manager::fs_retry as fs;
 use std::io;
 use std::process::ExitCode;
 
@@ -62,7 +62,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut prompt = StdioPrompt;
+    let mut prompt = StdioPrompt::new(cli.plain_prompts, reporter.color_enabled());
     let hook = NoopTransactionHook;
     let no_input = cli.no_input || machine_mode;
     let mut application = Application::new(

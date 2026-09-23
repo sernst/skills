@@ -7,6 +7,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 /// Manage reusable agent skills across AI development tools.
 #[derive(Clone, Debug, Parser)]
 #[command(name = "skill-manager", version, about)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent global CLI switches are clearer as direct booleans"
+)]
 pub struct Cli {
     /// Emit NDJSON; `--json=OBJECT` also supplies a recipe object.
     #[arg(
@@ -26,6 +30,9 @@ pub struct Cli {
     /// Disable interactive prompts.
     #[arg(long, global = true)]
     pub no_input: bool,
+    /// Use accessible line prompts instead of terminal widgets.
+    #[arg(long, global = true)]
+    pub plain_prompts: bool,
     /// Color policy for human output.
     #[arg(long, global = true, value_enum, default_value_t = ColorChoice::Auto)]
     pub color: ColorChoice,
@@ -504,6 +511,8 @@ pub enum SourceAction {
     Alternate(SourceAlternateArgs),
     /// Exchange the active and inactive source locations.
     Swap(SourceSwapArgs),
+    /// Change or restore a GitHub source branch.
+    Branch(SourceBranchArgs),
 }
 
 /// Arguments for `source add`.
@@ -603,6 +612,31 @@ pub struct SourceAlternateArgs {
 pub struct SourceSwapArgs {
     /// Source name, ID, label, path, or GitHub reference.
     pub source: String,
+}
+
+/// Arguments for `source branch`.
+#[derive(Clone, Debug, Args)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Independent CLI switches intentionally map one-to-one to the public command flags."
+)]
+pub struct SourceBranchArgs {
+    /// Source name, ID, label, path, or GitHub reference.
+    pub source: String,
+    /// Branch to use; omitted restores the saved manager-local default.
+    pub branch: Option<String>,
+    /// Save BRANCH as the new manager-local default.
+    #[arg(long, requires = "branch")]
+    pub default: bool,
+    /// Target the inactive alternate location.
+    #[arg(long)]
+    pub alternate: bool,
+    /// Preview the complete plan without saving configuration.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Apply without prompting.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 /// Target-management command wrapper.

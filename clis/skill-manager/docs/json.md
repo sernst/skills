@@ -30,6 +30,12 @@ mode; `configs.restore` optionally accepts the strict `backup` field.
 they require `source`/`path` and `name`, never infer positional roles, and do
 not accept `yes`. The direct argv commands retain `--yes` only as a way to
 declare that prompting is unavailable; it cannot resolve ambiguous roles.
+Terminal radio and checklist editors are human-input surfaces only; no JSON,
+recipe, or `--no-input` path may start one.
+`source.branch` accepts `source`, optional `branch`, `default`, `alternate`,
+`dry_run`, and `yes`; `default:true` requires a nonblank `branch`. An actual
+branch or saved-default change requires `yes:true` in every noninteractive
+mode, including `--json`, inline/stdin/file recipes, and `--no-input`.
 
 ## Event stream
 
@@ -130,6 +136,15 @@ command whose plan can carry more than one decision (source copy, then
 propagation mode), so it is the only command that can emit `plan.updated` —
 one per nonfinal answer, before the corresponding narrowed re-render; the
 final answer needs no extra revision because applying begins immediately.
+`source.branch` also emits `plan` revision `0` for a real branch or baseline
+change. Its compact command-specific payload has `command`, `revision`,
+`authorization`, `items`, and `summary`. The single item identifies `source`,
+`source_id`, `slot`, whether it is `inactive`, `owner`, `repo`, optional
+`repo_path`, configured `old_branch`/`new_branch`, concrete
+`resolved_branch`, typed `default_before`/`default_after`, and
+`cache_refresh`. Its summary counts `sources`, `branch_changes`, and
+`default_changes`. This plan is emitted only after remote branch validation and
+before confirmation or writes. An unchanged request emits no plan.
 Propagation resolves silently (no flag, no prompt) whenever the resolved
 source copy would leave nothing else out of date, so a single-deployment or
 already-synchronized import can commit with `yes:true` alone. Otherwise, every
@@ -407,3 +422,13 @@ Normal completion, no work, and user cancellation return `0`. Operational,
 validation, and interaction-required failures return `1`; Clap usage errors
 return `2`. Human data is stdout and diagnostics stderr. In JSON mode, semantic
 errors are NDJSON on stdout, so consumers can parse every output line.
+
+### Committed cleanup warnings
+
+A committed filesystem change whose cleanup remains locked still emits its
+normal action and successful summary. A `diagnostic` warning with `message`
+identifies the committed destination, remaining cleanup error, and recovery
+journal. Housekeeping retries under the existing lock when a later operation
+applies that skill or materializes that cache outside a dry run. Commands that
+stop before entering recovery, including skill no-ops, do not retry cleanup.
+Successfully recovered transient errors add no events.
