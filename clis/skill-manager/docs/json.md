@@ -407,3 +407,13 @@ Normal completion, no work, and user cancellation return `0`. Operational,
 validation, and interaction-required failures return `1`; Clap usage errors
 return `2`. Human data is stdout and diagnostics stderr. In JSON mode, semantic
 errors are NDJSON on stdout, so consumers can parse every output line.
+
+### Committed cleanup warnings
+
+A committed filesystem change whose cleanup remains locked still emits its
+normal action and successful summary. A `diagnostic` warning with `message`
+identifies the committed destination, remaining cleanup error, and recovery
+journal. Housekeeping retries under the existing lock when a later operation
+applies that skill or materializes that cache outside a dry run. Commands that
+stop before entering recovery, including skill no-ops, do not retry cleanup.
+Successfully recovered transient errors add no events.
