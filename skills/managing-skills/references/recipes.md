@@ -229,14 +229,21 @@ Required: `source` selector. Optional: replacement `name`, active `location`,
 {"command":"source.update","source":"team","label":"Team skills","clear_exclude":true}
 ```
 
-<!-- recipe-command: source.locate fields: command,location,no_input,source -->
+<!-- recipe-command: source.locate fields: all,command,copy,dry_run,exclude,filter,include,location,missing,no_copy,no_input,skill,skills,source,yes -->
 ### `source.locate`
 
-Change only the active location. Required strings: `source`, `location`.
+Change the active location with optional complete physical skill copies.
+Required strings: `source`, `location`. Boolean fields: `copy`, `no_copy`,
+`all`, `missing`, `dry_run`, `yes`. Repeated string or string-array selectors:
+`skill`/`skills`, `filter`/`include`, and `exclude`. `copy` alone means missing
+only; `all` includes whole-directory replacements. Explicit positive selectors
+imply copying; exclusions apply last. `no_copy` conflicts with all copy selection
+fields and works even when the old path is missing. Actual changes require
+`yes:true`; recipes never open a checklist or infer unresolved destructive choices.
 `relocate`, `move`, and `mv` are argv aliases, not recipe command names.
 
 ```json
-{"command":"source.locate","source":"team","location":"../team-skills"}
+{"command":"source.locate","source":"team","location":"../team-skills","copy":true,"yes":true}
 ```
 
 <!-- recipe-command: source.alternate fields: clear,command,location,no_input,source -->
@@ -256,6 +263,27 @@ Exchange active and inactive locations. Required: `source`.
 
 ```json
 {"command":"source.swap","source":"team"}
+```
+
+<!-- recipe-command: source.branch fields: alternate,branch,command,default,dry_run,no_input,source,yes -->
+### `source.branch`
+
+Change a GitHub source branch or restore its saved manager-local baseline.
+Required: `source`. Optional: `branch` (`string`), `alternate`, `dry_run`, and
+`yes` (`bool`). `default:true` requires `branch` and saves that branch as the
+new baseline. Omit `branch` to restore the existing baseline. `alternate:true`
+selects the inactive location; otherwise the active GitHub location is used,
+except that a sole GitHub alternate is inferred when the active location is
+local. The branch is validated remotely before any plan or configuration save.
+An actual branch or saved-default change requires `yes:true`; omit `yes` only
+for `dry_run:true` or a request expected to be a validated no-op.
+
+```json
+{"command":"source.branch","source":"team","branch":"release/2026","default":true,"dry_run":true}
+```
+
+```json
+{"command":"source.branch","source":"team","yes":true}
 ```
 
 ## Target recipes

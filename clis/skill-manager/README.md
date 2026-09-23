@@ -59,7 +59,15 @@ skill-manager source swap personal
 skill-manager source swap personal
 ```
 
-`source locate` also has `relocate`, `move`, and `mv` aliases, and `source update --location` combines relocation with metadata changes. `target add|list|enable|disable|remove|set-path` manages deployment targets. See [the command reference](docs/cli.md) for the full contract.
+`source locate` also has `relocate`, `move`, and `mv` aliases. Local relocation
+can copy selected physical skills while retaining originals: `--copy` selects
+missing skills, `--all` includes replacements, and `--skill`/`--filter` plus
+`--exclude` resolve a specific selection. `--no-copy` changes configuration
+only. The entire selected batch rolls back on precommit failure. Actual
+noninteractive relocation requires `--yes`. `source update --location` combines
+a configuration-only location change with metadata changes.
+`target add|list|enable|disable|remove|set-path` manages deployment targets. See
+[the command reference](docs/cli.md) for the full contract.
 
 ## Configuration and safety
 

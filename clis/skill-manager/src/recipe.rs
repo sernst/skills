@@ -1,6 +1,6 @@
 //! Strict JSON invocation input and CLI-over-recipe overlay behavior.
 
-use std::fs;
+use crate::fs_retry as fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
@@ -9,10 +9,10 @@ use serde_json::{Map, Value};
 use crate::cli::{
     Cli, Command, ConfigsAction, ConfigsArgs, ConfigsConfirmArgs, ConfigsCopyArgs,
     ConfigsRestoreArgs, CopyArgs, ImportArgs, LoadArgs, RemoveArgs, ResolveArgs, ScopeSelection,
-    SourceAction, SourceAddArgs, SourceAlternateArgs, SourceArgs, SourceLocateArgs, SourceModeArg,
-    SourceRemoveArgs, SourceSelection, SourceSwapArgs, SourceUpdateArgs, StatusArgs, SyncArgs,
-    TargetAction, TargetAddArgs, TargetArgs, TargetNameArgs, TargetPathArgs, TargetSelection,
-    UpdateArgs,
+    SourceAction, SourceAddArgs, SourceAlternateArgs, SourceArgs, SourceBranchArgs,
+    SourceLocateArgs, SourceModeArg, SourceRemoveArgs, SourceSelection, SourceSwapArgs,
+    SourceUpdateArgs, StatusArgs, SyncArgs, TargetAction, TargetAddArgs, TargetArgs,
+    TargetNameArgs, TargetPathArgs, TargetSelection, UpdateArgs,
 };
 use crate::config::is_github_reference;
 use crate::error::{Result, SkillManagerError};
@@ -471,7 +471,13 @@ fn overlay_source(
             }
         }
         SourceAction::Locate(args) => {
-            reject_unknown(object, &["command", "no_input", "source", "location"])?;
+            reject_unknown(
+                object,
+                &[
+                    "command", "no_input", "source", "location", "copy", "no_copy", "all",
+                    "missing", "skill", "skills", "filter", "include", "exclude", "dry_run", "yes",
+                ],
+            )?;
             if args.source.is_empty() {
                 args.source = first_string(object, &["source"])?.unwrap_or_default();
             }
@@ -479,6 +485,27 @@ fn overlay_source(
                 args.location = first_string(object, &["location"])?
                     .map(|value| rebase_reference(&value, base, true))
                     .unwrap_or_default();
+            }
+            overlay_bool(&mut args.copy, object.get("copy"))?;
+            overlay_bool(&mut args.no_copy, object.get("no_copy"))?;
+            overlay_bool(&mut args.all, object.get("all"))?;
+            overlay_bool(&mut args.missing, object.get("missing"))?;
+            overlay_bool(&mut args.dry_run, object.get("dry_run"))?;
+            overlay_bool(&mut args.yes, object.get("yes"))?;
+            overlay_strings(&mut args.skills, object, &["skill", "skills"])?;
+            overlay_strings(&mut args.filters, object, &["filter", "include"])?;
+            overlay_strings(&mut args.exclude, object, &["exclude"])?;
+            if args.no_copy
+                && (args.copy
+                    || args.all
+                    || args.missing
+                    || !args.skills.is_empty()
+                    || !args.filters.is_empty()
+                    || !args.exclude.is_empty())
+            {
+                return Err(SkillManagerError::InvalidInput(
+                    "source.locate no_copy conflicts with all copy selection fields".into(),
+                ));
             }
         }
         SourceAction::Alternate(args) => {
@@ -517,6 +544,32 @@ fn overlay_source(
             if args.source.is_empty() {
                 args.source = first_string(object, &["source"])?.unwrap_or_default();
             }
+        }
+        SourceAction::Branch(args) => {
+            reject_unknown(
+                object,
+                &[
+                    "command",
+                    "no_input",
+                    "source",
+                    "branch",
+                    "default",
+                    "alternate",
+                    "dry_run",
+                    "yes",
+                ],
+            )?;
+            if args.source.is_empty() {
+                args.source = first_string(object, &["source"])?.unwrap_or_default();
+            }
+            let branch = first_string(object, &["branch"])?;
+            if args.branch.is_none() {
+                args.branch = branch;
+            }
+            overlay_bool(&mut args.default, object.get("default"))?;
+            overlay_bool(&mut args.alternate, object.get("alternate"))?;
+            overlay_bool(&mut args.dry_run, object.get("dry_run"))?;
+            overlay_bool(&mut args.yes, object.get("yes"))?;
         }
     }
     Ok(())
@@ -848,6 +901,7 @@ fn command_name(command: &Command) -> &'static str {
             SourceAction::Locate(_) => "source.locate",
             SourceAction::Alternate(_) => "source.alternate",
             SourceAction::Swap(_) => "source.swap",
+            SourceAction::Branch(_) => "source.branch",
         },
         Command::Target(args) => match args.action {
             TargetAction::Add(_) => "target.add",
@@ -884,6 +938,7 @@ fn canonical_command(value: &str) -> Result<&'static str> {
         "source.locate" => Ok("source.locate"),
         "source.alternate" => Ok("source.alternate"),
         "source.swap" => Ok("source.swap"),
+        "source.branch" => Ok("source.branch"),
         "target.add" => Ok("target.add"),
         "target.list" => Ok("target.list"),
         "target.enable" => Ok("target.enable"),
@@ -943,8 +998,8 @@ fn default_command(name: &str) -> Result<Command> {
         })),
         // Commands with required positional fields must be expressed on argv.
         "copy" | "configs.copy" | "source.update" | "source.locate" | "source.alternate"
-        | "source.swap" | "target.add" | "target.enable" | "target.disable" | "target.remove"
-        | "target.set-path" => build_required_command(name),
+        | "source.swap" | "source.branch" | "target.add" | "target.enable" | "target.disable"
+        | "target.remove" | "target.set-path" => build_required_command(name),
         _ => Err(SkillManagerError::InvalidInput(format!(
             "cannot create recipe command: {name}"
         ))),
@@ -992,6 +1047,16 @@ fn validate_required(command: &Command) -> Result<()> {
         Command::Source(SourceArgs {
             action: SourceAction::Swap(args),
         }) if args.source.is_empty() => Some("source.swap.source"),
+        Command::Source(SourceArgs {
+            action: SourceAction::Branch(args),
+        }) if args.source.is_empty() => Some("source.branch.source"),
+        Command::Source(SourceArgs {
+            action: SourceAction::Branch(args),
+        }) if args.default && args.branch.is_none() => {
+            return Err(SkillManagerError::InvalidInput(
+                "source.branch default:true requires field branch".into(),
+            ));
+        }
         Command::Target(TargetArgs {
             action: TargetAction::Add(args),
         }) if args.name.as_ref().is_none_or(String::is_empty) => Some("target.name"),
@@ -1056,6 +1121,7 @@ fn build_required_command(name: &str) -> Result<Command> {
             action: SourceAction::Locate(SourceLocateArgs {
                 source: String::new(),
                 location: String::new(),
+                ..SourceLocateArgs::default()
             }),
         })),
         "source.alternate" => Ok(Command::Source(SourceArgs {
@@ -1068,6 +1134,16 @@ fn build_required_command(name: &str) -> Result<Command> {
         "source.swap" => Ok(Command::Source(SourceArgs {
             action: SourceAction::Swap(SourceSwapArgs {
                 source: String::new(),
+            }),
+        })),
+        "source.branch" => Ok(Command::Source(SourceArgs {
+            action: SourceAction::Branch(SourceBranchArgs {
+                source: String::new(),
+                branch: None,
+                default: false,
+                alternate: false,
+                dry_run: false,
+                yes: false,
             }),
         })),
         "target.add" | "target.set-path" => Ok(Command::Target(TargetArgs {
