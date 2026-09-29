@@ -60,6 +60,9 @@ test coverage.
 Run an agent as an accountable orchestrator that delegates work to subagents,
 selects appropriate model tiers, and verifies their output.
 
+See the [GPT/Codex maestro maintenance playbook](./docs/maestro-maintenance.md)
+for evidence-driven profile reviews.
+
 ## Install skill-manager
 
 macOS and Linux:
