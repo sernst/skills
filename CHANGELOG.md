@@ -2,6 +2,19 @@
 
 All notable changes to the downloadable CLIs are documented here.
 
+## 0.1.5 - 2026-09-16
+
+- Retries transient filesystem errors across deployment, import, removal,
+  configuration, migration, source caching, discovery, and file output. Every
+  primitive starts immediately and waits at most 775ms in bounded backoff;
+  successful operations stay quiet.
+- Makes import/deployment and cache staging recoverable before content is
+  copied, retains journals until committed cleanup completes, and reports
+  committed changes with a cleanup-pending warning when a handle stays locked.
+  Configuration and migration backup staging have exact-path cleanup receipts.
+  Recovery refuses linked paths and preserves leftovers without ownership
+  evidence, with guidance to inspect and move them aside.
+
 ## 0.1.4 - 2026-08-14
 
 - Adds `describe` (plus `describe skill` and `describe source`) for concise,
