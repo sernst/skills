@@ -22,7 +22,8 @@ fn help_lists_all_top_level_commands() {
         .stdout(predicate::str::contains("status"))
         .stdout(predicate::str::contains("resolve"))
         .stdout(predicate::str::contains("source"))
-        .stdout(predicate::str::contains("target"));
+        .stdout(predicate::str::contains("target"))
+        .stdout(predicate::str::contains("--plain-prompts"));
 }
 
 /// Version is the release version and remains available without configuration.
@@ -33,7 +34,7 @@ fn version_is_available_without_configuration() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.1.4"));
+        .stdout(predicate::str::contains("0.1.5"));
 }
 
 /// Parser misuse follows Clap's conventional usage exit code and stderr stream.

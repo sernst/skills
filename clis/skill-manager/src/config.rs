@@ -1,8 +1,7 @@
 //! Versioned configuration, source normalization, and target resolution.
 
+use crate::fs_retry::{self as fs, OpenOptions};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -306,51 +305,48 @@ impl FileConfigRepository {
             suffix += 1;
         }
         let final_directory = self.backups_root.join(&id);
-        let staging = tempfile::Builder::new()
-            .prefix(".backup-")
-            .tempdir_in(&self.backups_root)
-            .map_err(|error| SkillManagerError::io(&self.backups_root, error))?;
-        let raw_path = final_directory.join("config.raw");
-        if let Some(raw) = bytes {
-            let staged_raw = staging.path().join("config.raw");
-            fs::write(&staged_raw, raw)
+        crate::staging::with_directory(&self.backups_root, "config-backup", |staging| {
+            let raw_path = final_directory.join("config.raw");
+            if let Some(raw) = bytes {
+                let staged_raw = staging.join("config.raw");
+                fs::write(&staged_raw, raw)
+                    .and_then(|()| {
+                        fs::retry(|| OpenOptions::new().read(true).write(true).open(&staged_raw))
+                            .and_then(|file| fs::retry(|| file.sync_all()))
+                    })
+                    .map_err(|error| SkillManagerError::io(&staged_raw, error))?;
+            }
+            let parsed = bytes.and_then(|raw| serde_json::from_slice::<Value>(raw).ok());
+            let metadata = BackupMetadata {
+                id,
+                created_at: now,
+                reason: reason.to_owned(),
+                original_path: self.config_path.clone(),
+                present: bytes.is_some(),
+                schema_version: parsed
+                    .as_ref()
+                    .and_then(|value| value.get("schema_version"))
+                    .and_then(Value::as_u64),
+                valid: bytes.is_none() || parsed.is_some(),
+            };
+            let metadata_bytes = serde_json::to_vec_pretty(&metadata)
+                .map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
+            let staged_metadata = staging.join("metadata.json");
+            fs::write(&staged_metadata, metadata_bytes)
                 .and_then(|()| {
-                    OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&staged_raw)?
-                        .sync_all()
+                    fs::retry(|| {
+                        OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(&staged_metadata)
+                    })
+                    .and_then(|file| fs::retry(|| file.sync_all()))
                 })
-                .map_err(|error| SkillManagerError::io(&staged_raw, error))?;
-        }
-        let parsed = bytes.and_then(|raw| serde_json::from_slice::<Value>(raw).ok());
-        let metadata = BackupMetadata {
-            id,
-            created_at: now,
-            reason: reason.to_owned(),
-            original_path: self.config_path.clone(),
-            present: bytes.is_some(),
-            schema_version: parsed
-                .as_ref()
-                .and_then(|value| value.get("schema_version"))
-                .and_then(Value::as_u64),
-            valid: bytes.is_none() || parsed.is_some(),
-        };
-        let metadata_bytes = serde_json::to_vec_pretty(&metadata)
-            .map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
-        let staged_metadata = staging.path().join("metadata.json");
-        fs::write(&staged_metadata, metadata_bytes)
-            .and_then(|()| {
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&staged_metadata)?
-                    .sync_all()
-            })
-            .map_err(|error| SkillManagerError::io(&staged_metadata, error))?;
-        fs::rename(staging.keep(), &final_directory)
-            .map_err(|error| SkillManagerError::io(&final_directory, error))?;
-        Ok(ConfigBackup { metadata, raw_path })
+                .map_err(|error| SkillManagerError::io(&staged_metadata, error))?;
+            fs::rename(staging, &final_directory)
+                .map_err(|error| SkillManagerError::io(&final_directory, error))?;
+            Ok(ConfigBackup { metadata, raw_path })
+        })
     }
 
     fn list_backups_unlocked(&self) -> Result<Vec<ConfigBackup>> {
@@ -683,20 +679,7 @@ pub fn canonical_config_bytes() -> Result<Vec<u8>> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        SkillManagerError::InvalidInput(format!("path has no parent: {}", path.display()))
-    })?;
-    fs::create_dir_all(parent).map_err(|error| SkillManagerError::io(parent, error))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| SkillManagerError::io(parent, error))?;
-    temporary
-        .write_all(bytes)
-        .and_then(|()| temporary.as_file().sync_all())
-        .map_err(|error| SkillManagerError::io(temporary.path(), error))?;
-    temporary
-        .persist(path)
-        .map_err(|error| SkillManagerError::io(path, error.error))?;
-    Ok(())
+    fs::atomic_write(path, bytes).map_err(|error| SkillManagerError::io(path, error))
 }
 
 /// Advisory lock held for one resource.
@@ -720,13 +703,15 @@ pub fn acquire_lock(path: &Path, resource: &str, timeout: Duration) -> Result<Re
         SkillManagerError::InvalidInput(format!("lock path has no parent: {}", path.display()))
     })?;
     fs::create_dir_all(parent).map_err(|error| SkillManagerError::io(parent, error))?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| SkillManagerError::io(path, error))?;
+    let file = fs::retry(|| {
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+    })
+    .map_err(|error| SkillManagerError::io(path, error))?;
     let started = Instant::now();
     loop {
         match file.try_lock_exclusive() {

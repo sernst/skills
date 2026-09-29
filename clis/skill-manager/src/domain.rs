@@ -150,7 +150,9 @@ pub struct ResolvedSource {
     /// Whether the root belongs to the persistent remote cache.
     pub from_cache: bool,
     /// Keeps invocation-scoped materialization alive without persistent cache writes.
-    pub temporary: Option<Arc<tempfile::TempDir>>,
+    pub temporary: Option<Arc<crate::fs_retry::TemporaryDirectory>>,
+    /// A committed cache refresh whose journal still owns pending cleanup.
+    pub cleanup_pending: Option<String>,
 }
 
 /// A discovered source skill.

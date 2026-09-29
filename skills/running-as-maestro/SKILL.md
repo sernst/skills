@@ -88,15 +88,14 @@ This profile applies only if you are a GPT/Codex-family agent running outside
 GitHub Copilot (an OpenAI model via the native API, Codex CLI, or ChatGPT)
 and not running in Cursor. If that is not you, skip this profile entirely.
 
-Unlike Claude, you will not automatically launch subagents on a lighter
-tier — left unspecified, your subagents default to your own model. You must
-explicitly pick a tier per subagent and pass it when launching, matching tier
-weight to task complexity as a judgment call: **Sol** (heaviest, most
-capable), **Terra** (balanced mid tier), and **Luna** (lightest, fastest).
-These are typically named with a `-sol`/`-terra`/`-luna` suffix (e.g.
-`gpt-5.6-sol`/`gpt-5.6-terra`/`gpt-5.6-luna`); exact identifiers vary by
-environment, so use whatever matching tier is exposed there, falling back to
-the closest lighter-weight option when these exact names aren't available.
+When this profile applies, read and apply
+[references/gpt-codex.md](references/gpt-codex.md). It adapts the shared rules
+to the current Codex collaboration interface, including explicit model and
+effort selection from the live roster, fork semantics, execution ownership,
+correction handling, and evidence. Its specific refinements prevail over the
+conflicting shared rules for this profile, including roster and cost
+assumptions, scheduling and lifetimes, low-risk judging, and review criteria;
+all shared rules it does not explicitly refine remain in force.
 
 ## GitHub Copilot
 

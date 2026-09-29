@@ -1,7 +1,7 @@
 //! GitHub transport, bounded archive extraction, and persistent source caching.
 
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use crate::fs_retry::{self as fs, File};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -46,6 +46,7 @@ pub struct CacheMetadata {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum CacheSwapState {
+    Staging,
     Prepared,
     OldMoved,
     Committed,
@@ -112,7 +113,12 @@ impl ReqwestGitHubTransport {
     ///
     /// Returns an error when the bounded HTTP client cannot be constructed.
     pub fn new() -> Result<Self> {
+        let tls_config = mozilla_tls_config().map_err(|error| SkillManagerError::GitHub {
+            reference: "github.com".into(),
+            message: format!("failed to configure bundled Mozilla TLS roots: {error}"),
+        })?;
         let client = Client::builder()
+            .tls_backend_preconfigured(tls_config)
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_mins(2))
             .user_agent(concat!("skill-manager/", env!("CARGO_PKG_VERSION")))
@@ -176,6 +182,29 @@ impl ReqwestGitHubTransport {
     }
 }
 
+fn ring_tls_config(
+    roots: rustls::RootCertStore,
+) -> std::result::Result<rustls::ClientConfig, rustls::Error> {
+    Ok(rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(roots)
+    .with_no_client_auth())
+}
+
+fn mozilla_root_store() -> std::result::Result<rustls::RootCertStore, rustls::Error> {
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+        roots.add(certificate.clone())?;
+    }
+    Ok(roots)
+}
+
+fn mozilla_tls_config() -> std::result::Result<rustls::ClientConfig, rustls::Error> {
+    ring_tls_config(mozilla_root_store()?)
+}
+
 impl GitHubTransport for ReqwestGitHubTransport {
     fn default_branch(&self, owner: &str, repo: &str) -> Result<String> {
         let reference = format!("{owner}/{repo}");
@@ -230,11 +259,11 @@ impl GitHubTransport for ReqwestGitHubTransport {
                 message: format!("archive exceeds {MAX_COMPRESSED_BYTES} compressed bytes"),
             });
         }
-        let mut output =
-            File::create(destination).map_err(|error| SkillManagerError::io(destination, error))?;
+        let mut output = fs::retry(|| File::create(destination))
+            .map_err(|error| SkillManagerError::io(destination, error))?;
         let copied = std::io::copy(
             &mut response.by_ref().take(MAX_COMPRESSED_BYTES + 1),
-            &mut output,
+            &mut fs::Retrying(&mut output),
         )
         .map_err(|error| SkillManagerError::GitHub {
             reference: source.clone(),
@@ -246,9 +275,7 @@ impl GitHubTransport for ReqwestGitHubTransport {
                 message: format!("archive exceeds {MAX_COMPRESSED_BYTES} compressed bytes"),
             });
         }
-        output
-            .sync_all()
-            .map_err(|error| SkillManagerError::io(destination, error))
+        fs::retry(|| output.sync_all()).map_err(|error| SkillManagerError::io(destination, error))
     }
 }
 
@@ -299,6 +326,7 @@ pub fn materialize_source_with_clock<R: ConfigRepository, G: GitHubTransport, C:
             })?,
             from_cache: false,
             temporary: None,
+            cleanup_pending: None,
         }),
         SourceType::GitHub => {
             materialize_github(repository, github, clock, source, refresh, dry_run)
@@ -338,7 +366,8 @@ fn materialize_github<R: ConfigRepository, G: GitHubTransport, C: Clock>(
             return resolved_cached(source, &content);
         }
         let temporary = Arc::new(
-            tempfile::tempdir().map_err(|error| SkillManagerError::io("<temporary>", error))?,
+            fs::TemporaryDirectory::new()
+                .map_err(|error| SkillManagerError::io("<temporary>", error))?,
         );
         let reference = source
             .r#ref
@@ -359,6 +388,7 @@ fn materialize_github<R: ConfigRepository, G: GitHubTransport, C: Clock>(
             path: selected,
             from_cache: false,
             temporary: Some(temporary),
+            cleanup_pending: None,
         });
     }
 
@@ -375,16 +405,61 @@ fn materialize_github<R: ConfigRepository, G: GitHubTransport, C: Clock>(
     }
     fs::create_dir_all(repository.cache_root())
         .map_err(|error| SkillManagerError::io(repository.cache_root(), error))?;
-    let staging = tempfile::Builder::new()
-        .prefix(&format!(".{}.stage-", source.id))
-        .tempdir_in(repository.cache_root())
-        .map_err(|error| SkillManagerError::io(repository.cache_root(), error))?;
+    let staging = repository
+        .cache_root()
+        .join(format!(".{}.stage-pending", source.id));
+    crate::staging::reject_link(repository.cache_root())?;
+    if crate::staging::exists(&staging)? {
+        return Err(SkillManagerError::InvalidInput(format!(
+            "unowned cache staging directory {}; inspect and move it aside before retrying",
+            staging.display()
+        )));
+    }
+    write_cache_journal(
+        &swap_paths.journal,
+        &CacheJournal {
+            state: CacheSwapState::Staging,
+            destination: source_cache.clone(),
+            backup: swap_paths.backup.clone(),
+            staging_root: staging.clone(),
+        },
+    )?;
+    fs::create_dir(&staging).map_err(|error| SkillManagerError::io(&staging, error))?;
+    let preparation = prepare_cache(github, clock, source, source_ref, owner, repo, &staging);
+    let staged_cache = match preparation {
+        Ok(path) => path,
+        Err(error) => {
+            return match recover_cache_swap(&source_cache, &swap_paths.backup, &swap_paths.journal)
+            {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(SkillManagerError::InvalidInput(format!(
+                    "{error}; cache staging cleanup pending in {}: {cleanup}; retry to recover",
+                    swap_paths.journal.display()
+                ))),
+            };
+        }
+    };
+    let cleanup_pending = swap_cache(&source_cache, &staged_cache, &staging)?;
+    let mut resolved = resolved_cached(source, &content)?;
+    resolved.cleanup_pending = cleanup_pending;
+    Ok(resolved)
+}
+
+fn prepare_cache<G: GitHubTransport, C: Clock>(
+    github: &G,
+    clock: &C,
+    source: &SourceEntry,
+    source_ref: String,
+    owner: &str,
+    repo: &str,
+    staging: &Path,
+) -> Result<PathBuf> {
     let reference = source
         .r#ref
         .clone()
         .map_or_else(|| github.default_branch(owner, repo), Ok)?;
-    let archive = staging.path().join("source.tar.gz");
-    let new_content = staging.path().join("content");
+    let archive = staging.join("source.tar.gz");
+    let new_content = staging.join("content");
     github.download_archive(owner, repo, &reference, &archive)?;
     extract_archive(
         &archive,
@@ -399,7 +474,7 @@ fn materialize_github<R: ConfigRepository, G: GitHubTransport, C: Clock>(
             message: "configured repository path does not exist".into(),
         });
     }
-    let staged_cache = staging.path().join("cache");
+    let staged_cache = staging.join("cache");
     fs::create_dir(&staged_cache).map_err(|error| SkillManagerError::io(&staged_cache, error))?;
     fs::rename(&new_content, staged_cache.join("content"))
         .map_err(|error| SkillManagerError::io(&new_content, error))?;
@@ -414,8 +489,7 @@ fn materialize_github<R: ConfigRepository, G: GitHubTransport, C: Clock>(
             repo_path: source.repo_path.clone(),
         },
     )?;
-    swap_cache(&source_cache, &staged_cache, staging.path())?;
-    resolved_cached(source, &content)
+    Ok(staged_cache)
 }
 
 fn cache_can_be_reused<C: Clock>(
@@ -472,6 +546,7 @@ fn resolved_cached(source: &SourceEntry, content: &Path) -> Result<ResolvedSourc
         path,
         from_cache: true,
         temporary: None,
+        cleanup_pending: None,
     })
 }
 
@@ -524,9 +599,17 @@ fn cache_swap_paths(destination: &Path) -> Result<CacheSwapPaths> {
     Ok(CacheSwapPaths { backup, journal })
 }
 
-fn swap_cache(destination: &Path, staged: &Path, staging_root: &Path) -> Result<()> {
+fn swap_cache(destination: &Path, staged: &Path, staging_root: &Path) -> Result<Option<String>> {
+    swap_cache_with_commit_hook(destination, staged, staging_root, || Ok(()))
+}
+
+fn swap_cache_with_commit_hook(
+    destination: &Path,
+    staged: &Path,
+    staging_root: &Path,
+    before_commit: impl FnOnce() -> Result<()>,
+) -> Result<Option<String>> {
     let paths = cache_swap_paths(destination)?;
-    recover_cache_swap(destination, &paths.backup, &paths.journal)?;
     let mut journal = CacheJournal {
         state: CacheSwapState::Prepared,
         destination: destination.to_path_buf(),
@@ -548,34 +631,34 @@ fn swap_cache(destination: &Path, staged: &Path, staging_root: &Path) -> Result<
         return Err(SkillManagerError::io(staged, error));
     }
     journal.state = CacheSwapState::Committed;
-    write_cache_journal(&paths.journal, &journal)?;
-    if paths.backup.exists() {
-        fs::remove_dir_all(&paths.backup)
-            .map_err(|error| SkillManagerError::io(&paths.backup, error))?;
-    }
-    cleanup_cache_staging(staging_root, destination)?;
-    fs::remove_file(&paths.journal).map_err(|error| SkillManagerError::io(&paths.journal, error))
+    before_commit().and_then(|()| write_cache_journal(&paths.journal, &journal))
+        .map_err(|error| SkillManagerError::InvalidInput(format!(
+            "cache data is installed at {}, but recording committed state failed: {error}; refresh interrupted; recovery journal {} retains the prior state and recovery may restore prior content",
+            destination.display(), paths.journal.display()
+        )))?;
+    let cleanup = (|| {
+        crate::staging::remove_tree(&paths.backup)?;
+        cleanup_cache_staging(staging_root, destination)?;
+        fs::remove_file(&paths.journal)
+            .map_err(|error| SkillManagerError::io(&paths.journal, error))
+    })();
+    Ok(cleanup.err().map(|error| format!("cache refresh committed at {}; cleanup pending: {error}; recovery journal {}; a later non-dry-run source access retries cleanup", destination.display(), paths.journal.display())))
 }
 
 fn write_cache_journal(path: &Path, journal: &CacheJournal) -> Result<()> {
     let mut data = serde_json::to_vec(journal)
         .map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
     data.push(b'\n');
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| SkillManagerError::io(path, error))?;
-    file.write_all(&data)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| SkillManagerError::io(path, error))
+    fs::atomic_write(path, &data).map_err(|error| SkillManagerError::io(path, error))
 }
 
 fn recover_cache_swap(destination: &Path, backup: &Path, journal: &Path) -> Result<()> {
     if !journal.exists() {
         if backup.exists() {
-            fs::remove_dir_all(backup).map_err(|error| SkillManagerError::io(backup, error))?;
+            return Err(SkillManagerError::InvalidInput(format!(
+                "unowned cache backup {}; inspect and move it aside before retrying; no recovery journal exists",
+                backup.display()
+            )));
         }
         return Ok(());
     }
@@ -592,12 +675,27 @@ fn recover_cache_swap(destination: &Path, backup: &Path, journal: &Path) -> Resu
             journal.display()
         )));
     }
-    if !matches!(record.state, CacheSwapState::Committed)
-        && backup.exists()
+    validate_cache_staging(&record.staging_root, destination)?;
+    for managed in [
+        Some(destination),
+        destination.parent(),
+        Some(journal),
+        Some(backup),
+        Some(record.staging_root.as_path()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        crate::staging::reject_link(managed)?;
+    }
+    if !matches!(
+        record.state,
+        CacheSwapState::Committed | CacheSwapState::Staging
+    ) && backup.exists()
         && !destination.exists()
     {
         fs::rename(backup, destination).map_err(|error| SkillManagerError::io(backup, error))?;
-    } else if backup.exists() {
+    } else if backup.exists() && !matches!(record.state, CacheSwapState::Staging) {
         fs::remove_dir_all(backup).map_err(|error| SkillManagerError::io(backup, error))?;
     }
     cleanup_cache_staging(&record.staging_root, destination)?;
@@ -605,9 +703,11 @@ fn recover_cache_swap(destination: &Path, backup: &Path, journal: &Path) -> Resu
 }
 
 fn cleanup_cache_staging(staging_root: &Path, destination: &Path) -> Result<()> {
-    if !staging_root.exists() {
-        return Ok(());
-    }
+    validate_cache_staging(staging_root, destination)?;
+    crate::staging::remove_tree(staging_root)
+}
+
+fn validate_cache_staging(staging_root: &Path, destination: &Path) -> Result<()> {
     let parent = destination.parent().ok_or_else(|| {
         SkillManagerError::InvalidInput(format!(
             "cache destination has no parent: {}",
@@ -630,7 +730,7 @@ fn cleanup_cache_staging(staging_root: &Path, destination: &Path) -> Result<()> 
             staging_root.display()
         )));
     }
-    fs::remove_dir_all(staging_root).map_err(|error| SkillManagerError::io(staging_root, error))
+    Ok(())
 }
 
 fn extract_archive(
@@ -645,8 +745,8 @@ fn extract_archive(
         .map(|path| validate_relative_path(Path::new(path), source))
         .transpose()?;
     let archive_file =
-        File::open(archive_path).map_err(|error| SkillManagerError::io(archive_path, error))?;
-    let decoder = GzDecoder::new(archive_file);
+        fs::open(archive_path).map_err(|error| SkillManagerError::io(archive_path, error))?;
+    let decoder = GzDecoder::new(fs::Retrying(archive_file));
     let mut archive = Archive::new(decoder);
     let entries = archive
         .entries()
@@ -696,13 +796,16 @@ fn extract_archive(
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent).map_err(|error| SkillManagerError::io(parent, error))?;
         }
-        let mut file =
-            File::create(&output).map_err(|error| SkillManagerError::io(&output, error))?;
-        let copied = std::io::copy(&mut entry.by_ref().take(MAX_FILE_BYTES + 1), &mut file)
-            .map_err(|error| SkillManagerError::GitHub {
-                reference: source.to_owned(),
-                message: error.to_string(),
-            })?;
+        let mut file = fs::retry(|| File::create(&output))
+            .map_err(|error| SkillManagerError::io(&output, error))?;
+        let copied = std::io::copy(
+            &mut entry.by_ref().take(MAX_FILE_BYTES + 1),
+            &mut fs::Retrying(&mut file),
+        )
+        .map_err(|error| SkillManagerError::GitHub {
+            reference: source.to_owned(),
+            message: error.to_string(),
+        })?;
         if copied > MAX_FILE_BYTES {
             return archive_error(source, "archive file exceeds per-file limit");
         }
@@ -713,8 +816,8 @@ fn extract_archive(
 
 fn validate_raw_archive(archive_path: &Path, source: &str) -> Result<()> {
     let archive_file =
-        File::open(archive_path).map_err(|error| SkillManagerError::io(archive_path, error))?;
-    let decoder = GzDecoder::new(archive_file);
+        fs::open(archive_path).map_err(|error| SkillManagerError::io(archive_path, error))?;
+    let decoder = GzDecoder::new(fs::Retrying(archive_file));
     let mut archive = Archive::new(decoder);
     let entries = archive
         .entries()
@@ -836,7 +939,7 @@ fn preserve_executable_permission<R: Read>(entry: &tar::Entry<'_, R>, output: &P
     use std::os::unix::fs::PermissionsExt;
 
     let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
-    fs::set_permissions(output, fs::Permissions::from_mode(mode))
+    fs::set_permissions(output, &fs::Permissions::from_mode(mode))
         .map_err(|error| SkillManagerError::io(output, error))
 }
 
@@ -862,17 +965,25 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::path::Path;
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
     use chrono::{DateTime, TimeZone, Utc};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose,
+    };
     use reqwest::StatusCode;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
     use super::{
         CacheJournal, CacheMetadata, CacheSwapState, Clock, GitHubTransport, MAX_COMPRESSED_BYTES,
         ReqwestGitHubTransport, cache_is_fresh, cache_swap_paths, is_transient_status,
-        read_metadata, recover_cache_swap, resolved_cached, select_repo_path, swap_cache,
-        validate_relative_path, write_cache_journal, write_metadata,
+        mozilla_root_store, mozilla_tls_config, read_metadata, recover_cache_swap, resolved_cached,
+        ring_tls_config, select_repo_path, swap_cache, validate_relative_path, write_cache_journal,
+        write_metadata,
     };
     use crate::config::source_from_reference;
 
@@ -939,6 +1050,9 @@ mod tests {
     fn test_transport(base: &str, token: Option<&str>) -> ReqwestGitHubTransport {
         ReqwestGitHubTransport {
             client: reqwest::blocking::Client::builder()
+                .tls_backend_preconfigured(
+                    mozilla_tls_config().unwrap_or_else(|error| unreachable!("{error}")),
+                )
                 .timeout(Duration::from_secs(2))
                 .build()
                 .unwrap_or_else(|error| unreachable!("{error}")),
@@ -946,6 +1060,94 @@ mod tests {
             api_base: base.into(),
             codeload_base: base.into(),
         }
+    }
+
+    fn test_ca(name: &str) -> (CertificateDer<'static>, Issuer<'static, KeyPair>) {
+        let mut params =
+            CertificateParams::new(Vec::new()).unwrap_or_else(|error| unreachable!("{error}"));
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.distinguished_name.push(DnType::CommonName, name);
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let key = KeyPair::generate().unwrap_or_else(|error| unreachable!("{error}"));
+        let certificate = params
+            .self_signed(&key)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        (certificate.der().clone(), Issuer::new(params, key))
+    }
+
+    fn test_server_certificate(
+        issuer: &Issuer<'static, KeyPair>,
+    ) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+        let mut params = CertificateParams::new(vec!["127.0.0.1".into()])
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "127.0.0.1");
+        params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+        params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ServerAuth);
+        let key = KeyPair::generate().unwrap_or_else(|error| unreachable!("{error}"));
+        let certificate = params
+            .signed_by(&key, issuer)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        (
+            certificate.der().clone(),
+            PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+        )
+    }
+
+    fn tls_server(
+        certificate: CertificateDer<'static>,
+        private_key: PrivateKeyDer<'static>,
+    ) -> (String, thread::JoinHandle<bool>) {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").unwrap_or_else(|error| unreachable!("{error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let config =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap_or_else(|error| unreachable!("{error}"))
+                .with_no_client_auth()
+                .with_single_cert(vec![certificate], private_key)
+                .unwrap_or_else(|error| unreachable!("{error}"));
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener
+                .accept()
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            let connection = ServerConnection::new(Arc::new(config))
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            let mut tls = StreamOwned::new(connection, stream);
+            let mut request = [0_u8; 1024];
+            if tls.read(&mut request).is_err() {
+                return false;
+            }
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .is_ok()
+        });
+        (format!("https://{address}"), handle)
+    }
+
+    fn tls_client(roots: rustls::RootCertStore) -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .tls_backend_preconfigured(
+                ring_tls_config(roots).unwrap_or_else(|error| unreachable!("{error}")),
+            )
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap_or_else(|error| unreachable!("{error}"))
     }
 
     #[test]
@@ -1048,6 +1250,48 @@ mod tests {
     }
 
     #[test]
+    fn cache_commit_record_failure_is_interrupted_and_retains_prior_journal() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
+        let destination = root.path().join("src_example");
+        let staging_root = root.path().join(".src_example.stage-pending");
+        let staged = staging_root.join("cache");
+        fs::create_dir_all(&staged).unwrap_or_else(|error| unreachable!("{error}"));
+        fs::create_dir_all(&destination).unwrap_or_else(|error| unreachable!("{error}"));
+        fs::write(destination.join("value"), "old").unwrap_or_else(|error| unreachable!("{error}"));
+        fs::write(staged.join("value"), "new").unwrap_or_else(|error| unreachable!("{error}"));
+        let result =
+            super::swap_cache_with_commit_hook(&destination, &staged, &staging_root, || {
+                Err(crate::error::SkillManagerError::InvalidInput(
+                    "commit record unavailable".into(),
+                ))
+            });
+        let error = result
+            .err()
+            .unwrap_or_else(|| unreachable!("commit recording must fail"));
+        assert!(error.to_string().contains("data is installed"));
+        assert!(error.to_string().contains("refresh interrupted"));
+        let paths = cache_swap_paths(&destination).unwrap_or_else(|error| unreachable!("{error}"));
+        let journal: CacheJournal = serde_json::from_slice(
+            &fs::read(&paths.journal).unwrap_or_else(|error| unreachable!("{error}")),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(matches!(journal.state, CacheSwapState::OldMoved));
+        assert!(staging_root.exists());
+        assert_eq!(
+            fs::read_to_string(destination.join("value"))
+                .ok()
+                .as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            fs::read_to_string(paths.backup.join("value"))
+                .ok()
+                .as_deref(),
+            Some("old")
+        );
+    }
+
+    #[test]
     fn cache_swap_covers_new_replacement_and_committed_recovery() {
         let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
         let destination = root.path().join("src_example");
@@ -1096,14 +1340,13 @@ mod tests {
     }
 
     #[test]
-    fn recovery_rejects_corrupt_paths_and_cleans_orphan_backup_without_journal() {
+    fn recovery_rejects_corrupt_paths_and_preserves_unowned_backup() {
         let root = tempfile::tempdir().unwrap_or_else(|error| unreachable!("{error}"));
         let destination = root.path().join("src_example");
         let paths = cache_swap_paths(&destination).unwrap_or_else(|error| unreachable!("{error}"));
         fs::create_dir(&paths.backup).unwrap_or_else(|error| unreachable!("{error}"));
-        recover_cache_swap(&destination, &paths.backup, &paths.journal)
-            .unwrap_or_else(|error| unreachable!("{error}"));
-        assert!(!paths.backup.exists());
+        assert!(recover_cache_swap(&destination, &paths.backup, &paths.journal).is_err());
+        assert!(paths.backup.exists());
 
         fs::write(&paths.journal, "{broken").unwrap_or_else(|error| unreachable!("{error}"));
         assert!(recover_cache_swap(&destination, &paths.backup, &paths.journal).is_err());
@@ -1225,5 +1468,45 @@ mod tests {
         let _requests = handle.join().unwrap_or_else(|_| unreachable!("server"));
 
         ReqwestGitHubTransport::new().unwrap_or_else(|error| unreachable!("{error}"));
+    }
+
+    #[test]
+    fn bundled_tls_accepts_an_explicit_fixture_root_and_rejects_it_in_production() {
+        let production_roots = mozilla_root_store().unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            production_roots.len(),
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS.len()
+        );
+
+        let (trusted_ca, issuer) = test_ca("trusted test root");
+        let (server_certificate, server_key) = test_server_certificate(&issuer);
+        let mut trusted_roots = rustls::RootCertStore::empty();
+        trusted_roots
+            .add(trusted_ca)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let trusted_client = tls_client(trusted_roots);
+        let (url, trusted_server) = tls_server(server_certificate.clone(), server_key.clone_key());
+        let body = trusted_client
+            .get(&url)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .and_then(reqwest::blocking::Response::text)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(body, "ok");
+        assert!(
+            trusted_server
+                .join()
+                .unwrap_or_else(|_| unreachable!("server"))
+        );
+
+        let production_transport =
+            ReqwestGitHubTransport::new().unwrap_or_else(|error| unreachable!("{error}"));
+        let (url, untrusted_server) = tls_server(server_certificate, server_key);
+        assert!(production_transport.client.get(&url).send().is_err());
+        assert!(
+            !untrusted_server
+                .join()
+                .unwrap_or_else(|_| unreachable!("server"))
+        );
     }
 }

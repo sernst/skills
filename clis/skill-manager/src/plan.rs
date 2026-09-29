@@ -142,11 +142,12 @@ pub fn diff_directory_maps(
 ) -> Result<DiffStat> {
     let mut files = Vec::new();
     for (relative, path) in before {
-        let old = std::fs::read(path).map_err(|error| SkillManagerError::io(path, error))?;
+        let old =
+            crate::fs_retry::read(path).map_err(|error| SkillManagerError::io(path, error))?;
         match after.get(relative) {
             None => files.push(deleted_delta(relative, &old)),
             Some(new_path) => {
-                let new = std::fs::read(new_path)
+                let new = crate::fs_retry::read(new_path)
                     .map_err(|error| SkillManagerError::io(new_path, error))?;
                 if old != new {
                     files.push(modified_delta(relative, &old, &new));
@@ -158,7 +159,8 @@ pub fn diff_directory_maps(
         if before.contains_key(relative) {
             continue;
         }
-        let new = std::fs::read(path).map_err(|error| SkillManagerError::io(path, error))?;
+        let new =
+            crate::fs_retry::read(path).map_err(|error| SkillManagerError::io(path, error))?;
         files.push(added_delta(relative, &new));
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
