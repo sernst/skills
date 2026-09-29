@@ -99,11 +99,20 @@ optional inactive location is a closed typed object:
 
 Local alternates contain exactly `type: "local"` and an absolute `path`.
 GitHub alternates contain exactly `type: "github"`, `owner`, `repo`, and
-optional `ref`/`repo_path`. Cross-type and unknown nested fields are errors,
+optional `ref`/`repo_path`/`branch_default`. A branch default is either
+`{"type":"repository-default"}` or
+`{"type":"branch","name":"release/stable"}`. The same optional
+`branch_default` field is flattened beside an active GitHub location. Its
+absence is the legacy state: the first actual branch change records the
+location's current ref, or the repository-default sentinel when `ref` is
+absent. Each location carries its own baseline through `source swap`.
+Cross-type and unknown nested fields are errors,
 while source-wide extension fields remain preserved. Active and alternate
 identities must differ. Local identities are absolute and platform-aware
 (case-insensitive on Windows); GitHub owner/repo are case-insensitive while ref
-and repository path remain case-sensitive.
+and repository path remain case-sensitive. The saved branch baseline is state,
+not location identity, so changing only that baseline is a valid update and
+does not create a location collision.
 
 ## Backups, reset, and restore
 
@@ -131,8 +140,11 @@ content is an error.
 GitHub source content is keyed by stable source ID below
 `cache/<source-id>/content`; `metadata.json` records fetch time, resolved ref,
 and normalized complete remote identity (`owner`, `repo`, `ref`, and
-`repo_path`). Reuse requires fresh metadata, content, and an exact identity
-match. Missing legacy identity metadata or a mismatch refreshes, including
+`repo_path`). Metadata also carries an opaque source generation. Every actual
+branch change advances that generation, including switches away and back before
+materialization. Reuse requires fresh metadata, content, an exact identity
+match, and the current generation. Missing legacy identity metadata or a
+mismatch refreshes, including
 during dry runs; refresh failure never falls back to mismatched content. Cache
 directories remain keyed by stable source ID, and switching to local leaves
 remote content available for a later matching swap. `GITHUB_TOKEN` is preferred

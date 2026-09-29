@@ -279,6 +279,11 @@ fn known_leaf_args(leaf: &[String], home: &Path) -> Option<Vec<String>> {
             "nonexistent-source".to_owned(),
             home.join("synthetic-alternate").display().to_string(),
         ]),
+        ["source", "branch"] => Some(vec![
+            "nonexistent-source".to_owned(),
+            "synthetic-branch".to_owned(),
+            "--yes".to_owned(),
+        ]),
         ["target", "add"] => Some(vec![
             "synthetic-target".to_owned(),
             "synthetic-target-dir".to_owned(),
