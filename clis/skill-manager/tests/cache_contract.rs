@@ -38,6 +38,10 @@ impl GitHubTransport for ArchiveTransport {
         Ok("main".into())
     }
 
+    fn validate_branch(&self, _owner: &str, _repo: &str, _branch: &str) -> Result<()> {
+        Ok(())
+    }
+
     fn download_archive(
         &self,
         _owner: &str,
@@ -57,6 +61,13 @@ struct FailingTransport;
 impl GitHubTransport for FailingTransport {
     fn default_branch(&self, _owner: &str, _repo: &str) -> Result<String> {
         Ok("main".into())
+    }
+
+    fn validate_branch(&self, owner: &str, repo: &str, branch: &str) -> Result<()> {
+        Err(SkillManagerError::GitHub {
+            reference: format!("{owner}/{repo}:{branch}"),
+            message: "simulated network failure".into(),
+        })
     }
 
     fn download_archive(
@@ -87,6 +98,8 @@ fn github_source(id: &str, ttl: i64) -> SourceEntry {
         repo: Some("repo".into()),
         r#ref: None,
         repo_path: None,
+        branch_default: None,
+        cache_generation: 0,
         alternate: None,
         extra: IndexMap::new(),
     }
@@ -501,6 +514,38 @@ fn remote_to_local_to_same_remote_reuses_the_matching_stable_id_cache() {
         materialize_source(&repository, &transport, &remote, false, false).expect("reuse remote");
     assert!(reused.from_cache);
     assert_eq!(transport.downloads.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn branch_generation_forces_refresh_after_switching_away_and_back_without_materializing() {
+    let home = tempfile::tempdir().expect("temporary home");
+    let archive = home.path().join("source.tar.gz");
+    write_regular_archive(&archive, b"# original branch");
+    let repository = FileConfigRepository::new(home.path());
+    let transport = ArchiveTransport::new(archive);
+    let mut source = github_source("stable-id", 24);
+    source.r#ref = Some("feature/x".into());
+    materialize_source(&repository, &transport, &source, false, false)
+        .expect("seed feature branch cache");
+
+    // Two applied branch changes occurred without an intervening materialization:
+    // feature/x -> release/y -> feature/x.
+    source.cache_generation = 2;
+
+    let result = materialize_source(&repository, &FailingTransport, &source, false, false);
+    assert!(
+        result.is_err(),
+        "returning to the same ref after two switches must not revive generation-zero cache"
+    );
+    assert_eq!(
+        fs::read_to_string(
+            repository
+                .cache_root()
+                .join("stable-id/content/alpha/SKILL.md")
+        )
+        .expect("old cache remains recoverable"),
+        "# original branch"
+    );
 }
 
 #[test]

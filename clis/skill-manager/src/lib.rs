@@ -17,6 +17,8 @@ pub mod domain;
 pub mod error;
 /// Human and machine reporting.
 pub mod event;
+/// Bounded, primitive-level filesystem retries.
+pub mod fs_retry;
 /// Shared pre-mutation change plans.
 pub mod plan;
 /// Interactive input boundary.
@@ -27,6 +29,7 @@ pub mod recipe;
 pub mod review;
 /// Skill discovery and status helpers.
 pub mod skills;
+mod staging;
 /// Human-readable status table rendering.
 pub mod status;
 /// Isolated migration from historical flat storage locations.

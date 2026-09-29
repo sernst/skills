@@ -258,6 +258,27 @@ Exchange active and inactive locations. Required: `source`.
 {"command":"source.swap","source":"team"}
 ```
 
+<!-- recipe-command: source.branch fields: alternate,branch,command,default,dry_run,no_input,source,yes -->
+### `source.branch`
+
+Change a GitHub source branch or restore its saved manager-local baseline.
+Required: `source`. Optional: `branch` (`string`), `alternate`, `dry_run`, and
+`yes` (`bool`). `default:true` requires `branch` and saves that branch as the
+new baseline. Omit `branch` to restore the existing baseline. `alternate:true`
+selects the inactive location; otherwise the active GitHub location is used,
+except that a sole GitHub alternate is inferred when the active location is
+local. The branch is validated remotely before any plan or configuration save.
+An actual branch or saved-default change requires `yes:true`; omit `yes` only
+for `dry_run:true` or a request expected to be a validated no-op.
+
+```json
+{"command":"source.branch","source":"team","branch":"release/2026","default":true,"dry_run":true}
+```
+
+```json
+{"command":"source.branch","source":"team","yes":true}
+```
+
 ## Target recipes
 
 Target paths are non-empty root-relative templates. Absolute paths, traversal,
