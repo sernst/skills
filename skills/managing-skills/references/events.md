@@ -82,10 +82,16 @@ The comments in this section are machine-checked against production emit sites.
 - `source.alternate-cleared`: inactive location removed or already absent.
 <!-- event: source.alternate-set -->
 - `source.alternate-set`: inactive location set or already equal.
+<!-- event: source.branch-set -->
+- `source.branch-set`: GitHub branch or manager-local branch baseline saved.
+<!-- event: source.branch-unchanged -->
+- `source.branch-unchanged`: validated branch and baseline already selected.
 <!-- event: source.listed -->
 - `source.listed`: one stored source.
 <!-- event: source.location-set -->
 - `source.location-set`: active source location changed or unchanged.
+<!-- event: source.relocation-candidate -->
+- `source.relocation-candidate`: unresolved physical copy candidate and default selection.
 <!-- event: source.locations-swapped -->
 - `source.locations-swapped`: active and inactive locations exchanged.
 <!-- event: source.removed -->
@@ -115,6 +121,9 @@ The comments in this section are machine-checked against production emit sites.
 <!-- payload: source-location fields: source,source_type -->
 <!-- payload: source-previous fields: alternate,source,source_type -->
 <!-- payload: source-change fields: alternate,changed,mode,previous,source,source_id,source_label,source_name,source_type -->
+<!-- payload: source-relocation-candidate fields: default_selected,effect,from,originals_retained,selection_resolved,skill,source_id,source_name,to -->
+<!-- payload: source-branch-set fields: branch,cache_refresh,changed,default,resolved_branch,slot,source,source_id -->
+<!-- payload: source-branch-unchanged fields: branch,changed,default,resolved_branch,slot,source,source_id -->
 `source.added`, `source.removed`, and `source.listed` contain one flattened
 source object (source identity is not nested):
 
@@ -139,6 +148,22 @@ source object (source identity is not nested):
 (`bool`) and `previous`, where `previous` contains exactly `source`,
 `source_type`, and `alternate`. These event payloads do not expose exclusions
 or cache TTL.
+
+After a committed relocation batch, `source.location-set` additionally reports
+nonzero `copied` and `unchanged` counts and `originals_retained:true`. These
+optional fields are absent from location-only changes and location no-ops.
+No success event is emitted for a failed precommit batch.
+`source.relocation-candidate` contains `source_id`, `source_name`, `skill`,
+`from`, `to`, `effect` (`create` or `replace-if-different`),
+`default_selected`, `selection_resolved:false`, and `originals_retained:true`.
+It is a preview for an unresolved checklist, including unresolved JSON dry runs,
+and does not claim a chosen or authorized action.
+
+`source.branch-set` and `source.branch-unchanged` identify the stable source,
+selected `slot` (`active` or `alternate`), configured `branch` (`null` means
+follow the repository default), concrete `resolved_branch`, and typed saved
+`default`. A set event also reports whether `cache_refresh` was required.
+Neither event claims a GitHub repository-default mutation or local checkout.
 
 <!-- payload: target fields: builtin,enabled,label,legacy_override,name,path -->
 <!-- payload: target-removed fields: name -->
@@ -363,6 +388,7 @@ command, such as `remove`, `update`, `import`, `configs.reset`, or
 <!-- payload: summary-resolve fields: action,resolved -->
 <!-- payload: summary-describe fields: action,skills,sources -->
 <!-- payload: summary-configs-copy fields: action,dry_run,items,merged,new,skipped,skipped_linked -->
+<!-- payload: summary-source-branch fields: action,applied,dry_run,planned,unchanged -->
 `summary.data` has one of these exact shapes:
 
 - `source.list`: `{sources}`;
@@ -383,17 +409,22 @@ command, such as `remove`, `update`, `import`, `configs.reset`, or
   copied, so an identical repeat copy reports `new: 0, merged: 0` and only
   `skipped`. On an error exit the `summary` is still emitted before
   `command.failed`, counting only what was committed before the failure.
+- `source.branch`: `{action,planned,applied,unchanged,dry_run}`. `planned` is
+  `1` only when a nonempty branch/default plan was emitted, `applied` is `1`
+  only after the atomic configuration save, and `unchanged` is `1` only for
+  the validated no-op path.
 
 Other source, target, and configuration lifecycle commands finish with their
-specific event and do not emit `summary`; `configs copy` is the one
-configuration-lifecycle exception, since it is a seeding/merge operation
+specific event and do not emit `summary`; `configs copy` and `source branch`
+are the exceptions. The branch summary distinguishes dry-run, cancelled,
+applied, and validated no-op results. `configs copy` is a seeding/merge operation
 whose final counts (directories new vs. merged) fit the shared `summary`
 vocabulary the same way `copy`'s do. Do not require `summary` as a generic
 success condition.
 
 <!-- payload: plan fields: authorization,command,decisions,destinations,dry_run,entries,plan_id,revision,selection,summary -->
-`plan` and `plan.updated` share one payload. `plan_id` correlates every revision
-of the same decision; `revision` starts at `0` and increments once per
+Deployment `plan` and `plan.updated` events share this payload. `plan_id`
+correlates every revision of the same decision; `revision` starts at `0` and increments once per
 re-render. Unlike the human rendering, this payload is never significance-gated:
 `selection.targets.names` always lists every selected target, so a target that
 was selected but had no work is distinguishable from one that was never
@@ -414,12 +445,22 @@ unresolved scope branch is the only current source of `available`: while the
 branch is open an entry's `actions` is empty and `available` lists every
 deployment id the skill occupies; once resolved (explicit scope, `--both`, or
 a made selection) those become concrete `"operation": "remove"` actions.
-`load`, `update`, `copy`, `remove`, and `import` all emit `plan`/`plan.updated`.
+`load`, `update`, `copy`, `remove`, and `import` all emit this shared
+`plan`/`plan.updated` shape.
 `remove` always emits a single revision `0`: its one decision is resolved by
 one prompt, never a re-rendered sequence, so it never emits `plan.updated`.
 `import` is the only command whose plan can resolve more than one decision
 across successive revisions (`authorization.kind: "progressive"`), so it is
 the only command that can emit `plan.updated`.
+
+`source.branch` emits a compact `plan` revision `0` only when the validated
+request would change the configured branch or saved baseline. Its top-level
+fields are `command`, `revision`, `authorization`, `items`, and `summary`.
+The single item records source identity, selected active/alternate slot and
+whether it is inactive, repository and subpath, configured old/new branches,
+resolved concrete branch, typed old/new defaults, and whether the next cache
+use must refresh. Its summary counts sources, branch changes, and default
+changes. An unchanged branch request emits no empty plan or prompt.
 
 `decisions` is present whenever the plan carries dimensions and describes all of
 them, resolved and pending alike, so the payload matches the plan the user

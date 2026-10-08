@@ -262,12 +262,16 @@ fn locate_aliases_update_location_atomically_and_salted_add_reuses_the_old_locat
     ] {
         let result = events(
             cli(home.path())
-                .args(["--json", "source", alias, "personal", location])
+                .args(["--json", "source", alias, "personal", location, "--yes"])
                 .output()
                 .expect("locate alias"),
         );
-        assert_eq!(result[0]["event"], "source.location-set");
-        assert_eq!(result[0]["data"]["changed"], true);
+        assert_eq!(result[0]["event"], "plan");
+        let changed = result
+            .iter()
+            .find(|event| event["event"] == "source.location-set")
+            .expect("location event");
+        assert_eq!(changed["data"]["changed"], true);
     }
 }
 
@@ -360,7 +364,7 @@ fn github_pairs_replace_and_inactive_selectors_are_rejected_before_ad_hoc_fallba
     let local = home.path().join("local");
     add_local(home.path(), &local, "personal");
     cli(home.path())
-        .args(["source", "locate", "personal", "owner/active"])
+        .args(["source", "locate", "personal", "owner/active", "--yes"])
         .assert()
         .success();
     cli(home.path())

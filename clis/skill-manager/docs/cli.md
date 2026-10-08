@@ -6,6 +6,9 @@ Running without a command is `status`; `ls` and `list` are aliases. `--json`
 emits NDJSON and implies `--no-input`. `--verbose` adds advanced human details
 and full import paths without changing JSON. `--color auto` colors only a TTY
 and honors `NO_COLOR`; `always` colors even redirected output; `never` is plain.
+Interactive terminals use radio and checklist controls where a command exposes
+a genuine selection editor. `--plain-prompts` keeps the accessible numbered
+line interface; redirected streams and `TERM=dumb` use it automatically.
 `--home DIR` overrides the manager home for the whole invocation, ahead of
 `SKILL_MANAGER_HOME` and the operating system home; a relative value (and a
 relative `SKILL_MANAGER_HOME`) is normalized to an absolute, lexically clean
@@ -260,12 +263,88 @@ and the active location are updated atomically with `source update`;
 `--location LOCATION` can be combined with metadata flags. IDs do not change
 when a source moves.
 
-`source locate SOURCE LOCATION` is the location-only spelling, with aliases
+`source locate SOURCE LOCATION` changes the active location, with aliases
 `relocate`, `move`, and `mv`. `source alternate SOURCE LOCATION` saves or
 replaces an inactive location, while `source alternate SOURCE --clear` removes
 it. `source swap SOURCE` exchanges active and inactive locations. Local/local,
 local/GitHub, and GitHub/GitHub pairs are supported, and local paths need not
 exist yet. A swap requires an alternate.
+
+### Local source relocation copies
+
+For local-to-local relocation, copying retains originals and includes every
+valid physical skill, even skills excluded from ordinary load/update. Only
+complete skill directories are copied; source-root README, Git and build files
+are omitted. Selected collisions replace whole directories, removing old extra
+files. Destination-only skills and root files are preserved. A single-skill
+source copies directly to LOCATION.
+
+Bare interactive locate previews candidate effects, then opens a checklist
+with missing skills selected and replacements unchecked. After selection it
+renders the exact copy and location plan before one confirmation. Empty
+selection explicitly means configuration only and creates no directories.
+
+- `--copy` selects missing skills only.
+- `--all` selects every physical skill, including replacements.
+- `--missing` selects missing skills and can be combined with specific replacements.
+- Repeat `--skill NAME` for exact names or `--filter PATTERN` (visible alias
+  `--include`) for patterns. Positive selectors imply copying. Unknown exact
+  names fail; unmatched patterns warn when other selections survive and fail
+  when the positive selection matches nothing.
+- Repeat `--exclude PATTERN`; exclusions apply last. Deliberately excluding
+  every selected skill produces a truthful configuration-only final plan.
+- `--no-copy` conflicts with all copy selectors and changes only configuration,
+  including when the old local source directory is missing.
+- `--dry-run` never copies or changes configuration. Resolved selections show
+  the exact final plan; unresolved selections show candidates and flag guidance.
+- `--yes` authorizes a resolved plan and cannot choose skills. JSON, recipes,
+  and `--no-input` require explicit selection plus `--yes` for actual changes.
+
+```text
+skill-manager source locate personal /work/skills --copy --yes
+skill-manager source locate personal /work/skills --missing --skill alpha --yes
+skill-manager source locate personal /work/skills --all --exclude 'draft-*' --dry-run
+skill-manager source locate personal /work/skills --no-copy --yes
+```
+
+All selected trees are staged before any placement. Configuration changes only
+after every placement succeeds; any precommit failure restores the entire
+batch. Bounded filesystem retries may leave a journal when an OS handle blocks
+rollback or cleanup. A later applicable relocation first shows the exact pending
+recovery plan and obtains authorization, then prepares a fresh relocation plan.
+This rare safety phase can add a recovery confirmation before the checklist and
+final confirmation. Dry-run, cancellation, location no-ops, and `--no-copy` do
+not retry recovery. Committed recovery cleans only recorded owned scratch paths
+and preserves subsequent edits. Recovery never sweeps manager-looking prefixes.
+Overlapping paths, selected files/links/reparse points, case-folded collisions,
+duplicate source identities and changed review evidence fail before replacement.
+Missing destination parents are created under recorded ownership and removed
+only when empty during rollback. `source update --location` remains configuration
+only and does not gain copy selection.
+
+### GitHub source branches
+
+`source branch SOURCE [BRANCH]` changes the branch of a GitHub location without
+changing its repository, repository subpath, source identity, mode, or
+exclusions. A branch can contain `/`. The first change records the location's
+current branch as its manager-local baseline; omitting `BRANCH` later restores
+that baseline. `BRANCH --default` changes the branch and replaces the saved
+baseline. A location that originally followed the repository default keeps that
+choice as a distinct baseline: restoring it resolves and validates the
+repository's current default branch, then continues to follow future repository
+default changes. The command never changes the default branch on GitHub or a
+local Git checkout. An actual noninteractive change requires `--yes`; dry-run
+and validated no-op requests do not.
+
+The active GitHub location is selected by default. `--alternate` explicitly
+selects the inactive location. When the active location is local and the only
+GitHub location is the alternate, the command infers that alternate and marks
+it as inactive in the plan; the source remains local after the change. A
+selected local location is an error. The requested or resolved branch is
+checked on GitHub before the plan is emitted, so an inaccessible branch leaves
+the configuration unchanged. A branch change makes the existing remote cache
+ineligible and refreshes it on the next materialization; dry-run, cancellation,
+and unchanged requests do not modify configuration or cache eligibility.
 
 Source selectors are a stable ID, name, unique label, or active location.
 Inactive locations are deliberately not selectors. A newly set active or
@@ -562,3 +641,41 @@ and its `configs.copy.item`/`summary` events.
 
 See [configuration and migration](configuration.md) for storage and backup
 details, and [the JSON contract](json.md) for automation.
+
+## Temporary filesystem locks and cleanup
+
+Brief filesystem sharing/locking failures are retried silently, with an
+immediate first attempt and at most 775ms of backoff per primitive. A lasting
+failure names its filesystem path and underlying error. Normal permission and
+validation problems are not fixed by retrying.
+
+A committed import, deployment, removal, or cache refresh can succeed while
+cleanup remains blocked. The warning explicitly says the change committed,
+names the recovery journal, and explains when internal recovery can retry
+cleanup. Skill cleanup is retried when a later operation applies that skill;
+commands that stop at a no-op or discovery do not retry it. Cache cleanup is
+retried on a later source access outside a dry run. Do not repeat an import
+solely to reapply already committed content; preserve any edits made after
+that commit. Recovery itself
+only finishes housekeeping and does not replay the committed replacement.
+
+If replacement data is installed but recording the committed state fails, the
+command reports an interrupted operation instead of success. Preserve its
+reported journal and backup: recovery of the recorded prior state may restore
+prior content.
+
+There is no separate recovery command or automatic recovery before discovery.
+If a process stops after moving an import source to its backup, the missing
+source can prevent subsequent discovery from reaching internal recovery.
+Preserve that backup and journal while diagnosing the interrupted operation.
+
+A staging directory or backup without an ownership journal/receipt is never
+swept by its name. Inspect any reported unowned path and move it aside before
+retrying. Older unjournaled temporary directories are not automatically deleted.
+
+Dry-run remote sources use invocation-owned system temporary directories, with
+bounded cleanup when the final reference is released. An exhausted finalizer
+reports the exact scratch path on stderr, keeping NDJSON stdout intact. No
+manager-home cleanup record is written by that dry-run finalizer. Abrupt process
+termination can still leave unowned system-temp or atomic-write temporary files;
+these are not removed based only on a filename prefix.

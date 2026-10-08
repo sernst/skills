@@ -19,16 +19,10 @@
 //! step.
 
 use crate::error::{Result, SkillManagerError};
-use crate::prompt::Prompt;
+use crate::prompt::{Prompt, PromptChoice, PromptOutcome};
 
 /// Token that cancels any selection prompt.
 pub const CANCEL_TOKEN: &str = "c";
-
-/// Maximum invalid answers before a selection prompt gives up.
-///
-/// An invalid or empty answer must reprompt and must never select, but a closed
-/// or non-interactive stream would otherwise loop forever.
-const MAX_ATTEMPTS: usize = 4;
 
 /// Outcome of one authorization step.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,9 +95,10 @@ impl<'a, P: Prompt> Authorizer<'a, P> {
 
     /// Resolve exactly one dimension from one token on a rendered option line.
     ///
-    /// No option is preselected when every option is destructive or
-    /// authoritative, so pressing Enter reprompts and never authorizes. A
-    /// recommendation is guidance printed with the plan, never consent.
+    /// No destructive or authoritative option is preselected. In line mode,
+    /// pressing Enter reprompts; in widget mode, it chooses the explicit
+    /// `Cancel` row. Either way, Enter alone never authorizes. A recommendation
+    /// is guidance printed with the plan, never consent.
     ///
     /// # Errors
     ///
@@ -119,23 +114,19 @@ impl<'a, P: Prompt> Authorizer<'a, P> {
                 "a selection prompt needs at least one rendered option".into(),
             ));
         }
-        let hint = reprompt_hint(options);
-        for _ in 0..MAX_ATTEMPTS {
-            let answer = self.prompt.exact_text(question)?.trim().to_owned();
-            if answer.eq_ignore_ascii_case(CANCEL_TOKEN) {
-                return Ok(Authorization::Cancelled);
+        let prompt_choices = options
+            .iter()
+            .map(|option| PromptChoice::new(&option.token, &option.label))
+            .collect::<Vec<_>>();
+        match self.prompt.select_one(question, &prompt_choices)? {
+            PromptOutcome::Submitted(index) if index < options.len() => {
+                Ok(Authorization::Approved(index))
             }
-            if let Some(index) = options
-                .iter()
-                .position(|option| option.token.eq_ignore_ascii_case(&answer))
-            {
-                return Ok(Authorization::Approved(index));
-            }
-            self.prompt.note(&hint)?;
+            PromptOutcome::Submitted(_) => Err(SkillManagerError::InvalidInput(
+                "selection prompt returned an out-of-range option".into(),
+            )),
+            PromptOutcome::Cancelled => Ok(Authorization::Cancelled),
         }
-        Err(SkillManagerError::InteractionRequired(format!(
-            "no option was selected; {hint}"
-        )))
     }
 }
 
@@ -172,7 +163,7 @@ mod tests {
 
     use super::{Authorization, Authorizer, SelectionOption, reprompt_hint, selection_range};
     use crate::error::Result;
-    use crate::prompt::Prompt;
+    use crate::prompt::{Prompt, PromptChoice, PromptOutcome};
 
     #[derive(Default)]
     struct ScriptedPrompt {
@@ -217,6 +208,30 @@ mod tests {
             SelectionOption::numbered(1, "Remove global copies", true),
             SelectionOption::numbered(2, "Remove both copies", true),
         ]
+    }
+
+    struct OutOfRangePrompt;
+
+    impl Prompt for OutOfRangePrompt {
+        fn confirm(&mut self, _message: &str, default: bool) -> Result<bool> {
+            Ok(default)
+        }
+
+        fn text(&mut self, _message: &str, default: Option<&str>) -> Result<String> {
+            Ok(default.unwrap_or_default().to_owned())
+        }
+
+        fn choose(&mut self, _message: &str, _choices: &[String]) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn select_one(
+            &mut self,
+            _message: &str,
+            choices: &[PromptChoice],
+        ) -> Result<PromptOutcome<usize>> {
+            Ok(PromptOutcome::Submitted(choices.len()))
+        }
     }
 
     #[test]
@@ -277,5 +292,14 @@ mod tests {
         assert_eq!(selection_range(&options()[..1]), "1, c to cancel");
         assert_eq!(reprompt_hint(&options()), "Enter 1, 2, 3, or c.");
         assert_eq!(reprompt_hint(&options()[..1]), "Enter 1 or c.");
+    }
+
+    #[test]
+    fn authorizer_rejects_an_out_of_range_prompt_adapter_result() {
+        assert!(
+            Authorizer::new(&mut OutOfRangePrompt)
+                .select("Select removal scope", &options())
+                .is_err()
+        );
     }
 }

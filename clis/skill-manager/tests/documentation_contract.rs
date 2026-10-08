@@ -171,7 +171,12 @@ fn source_recipe_fields(source: &str) -> BTreeMap<String, BTreeSet<String>> {
             "SourceAction::Alternate",
             Some("SourceAction::Swap"),
         ),
-        ("source.swap", "SourceAction::Swap", None),
+        (
+            "source.swap",
+            "SourceAction::Swap",
+            Some("SourceAction::Branch"),
+        ),
+        ("source.branch", "SourceAction::Branch", None),
     ] {
         recipes.insert(
             name.to_owned(),
@@ -557,7 +562,7 @@ fn config_and_summary_payload_references_match_production_emit_sites() {
     );
 
     let summaries = event_json_payloads(app, "summary");
-    assert_eq!(summaries.len(), 9, "production summary emit-site count");
+    assert_eq!(summaries.len(), 10, "production summary emit-site count");
     let summary_fields = summaries
         .iter()
         .map(|payload| object_fields(payload))
@@ -572,6 +577,7 @@ fn config_and_summary_payload_references_match_production_emit_sites() {
         ("summary-resolve", 1),
         ("summary-describe", 1),
         ("summary-configs-copy", 1),
+        ("summary-source-branch", 1),
     ] {
         let expected = documented
             .get(marker)
@@ -672,6 +678,8 @@ fn every_production_event_has_a_source_derived_payload_family() {
         ("collision.detected", "collision-detected", 1),
         ("collision.resolved", "collision-resolved", 1),
         ("command.cancelled", "command-cancelled", 1),
+        ("source.branch-set", "source-branch-set", 1),
+        ("source.branch-unchanged", "source-branch-unchanged", 1),
     ] {
         let payloads = event_json_payloads(app, event);
         assert_eq!(payloads.len(), count, "{event} emit-site count");
@@ -729,8 +737,11 @@ fn every_production_event_has_a_source_derived_payload_family() {
         ("source.added", "source"),
         ("source.alternate-cleared", "source-change"),
         ("source.alternate-set", "source-change"),
+        ("source.branch-set", "source-branch-set"),
+        ("source.branch-unchanged", "source-branch-unchanged"),
         ("source.listed", "source"),
         ("source.location-set", "source-change"),
+        ("source.relocation-candidate", "source-relocation-candidate"),
         ("source.locations-swapped", "source-change"),
         ("source.removed", "source"),
         ("source.updated", "source-change"),

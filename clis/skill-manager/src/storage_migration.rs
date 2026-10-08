@@ -4,8 +4,7 @@
 //! be deleted after the legacy adoption window without changing configuration
 //! parsing, target resolution, or backup/restore behavior.
 
-use std::fs;
-use std::io::Write;
+use crate::fs_retry as fs;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -271,13 +270,10 @@ fn migrate_v0_backups(paths: &LayoutPaths, result: &mut LayoutMigrationResult) -
         }
         fs::create_dir_all(&paths.backups)
             .map_err(|error| SkillManagerError::io(&paths.backups, error))?;
-        let staging = tempfile::Builder::new()
-            .prefix(".legacy-backup-")
-            .tempdir_in(&paths.backups)
-            .map_err(|error| SkillManagerError::io(&paths.backups, error))?;
-        let staged_raw = staging.path().join("config.raw");
-        write_synced_file(&staged_raw, &bytes)?;
-        let metadata = serde_json::to_vec_pretty(&json!({
+        crate::staging::with_directory(&paths.backups, "legacy-backup", |staging| {
+            let staged_raw = staging.join("config.raw");
+            write_synced_file(&staged_raw, &bytes)?;
+            let metadata = serde_json::to_vec_pretty(&json!({
             "id": &id,
             "created_at": Utc::now(),
             "reason": "legacy-v0-migration",
@@ -289,12 +285,13 @@ fn migrate_v0_backups(paths: &LayoutPaths, result: &mut LayoutMigrationResult) -
             "valid": serde_json::from_slice::<serde_json::Value>(&bytes).is_ok()
         }))
         .map_err(|error| SkillManagerError::InvalidInput(error.to_string()))?;
-        let staged_metadata = staging.path().join("metadata.json");
-        write_synced_file(&staged_metadata, &metadata)?;
-        sync_directory(staging.path())?;
-        fs::rename(staging.keep(), &directory)
-            .map_err(|error| SkillManagerError::io(&directory, error))?;
-        sync_directory(&paths.backups)?;
+            let staged_metadata = staging.join("metadata.json");
+            write_synced_file(&staged_metadata, &metadata)?;
+            sync_directory(staging)?;
+            fs::rename(staging, &directory)
+                .map_err(|error| SkillManagerError::io(&directory, error))?;
+            sync_directory(&paths.backups)
+        })?;
         fs::remove_file(&source).map_err(|error| SkillManagerError::io(&source, error))?;
         result.migrated.push(LayoutMigrationItem {
             component: "backup",
@@ -359,30 +356,18 @@ fn copy_file_atomic(source: &Path, destination: &Path) -> Result<()> {
 }
 
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        SkillManagerError::InvalidInput(format!("path has no parent: {}", path.display()))
-    })?;
-    fs::create_dir_all(parent).map_err(|error| SkillManagerError::io(parent, error))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| SkillManagerError::io(parent, error))?;
-    temporary
-        .write_all(bytes)
-        .and_then(|()| temporary.as_file().sync_all())
-        .map_err(|error| SkillManagerError::io(temporary.path(), error))?;
-    temporary
-        .persist(path)
-        .map_err(|error| SkillManagerError::io(path, error.error))?;
-    sync_directory(parent)
+    fs::atomic_write(path, bytes).map_err(|error| SkillManagerError::io(path, error))?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
 }
 
 fn write_synced_file(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::write(path, bytes)
         .and_then(|()| {
-            fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)?
-                .sync_all()
+            fs::retry(|| fs::OpenOptions::new().read(true).write(true).open(path))
+                .and_then(|file| fs::retry(|| file.sync_all()))
         })
         .map_err(|error| SkillManagerError::io(path, error))
 }
@@ -394,10 +379,8 @@ fn sync_directory(path: &Path) -> Result<()> {
     // still flushed before replacement; Unix additionally flushes the entry.
     #[cfg(unix)]
     {
-        let directory = fs::File::open(path).map_err(|error| SkillManagerError::io(path, error))?;
-        directory
-            .sync_all()
-            .map_err(|error| SkillManagerError::io(path, error))?;
+        let directory = fs::open(path).map_err(|error| SkillManagerError::io(path, error))?;
+        fs::retry(|| directory.sync_all()).map_err(|error| SkillManagerError::io(path, error))?;
     }
     #[cfg(not(unix))]
     let _ = path;
