@@ -1440,11 +1440,11 @@ mod tests {
             match target.action {
                 TargetAction::Add(args) => {
                     assert_eq!(args.name.as_deref(), Some("custom"));
-                    assert!(!args.first.is_empty());
+                    assert_ne!(args.first.len(), 0);
                 }
                 TargetAction::SetPath(args) => {
                     assert_eq!(args.name, "custom");
-                    assert!(!args.path.as_os_str().is_empty());
+                    assert_ne!(args.path.as_os_str().len(), 0);
                 }
                 TargetAction::Enable(args)
                 | TargetAction::Disable(args)

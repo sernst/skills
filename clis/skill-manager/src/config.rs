@@ -2402,7 +2402,7 @@ mod tests {
             .load(false)
             .unwrap_or_else(|error| unreachable!("{error}"));
         assert!(!loaded.persisted);
-        assert!(loaded.config.exclude.is_empty());
+        assert_eq!(loaded.config.exclude.len(), 0);
         assert!(repository.layout_paths.python_flat_config.exists());
         assert_eq!(
             std::fs::read(repository.cache_root.join("entry"))
@@ -2587,11 +2587,12 @@ mod tests {
                 bytes
             );
             assert!(!path.exists());
-            assert!(
+            assert_eq!(
                 repository
                     .list_backups()
                     .unwrap_or_else(|error| unreachable!("{error}"))
-                    .is_empty()
+                    .len(),
+                0
             );
         }
     }
@@ -3244,11 +3245,12 @@ mod tests {
                 original
             );
             assert!(!config_path.exists());
-            assert!(
+            assert_eq!(
                 repository
                     .list_backups()
                     .unwrap_or_else(|error| unreachable!("{error}"))
-                    .is_empty()
+                    .len(),
+                0
             );
         }
     }
@@ -3346,11 +3348,12 @@ mod tests {
                 bytes
             );
             assert!(!path.exists());
-            assert!(
+            assert_eq!(
                 repository
                     .list_backups()
                     .unwrap_or_else(|error| unreachable!("{error}"))
-                    .is_empty()
+                    .len(),
+                0
             );
         }
     }

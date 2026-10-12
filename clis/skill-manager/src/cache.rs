@@ -105,6 +105,27 @@ pub struct ReqwestGitHubTransport {
     codeload_base: String,
 }
 
+fn tls_client_config(
+    roots: rustls::RootCertStore,
+) -> std::result::Result<rustls::ClientConfig, rustls::Error> {
+    // Reqwest 0.13 defaults to platform trust and aws-lc. Keep the previous
+    // rustls-tls policy: Mozilla roots, ring, TLS 1.2/1.3, and full verification.
+    rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map(|builder| builder.with_root_certificates(roots).with_no_client_auth())
+}
+
+fn github_client_builder() -> Result<reqwest::blocking::ClientBuilder> {
+    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls = tls_client_config(roots).map_err(|error| SkillManagerError::GitHub {
+        reference: "github.com".into(),
+        message: error.to_string(),
+    })?;
+    Ok(Client::builder().tls_backend_preconfigured(tls))
+}
+
 impl ReqwestGitHubTransport {
     /// Create a production GitHub transport.
     ///
@@ -112,7 +133,7 @@ impl ReqwestGitHubTransport {
     ///
     /// Returns an error when the bounded HTTP client cannot be constructed.
     pub fn new() -> Result<Self> {
-        let client = Client::builder()
+        let client = github_client_builder()?
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_mins(2))
             .user_agent(concat!("skill-manager/", env!("CARGO_PKG_VERSION")))
@@ -938,13 +959,181 @@ mod tests {
 
     fn test_transport(base: &str, token: Option<&str>) -> ReqwestGitHubTransport {
         ReqwestGitHubTransport {
-            client: reqwest::blocking::Client::builder()
+            client: super::github_client_builder()
+                .unwrap_or_else(|error| unreachable!("{error}"))
+                .no_proxy()
                 .timeout(Duration::from_secs(2))
                 .build()
                 .unwrap_or_else(|error| unreachable!("{error}")),
             token: token.map(ToOwned::to_owned),
             api_base: base.into(),
             codeload_base: base.into(),
+        }
+    }
+
+    fn tls_server(
+        certificate: &'static [u8],
+        protocol: &'static rustls::SupportedProtocolVersion,
+    ) -> (u16, thread::JoinHandle<bool>) {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").unwrap_or_else(|error| unreachable!("{error}"));
+        let port = listener
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("{error}"))
+            .port();
+        listener
+            .set_nonblocking(true)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[protocol])
+        .unwrap_or_else(|error| unreachable!("{error}"))
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![rustls::pki_types::CertificateDer::from(
+                certificate.to_vec(),
+            )],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(
+                include_bytes!("../tests/fixtures/tls/server-key.der").to_vec(),
+            )
+            .into(),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        let handle = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return false;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => unreachable!("{error}"),
+                }
+            };
+            socket
+                .set_nonblocking(false)
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            socket
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            let connection = rustls::ServerConnection::new(std::sync::Arc::new(config))
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            let mut stream = rustls::StreamOwned::new(connection, socket);
+            let mut request = [0_u8; 1024];
+            if !matches!(stream.read(&mut request), Ok(count) if count > 0) {
+                return false;
+            }
+            let response_written = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 25\r\nConnection: close\r\n\r\n{\"default_branch\":\"main\"}")
+                .is_ok();
+            stream.conn.send_close_notify();
+            response_written && stream.flush().is_ok()
+        });
+        (port, handle)
+    }
+
+    fn test_tls_client() -> reqwest::blocking::Client {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                include_bytes!("../tests/fixtures/tls/root.der").to_vec(),
+            ))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let tls = super::tls_client_config(roots).unwrap_or_else(|error| unreachable!("{error}"));
+        reqwest::blocking::Client::builder()
+            .tls_backend_preconfigured(tls)
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap_or_else(|error| unreachable!("{error}"))
+    }
+
+    fn assert_certificate_rejection(error: &reqwest::Error, reason: &str) {
+        assert!(error.is_connect());
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(current) = cause {
+            if let Some(rustls::Error::InvalidCertificate(certificate_error)) =
+                current.downcast_ref::<rustls::Error>()
+            {
+                assert!(format!("{certificate_error:?}").contains(reason));
+                return;
+            }
+            cause = current
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::get_ref)
+                .map(|error| error as &(dyn std::error::Error + 'static))
+                .or_else(|| current.source());
+        }
+        unreachable!("expected a certificate validation error: {error:?}");
+    }
+
+    #[test]
+    fn reqwest_tls_rejects_roots_outside_the_mozilla_store() {
+        let (port, server) = tls_server(
+            include_bytes!("../tests/fixtures/tls/server.der"),
+            &rustls::version::TLS13,
+        );
+        let client = super::github_client_builder()
+            .unwrap_or_else(|error| unreachable!("{error}"))
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let error = client
+            .get(format!("https://localhost:{port}/"))
+            .send()
+            .err()
+            .unwrap_or_else(|| unreachable!("private test CA must be rejected"));
+        assert_certificate_rejection(&error, "UnknownIssuer");
+        assert!(!server.join().unwrap_or_else(|_| unreachable!("server")));
+    }
+
+    #[test]
+    fn reqwest_tls_verifies_trusted_certificates_with_tls12_and_tls13() {
+        for protocol in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            let (port, server) =
+                tls_server(include_bytes!("../tests/fixtures/tls/server.der"), protocol);
+            let response = test_tls_client()
+                .get(format!("https://localhost:{port}/"))
+                .send()
+                .unwrap_or_else(|error| unreachable!("{error:?}"));
+            let value: serde_json::Value = response
+                .json()
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            assert_eq!(value["default_branch"], "main");
+            assert!(server.join().unwrap_or_else(|_| unreachable!("server")));
+        }
+    }
+
+    #[test]
+    fn reqwest_tls_rejects_wrong_hostname_and_expired_certificates() {
+        for (certificate, hostname, reason) in [
+            (
+                include_bytes!("../tests/fixtures/tls/server.der").as_slice(),
+                "127.0.0.1",
+                "NotValidForName",
+            ),
+            (
+                include_bytes!("../tests/fixtures/tls/expired.der").as_slice(),
+                "localhost",
+                "Expired",
+            ),
+        ] {
+            let (port, server) = tls_server(certificate, &rustls::version::TLS13);
+            let error = test_tls_client()
+                .get(format!("https://{hostname}:{port}/"))
+                .send()
+                .err()
+                .unwrap_or_else(|| unreachable!("invalid certificate must be rejected"));
+            assert_certificate_rejection(&error, reason);
+            assert!(!server.join().unwrap_or_else(|_| unreachable!("server")));
         }
     }
 

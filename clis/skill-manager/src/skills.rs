@@ -776,8 +776,8 @@ mod tests {
         // on `expand_skill_patterns` to do it implicitly.
         let none = expand_skill_patterns(&[], ["alpha", "beta"])
             .unwrap_or_else(|error| unreachable!("{error}"));
-        assert!(none.matched.is_empty());
-        assert!(none.unmatched_patterns.is_empty());
+        assert_eq!(none.matched.len(), 0);
+        assert_eq!(none.unmatched_patterns.len(), 0);
     }
 
     #[cfg(unix)]

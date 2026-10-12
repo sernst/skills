@@ -428,7 +428,7 @@ mod tests {
         assert_eq!(first.warnings.len(), 1);
 
         let second = migrate(&paths).unwrap_or_else(|error| unreachable!("{error}"));
-        assert!(second.migrated.is_empty());
+        assert_eq!(second.migrated.len(), 0);
         assert_eq!(second.warnings.len(), 1);
     }
 
@@ -553,7 +553,7 @@ mod tests {
         let recovered = migrate(&paths).unwrap_or_else(|error| unreachable!("{error}"));
         assert!(!source.exists());
         assert_eq!(recovered.migrated.len(), 1);
-        assert!(recovered.warnings.is_empty());
+        assert_eq!(recovered.warnings.len(), 0);
     }
 
     #[test]

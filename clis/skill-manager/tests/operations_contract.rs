@@ -107,10 +107,10 @@ fn no_command_defaults_to_status_and_every_json_line_has_the_envelope() {
         .output()
         .expect("run default command");
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr.len(), 0);
     let stdout = String::from_utf8(output.stdout).expect("utf8 output");
     let lines: Vec<_> = stdout.lines().collect();
-    assert!(!lines.is_empty());
+    assert_ne!(lines.len(), 0);
     for line in lines {
         let event: Value = serde_json::from_str(line).expect("NDJSON event");
         assert_eq!(event["version"], 1);
@@ -236,11 +236,12 @@ fn source_add_and_remove_without_a_reference_use_the_current_directory() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"event\":\"source.removed\""));
-    assert!(
+    assert_eq!(
         read_config(home.path())["sources"]
             .as_array()
             .expect("sources array")
-            .is_empty()
+            .len(),
+        0
     );
 }
 
@@ -3680,7 +3681,7 @@ fn import_reports_nothing_to_import_when_every_deployment_matches_the_source() {
         stdout_of(output.clone()),
         "docwriter has no changed deployment to import from the enabled targets in global or project scope.\n"
     );
-    assert!(stderr_of(&output).is_empty());
+    assert_eq!(stderr_of(&output).len(), 0);
 }
 
 /// GitHub-backed sources import only into a confirmed local alternate
@@ -4396,13 +4397,13 @@ fn import_yes_alone_commits_a_degenerate_recipe_and_round_trips_binary_content()
             .output()
             .expect("run the degenerate recipe with only yes:true"),
     );
-    assert!(events_of(&events, "command.failed").is_empty());
+    assert_eq!(events_of(&events, "command.failed").len(), 0);
     let plan = events_of(&events, "plan")[0];
     assert_eq!(
         plan["data"]["authorization"]["resolved"]["propagation"],
         "import-only"
     );
-    assert!(!events_of(&events, "skill.imported").is_empty());
+    assert_ne!(events_of(&events, "skill.imported").len(), 0);
     assert!(
         events_of(&events, "skill.skipped").is_empty(),
         "import-only never loops the deployment list"
@@ -4448,7 +4449,7 @@ fn import_explicit_update_on_a_degenerate_plan_records_import_update_and_hides_t
             .output()
             .expect("run the degenerate recipe with an explicit update:true"),
     );
-    assert!(events_of(&events, "command.failed").is_empty());
+    assert_eq!(events_of(&events, "command.failed").len(), 0);
     let plan = events_of(&events, "plan")[0];
     assert_eq!(
         plan["data"]["authorization"]["resolved"]["propagation"], "import-update",
@@ -4457,7 +4458,7 @@ fn import_explicit_update_on_a_degenerate_plan_records_import_update_and_hides_t
     let propagation_option = plan["data"]["decisions"][1]["options"][0].clone();
     assert_eq!(propagation_option["id"], "import-update");
     assert_eq!(propagation_option["consequence"]["totals"]["updated"], 0);
-    assert!(!events_of(&events, "skill.imported").is_empty());
+    assert_ne!(events_of(&events, "skill.imported").len(), 0);
     assert_eq!(
         events_of(&events, "skill.skipped").len(),
         1,
@@ -4683,7 +4684,7 @@ Dry run \u{2014} no changes were made.\n",
             .output()
             .expect("run bystander apply"),
     );
-    assert!(events_of(&events, "command.failed").is_empty());
+    assert_eq!(events_of(&events, "command.failed").len(), 0);
     let skipped = events_of(&events, "skill.skipped");
     assert_eq!(
         skipped.len(),
@@ -5119,7 +5120,7 @@ fn filtered_exact_and_pattern_updates_report_successful_no_work() {
             .output()
             .expect("machine filtered update"),
     );
-    assert!(events_of(&filtered, "command.failed").is_empty());
+    assert_eq!(events_of(&filtered, "command.failed").len(), 0);
     let filtered_summary = events_of(&filtered, "summary")[0];
     assert_eq!(filtered_summary["data"]["changed"], 0);
     assert_eq!(filtered_summary["data"]["skipped"], 0);
@@ -5138,7 +5139,7 @@ fn filtered_exact_and_pattern_updates_report_successful_no_work() {
             .output()
             .expect("recipe filtered update"),
     );
-    assert!(events_of(&recipe_filtered, "command.failed").is_empty());
+    assert_eq!(events_of(&recipe_filtered, "command.failed").len(), 0);
     let recipe_summary = events_of(&recipe_filtered, "summary")[0];
     assert_eq!(recipe_summary["data"]["changed"], 0);
     assert_eq!(recipe_summary["data"]["skipped"], 0);
@@ -5167,7 +5168,7 @@ fn exact_source_update_without_enabled_targets_is_successful_no_work() {
             .output()
             .expect("machine update without enabled targets"),
     );
-    assert!(events_of(&no_targets, "command.failed").is_empty());
+    assert_eq!(events_of(&no_targets, "command.failed").len(), 0);
     let no_target_summary = events_of(&no_targets, "summary")[0];
     assert_eq!(no_target_summary["data"]["changed"], 0);
     assert_eq!(no_target_summary["data"]["skipped"], 0);
@@ -5178,7 +5179,7 @@ fn exact_source_update_without_enabled_targets_is_successful_no_work() {
             .output()
             .expect("recipe update without enabled targets"),
     );
-    assert!(events_of(&recipe_no_targets, "command.failed").is_empty());
+    assert_eq!(events_of(&recipe_no_targets, "command.failed").len(), 0);
     let recipe_no_target_summary = events_of(&recipe_no_targets, "summary")[0];
     assert_eq!(recipe_no_target_summary["data"]["changed"], 0);
     assert_eq!(recipe_no_target_summary["data"]["skipped"], 0);

@@ -605,7 +605,7 @@ mod tests {
 
     #[test]
     fn empty_skill_table_still_has_a_stable_header_and_separator() {
-        assert!(source_table(&[]).is_empty());
+        assert_eq!(source_table(&[]).len(), 0);
         assert_eq!(
             skill_table(&[], &["claude".into()], false, false),
             [
@@ -626,7 +626,7 @@ mod tests {
              \u{1b}[36m~: 3 unsourced deployed\u{1b}[0m"
         );
         assert_eq!(status_summary(0, 0, 1, 0, true, false), "✗: 1 not-loaded");
-        assert!(status_summary(0, 0, 0, 0, true, false).is_empty());
+        assert_eq!(status_summary(0, 0, 0, 0, true, false).len(), 0);
     }
 
     #[test]
