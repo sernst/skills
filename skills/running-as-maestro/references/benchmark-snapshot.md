@@ -4,9 +4,9 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-10-08T16:27:48Z`
+- Retrieved after semantic change: `2026-10-13T16:56:31Z`
 - Parser version: `6`
-- Normalized SHA-256: `887ccd472ea07eb1b7554d3967f1873487456403c801de0eb388bb0a1875219d`
+- Normalized SHA-256: `ee1f4004b8921096f67ab172533cde1dc3daee77d4b0677dea2b8543ff39e733`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
@@ -92,7 +92,7 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 
 ## CursorBench
 
-Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-10-07` · normalized SHA-256 `9a9d770f5c8b4cf239e029aefef76a2026bc48d20af6f851762a84dd1910f15e`
+Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-10-07` · normalized SHA-256 `14c339e907f2ae360d400e3d2cd065d63a90d079c2cc923d37b694621894ff53`
 
 Metric: `score` · Ambiguous, multi-file tasks from real Cursor sessions. No uncertainty or sample count is published; small score differences may not be meaningful.
 
@@ -105,10 +105,14 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 | Opus 5.5 | Extra High | 56.00% | $6.980 | — |  |
 | Sonnet 5.5 | Max | 55.50% | $7.050 | — |  |
 | Sonnet 5.5 | Extra High | 53.10% | $2.810 | — | ★ |
+| Gemini 4 Argon | High | 52.90% | $4.570 | — |  |
+| Gemini 4 Argon | Medium | 52.80% | $4.390 | — |  |
 | Opus 5.5 | Medium | 52.50% | $2.910 | — |  |
 | Fable 5.1 | Max | 51.80% | $17.280 | — |  |
 | Fable 5.1 | Extra High | 51.60% | $13.010 | — |  |
+| Gemini 4 Argon | Low | 50.60% | $4.090 | — |  |
 | Fable 5.1 | High | 49.20% | $9.080 | — |  |
+| Gemini 4 Argon | Minimal | 48.80% | $3.540 | — |  |
 | Haiku 5.5 | Max | 48.40% | $1.120 | — | ★ |
 | Sonnet 5.5 | High | 47.80% | $1.200 | — |  |
 | Fable 5.1 | Medium | 46.80% | $7.050 | — |  |
