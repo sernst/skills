@@ -99,7 +99,7 @@ jobs:
       - name: Audit GitHub workflows
         run: zizmor --pedantic .github/workflows
   benchmark-python:
-    name: Benchmark updater on ${{ matrix.os }}
+    name: Offline Python helpers on ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -114,8 +114,10 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.15.0'
-      - name: Run offline benchmark updater tests
+      - name: Run offline Python helper tests
         run: python -m unittest discover -s tools/model_benchmarks/tests -v
+      - name: Run offline Jev routing tests
+        run: python -m unittest discover -s skills/running-as-maestro/scripts -p 'test_*.py' -v
   preflight:
     name: Preflight ${{ matrix.cli }} for ${{ matrix.target }}
     needs: [discover, quality]

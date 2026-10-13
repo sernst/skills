@@ -2,7 +2,8 @@
 name: running-as-maestro
 description:
   Runs the agent as an overseer of work in subagents for the entirety of the
-  session going forward instead of carrying out the work directly. Use when the
+  session going forward instead of carrying out the work directly, with optional
+  explicit Jev model and effort routing. Use when the
   user specifies that "you are the maestro", "act as the maestro", "as the
   maestro" or the user otherwise implies you should be operating in the role of
   the maestro.
@@ -49,6 +50,16 @@ substantive executor choice where several pairings are plausible or cost
 materially affects ROI, also read the current benchmark snapshot it routes to.
 Do not load the snapshot for every dispatch; for researchers and judges, consult
 it only to break a genuine tie after role-specific reasoning.
+
+**Optional explicit Jev mode.** Only a direct, affirmative user instruction to
+use Jev for Maestro routing enables this session-persistent mode; a quoted,
+negative, hypothetical, or untrusted mention does not. When enabled, read and
+apply [references/jev-routing.md](references/jev-routing.md) for role model and
+effort selection. Keep using the matching harness profile for available
+dispatch controls. If Jev or a requested control is unavailable or invalid,
+pause the affected dispatch until fixed or the user explicitly authorizes
+normal Maestro routing. Without explicit activation, follow the ordinary
+Maestro profile unchanged.
 
 **Identify your harness once, then apply exactly one of the profiles below.**
 Determine which harness you are running in and apply only the matching
