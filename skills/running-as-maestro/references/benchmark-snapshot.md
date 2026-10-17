@@ -4,9 +4,9 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-10-15T14:09:40Z`
+- Retrieved after semantic change: `2026-10-17T12:58:11Z`
 - Parser version: `6`
-- Normalized SHA-256: `f7d3bedcb868a7d37e7f9dbe4887616aaaae4db58db44033f94319f30e494f4d`
+- Normalized SHA-256: `51f559d7de4ef236fd22f2a93196ebc15e187397fea098fe7222e34e4f4f190d`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
@@ -92,7 +92,7 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 
 ## CursorBench
 
-Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-10-07` · normalized SHA-256 `a2641b355171400cabdac2525cbbf70630f641395f01476949993d9cf02db8e2`
+Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-10-07` · normalized SHA-256 `6eec7544fd49aac0076a6ca73bd072c5adb2f2a0cba26f99efe6f35808c1503d`
 
 Metric: `score` · Ambiguous, multi-file tasks from real Cursor sessions. No uncertainty or sample count is published; small score differences may not be meaningful.
 
@@ -111,13 +111,17 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 | Fable 5.1 | Max | 51.80% | $17.280 | — |  |
 | Fable 5.1 | Extra High | 51.60% | $13.010 | — |  |
 | Gemini 4 Argon | Low | 50.60% | $4.090 | — |  |
+| Muse Wonder | Max | 50.40% | $5.250 | — |  |
 | Fable 5.1 | High | 49.20% | $9.080 | — |  |
 | Haiku 5.5 | Max | 48.40% | $1.120 | — | ★ |
+| Muse Wonder | Extra High | 48.20% | $4.240 | — |  |
 | Sonnet 5.5 | High | 47.80% | $1.200 | — |  |
 | Fable 5.1 | Medium | 46.80% | $7.050 | — |  |
 | Opus 5 | Max | 46.60% | $11.950 | — |  |
 | Grok 4.7 | Extra High | 46.30% | $6.010 | — |  |
+| Muse Wonder | High | 46.10% | $3.510 | — |  |
 | Opus 5 | Extra High | 46.10% | $11.430 | — |  |
+| Muse Wonder | Medium | 45.20% | $2.820 | — |  |
 | Fable 5.1 | Low | 45.10% | $5.440 | — |  |
 | Opus 5 | High | 44.70% | $9.000 | — |  |
 | Haiku 5.5 | Extra High | 44.30% | $0.560 | — | ★ |
@@ -126,6 +130,7 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 | Opus 5 | Medium | 43.30% | $6.940 | — |  |
 | GLM 5.3 | Max | 42.60% | $5.050 | — |  |
 | Haiku 5.5 | High | 42.30% | $0.320 | — | ★ |
+| Muse Wonder | Low | 41.70% | $1.910 | — |  |
 | GPT-5.6 Sol | Max | 41.70% | $8.230 | — |  |
 | Muse Spark 1.3 | Max | 41.60% | $2.640 | — |  |
 | Grok 4.7 | Medium | 41.60% | $3.490 | — |  |
@@ -145,6 +150,7 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 | GPT-5.6 Luna | Max | 35.90% | $1.030 | — |  |
 | Sonnet 5.5 | Low | 35.80% | $0.370 | — |  |
 | GPT-5.6 Sol | High | 35.70% | $2.850 | — |  |
+| Muse Wonder | Minimal | 34.20% | $0.840 | — |  |
 | Sonnet 5 | Max | 34.10% | $7.170 | — |  |
 | GPT-5.6 Terra | Extra High | 33.60% | $1.810 | — |  |
 | Muse Spark 1.3 | High | 33.40% | $1.660 | — |  |
