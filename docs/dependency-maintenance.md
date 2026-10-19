@@ -1,8 +1,10 @@
 # Dependency maintenance
 
-Dependabot proposes one grouped Cargo update each day and one grouped GitHub
-Actions update each week, including major versions. GitHub's separate security
-update service may also open urgent advisory fixes. All proposals require normal
+Dependabot combines all available Cargo and GitHub Actions version updates into
+one multi-ecosystem pull request, including major versions. The shared group
+checks daily (weekdays), preserving frequent Cargo updates while including Actions
+in the same proposal. GitHub's separate security update service may also open
+urgent advisory fixes outside that routine group. All proposals require normal
 checks and human review; dependency maintenance never approves or merges them.
 
 The weekly **Propose pinned tool updates** workflow covers every `TOOL_VERSIONS`

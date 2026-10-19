@@ -1,16 +1,14 @@
 version: 2
+multi-ecosystem-groups:
+  all-dependencies:
+    schedule:
+      interval: daily
 updates:
   - package-ecosystem: cargo
     directory: /clis/skill-manager
-    schedule:
-      interval: daily
-    groups:
-      cargo-dependencies:
-        patterns: ['*']
+    patterns: ['*']
+    multi-ecosystem-group: all-dependencies
   - package-ecosystem: github-actions
     directory: /
-    schedule:
-      interval: weekly
-    groups:
-      workflow-actions:
-        patterns: ['*']
+    patterns: ['*']
+    multi-ecosystem-group: all-dependencies
