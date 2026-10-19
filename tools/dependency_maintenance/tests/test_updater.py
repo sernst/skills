@@ -187,7 +187,7 @@ class PublicationTests(unittest.TestCase):
             if args[1] == "ls-remote":
                 return "b" * 40 + "\trefs/heads/" + u.BRANCH if existing else ""
             if args[1] == "log":
-                return "human@example.com" if independent else u.BOT_EMAIL
+                return "human@example.com\n" + u.BOT_EMAIL if independent else "\n".join([u.BOT_EMAIL] * 2)
             if args[1] == "diff":
                 return "TOOL_VERSIONS"
             if args[:3] == ("gh", "pr", "list"):

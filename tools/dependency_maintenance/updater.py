@@ -237,19 +237,28 @@ def publish(root: Path, repository: str, *, runner=run) -> str | None:
     expected = remote.split()[0] if remote else ""
     if expected:
         runner("git", "fetch", "origin", f"refs/heads/{BRANCH}", root=root)
-        authors = runner("git", "log", "--format=%ae", "origin/main..FETCH_HEAD", root=root).splitlines()
+        identities = runner("git", "log", "--format=%ae%n%ce", "origin/main..FETCH_HEAD", root=root).splitlines()
         paths = runner("git", "diff", "--name-only", "origin/main...FETCH_HEAD", root=root).splitlines()
-        if not authors or set(authors) != {BOT_EMAIL} or not set(paths) <= ALLOWLIST:
+        # An empty range means the retained branch is already integrated into
+        # main and can be reused. Unmerged work must have both bot identities:
+        # a human amend normally preserves the bot author but changes committer.
+        if not set(identities) <= {BOT_EMAIL} or not set(paths) <= ALLOWLIST:
             raise MaintenanceError("Owned proposal branch contains independent edits; resolve it manually before refreshing.")
-    runner("git", "switch", "--force-create", BRANCH, root=root)
     runner("git", "add", "--", *files, root=root)
-    runner("git", "-c", "user.name=dependency-updater[bot]", "-c", f"user.email={BOT_EMAIL}", "commit", "-m", TITLE, root=root)
-    # Ephemeral environment-only HTTP credential; never put a token in a remote URL,
-    # command argument, persisted git configuration, PR body, or log.
-    env = dict(os.environ)
-    credential = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-    env.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader", "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {credential}"})
-    runner("git", "push", f"--force-with-lease=refs/heads/{BRANCH}:{expected}", "origin", f"HEAD:refs/heads/{BRANCH}", root=root, env=env)
+    unchanged = bool(expected) and (
+        runner("git", "write-tree", root=root) == runner("git", "rev-parse", "FETCH_HEAD^{tree}", root=root)
+        and runner("git", "merge-base", "origin/main", "FETCH_HEAD", root=root)
+        == runner("git", "rev-parse", "origin/main", root=root)
+    )
+    if not unchanged:
+        runner("git", "switch", "--force-create", BRANCH, root=root)
+        runner("git", "-c", "user.name=dependency-updater[bot]", "-c", f"user.email={BOT_EMAIL}", "commit", "-m", TITLE, root=root)
+        # Ephemeral environment-only HTTP credential; never put a token in a remote URL,
+        # command argument, persisted git configuration, PR body, or log.
+        env = dict(os.environ)
+        credential = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        env.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader", "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {credential}"})
+        runner("git", "push", f"--force-with-lease=refs/heads/{BRANCH}:{expected}", "origin", f"HEAD:refs/heads/{BRANCH}", root=root, env=env)
     prs = json.loads(runner("gh", "pr", "list", "--repo", repository, "--state", "open", "--head", BRANCH, "--base", "main", "--json", "number", root=root))
     body = "Automated proposal for the latest stable repository-owned build tools and runtimes.\n\nChanged pins: " + ", ".join(f"`{path}`" for path in files) + ".\n\nNormal PR checks and human review are required. This workflow never approves or merges. Cargo and Actions updates are proposed separately by Dependabot."
     if len(prs) > 1:
