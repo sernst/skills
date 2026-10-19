@@ -1,0 +1,81 @@
+name: Propose pinned tool updates
+
+on:
+  schedule:
+    - cron: '43 10 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: dependency-maintenance
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  propose:
+    name: Validate and propose stable tool pins
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: .python-version
+      - name: Run offline maintenance contract tests
+        run: python -m unittest discover -s tools/dependency_maintenance/tests -v
+      - name: Fetch and validate official stable releases
+        run: python -m tools.dependency_maintenance refresh
+      - id: diff
+        name: Enforce exact pin-file allowlist
+        run: python -m tools.dependency_maintenance diff
+      - id: app-token
+        if: github.ref == 'refs/heads/main' && steps.diff.outputs.changed == 'true'
+        name: Create repository-scoped proposal token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.BENCHMARK_APP_ID }}
+          private-key: ${{ secrets.BENCHMARK_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+      - if: github.ref == 'refs/heads/main' && steps.diff.outputs.changed == 'true'
+        name: Create or refresh the single proposal PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: python -m tools.dependency_maintenance publish
+  report:
+    name: Record dependency maintenance status
+    needs: propose
+    if: always() && !cancelled() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write # One dependency-specific failure/recovery issue.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: .python-version
+      - if: needs.propose.result == 'failure'
+        name: Record dependency maintenance failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python -m tools.dependency_maintenance failure --run-url "$RUN_URL"
+      - if: needs.propose.result == 'success'
+        name: Close any recovered dependency failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python -m tools.dependency_maintenance recovery --run-url "$RUN_URL"

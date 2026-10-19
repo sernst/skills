@@ -1,9 +1,9 @@
 # Repository-owned toolchain pins. Bootstrap scripts install these exact versions.
-rust=1.99.0
-just=1.58.0
+rust=1.99.1
+just=1.59.0
 psscriptanalyzer=1.25.0
 cargo-llvm-cov=0.9.1
 cargo-deny=0.20.2
 cargo-zigbuild=0.23.4
 zig=0.17.0
-workflow-audit=1.30.1
+workflow-audit=1.31.1

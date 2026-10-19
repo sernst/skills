@@ -36,6 +36,7 @@ deny:
 check:
     pwsh -File tools/run-registered.ps1 -Recipe check
     python -m unittest discover -s tools/model_benchmarks/tests -v
+    python -m unittest discover -s tools/dependency_maintenance/tests -v
     python -m unittest discover -s skills/running-as-maestro/scripts -p 'test_*.py' -v
 
 benchmark-test:

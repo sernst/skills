@@ -1,6 +1,7 @@
 name: Weekly advisory and live smoke
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: '23 4 * * 1'
   push:

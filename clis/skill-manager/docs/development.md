@@ -4,8 +4,12 @@ The repository registers independent CLI components through `clis/registry.just`
 
 The quality gate uses `cargo fmt --check`, strict pedantic Clippy with warnings denied, rustdoc warnings denied, dependency policy checks, and an 85% line coverage threshold. Production code forbids unsafe and unchecked unwrap/expect/panic-style exits; narrow allowances must explain why they are safe. Exact auxiliary-tool versions are stored centrally and bootstrap scripts install locked versions.
 
-CI uses the pinned Rust toolchain; the manifest's Rust 1.96 minimum remains
-unchanged because the refreshed dependencies support it. Benchmark workflows
+CI uses the pinned Rust toolchain; the manifest's Rust 1.96 minimum is also
+validated with `cargo +1.96.0 check --locked --all-targets --all-features`.
+Dependency refreshes update the complete compatible lockfile graph and verify
+new major releases of direct dependencies and build tools against upstream
+registries. Transitive major versions remain bounded by their upstream
+dependency requirements. Benchmark workflows
 pin Python 3.15.0 and test the updater on Linux, Windows, and macOS.
 
 The reqwest 0.13 transport explicitly configures rustls with ring and Mozilla
