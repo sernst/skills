@@ -4,6 +4,6 @@ just=1.59.0
 psscriptanalyzer=1.25.0
 cargo-llvm-cov=0.9.1
 cargo-deny=0.20.2
-cargo-zigbuild=0.23.4
+cargo-zigbuild=0.24.0
 zig=0.17.0
 workflow-audit=1.31.1

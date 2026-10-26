@@ -10,7 +10,7 @@ Dependency refreshes update the complete compatible lockfile graph and verify
 new major releases of direct dependencies and build tools against upstream
 registries. Transitive major versions remain bounded by their upstream
 dependency requirements. Benchmark workflows
-pin Python 3.15.0 and test the updater on Linux, Windows, and macOS.
+pin Python 3.15.2 and test the updater on Linux, Windows, and macOS.
 
 The reqwest 0.13 transport explicitly configures rustls with ring and Mozilla
 roots to preserve the previous `rustls-tls` trust policy. Reqwest's new default
