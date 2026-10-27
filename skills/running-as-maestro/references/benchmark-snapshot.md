@@ -4,9 +4,9 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-10-17T12:58:11Z`
+- Retrieved after semantic change: `2026-10-27T15:20:49Z`
 - Parser version: `6`
-- Normalized SHA-256: `51f559d7de4ef236fd22f2a93196ebc15e187397fea098fe7222e34e4f4f190d`
+- Normalized SHA-256: `af17eaca32501f360a63a6c91aedfb0322366e4d125abbfa32820f5b8dc4fc97`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
@@ -92,7 +92,7 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 
 ## CursorBench
 
-Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-10-07` · normalized SHA-256 `6eec7544fd49aac0076a6ca73bd072c5adb2f2a0cba26f99efe6f35808c1503d`
+Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-10-07` · normalized SHA-256 `b3f21329c245702c5261ce8b601ef749202cf0a2d3b70a037faaa513638ca4b2`
 
 Metric: `score` · Ambiguous, multi-file tasks from real Cursor sessions. No uncertainty or sample count is published; small score differences may not be meaningful.
 
@@ -116,13 +116,17 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 | Haiku 5.5 | Max | 48.40% | $1.120 | — | ★ |
 | Muse Wonder | Extra High | 48.20% | $4.240 | — |  |
 | Sonnet 5.5 | High | 47.80% | $1.200 | — |  |
+| DeepSeek V4.1 Flash 1017 | Max | 47.70% | $0.980 | — | ★ |
 | Fable 5.1 | Medium | 46.80% | $7.050 | — |  |
 | Opus 5 | Max | 46.60% | $11.950 | — |  |
+| DeepSeek V4.1 Flash 1017 | Medium | 46.30% | $0.800 | — | ★ |
 | Grok 4.7 | Extra High | 46.30% | $6.010 | — |  |
 | Muse Wonder | High | 46.10% | $3.510 | — |  |
 | Opus 5 | Extra High | 46.10% | $11.430 | — |  |
+| DeepSeek V4.1 Flash 1017 | High | 45.60% | $0.770 | — | ★ |
 | Muse Wonder | Medium | 45.20% | $2.820 | — |  |
 | Fable 5.1 | Low | 45.10% | $5.440 | — |  |
+| DeepSeek V4.1 Flash 1017 | Low | 44.90% | $0.600 | — | ★ |
 | Opus 5 | High | 44.70% | $9.000 | — |  |
 | Haiku 5.5 | Extra High | 44.30% | $0.560 | — | ★ |
 | Grok 4.7 | High | 43.90% | $4.690 | — |  |
