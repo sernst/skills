@@ -18,6 +18,24 @@ surface, independently understandable, reviewable, and revertable. Discover and
 apply each repository's conventions per applicable PR/car, including local gates
 and sanctioned exceptions for infra-only changes.
 
+**Cars are not executors.** CI/CD runs once per PR head; parallelism is per
+executor. They are different units. Prefer fewer, larger PRs, each still
+coherent by theme and deployment surface, independently understandable,
+reviewable, and revertable. Split a car only when deployment surface, risk
+isolation (for example a thin caboose, so a red head on a large car does not
+drag the version bump), or the rerun cost of a red head justifies another CI
+run.
+
+Preserve parallelism inside a car. Independent pieces of one car are built by
+separate executors on their own piece branches (`<car-branch>-<piece>`) in
+their own worktrees, each judged on its own diff with its own acceptance
+criteria and an executor model chosen per piece. Pieces that touch the same
+files run in sequence inside the car, with the later executor starting from the
+earlier piece's branch. Rebase the pieces onto the car tip in a fixed order, run
+the repository's full local gate once at the integrated tip, and add a short
+seam review of the joins. Open one PR per car. Piece branches never get a PR and
+are never pushed. Per-piece judging is what keeps a large PR reviewable.
+
 **Before implementation starts**, inspect repository instructions, relevant
 CHANGELOG file(s), VERSION files/manifests, release tooling, and recent history
 for every affected component/repository. Plan and follow established changelog
@@ -99,12 +117,23 @@ executable without the session's context. Keep exact commands, identifiers,
 expected results, and current evidence accurate as PRs evolve; retain executed
 steps with their status.
 
+Begin the runbook with a required lead-in, **Manual actions at a glance**,
+before the four mandatory sections. It does not change their order or
+numbering. List every action a person must carry out outside the agent's own
+work, each with its timing: before the first merge, between named cars, or
+after the last merge. Repeat each item with full detail in its proper section
+below. Write **None** if there are no manual actions.
+
 Use these mandatory sections in this order, writing **None** if a section is
 empty:
 
 1. **Prerequisites** — Put human preparation as early as feasible: access,
    secrets, configuration, and other necessary setup. State pre-merge safety
-   gates and expected results before the merge that relies on them.
+   gates and expected results before the merge that relies on them. Be
+   complete and compact: list every action a person must carry out before the
+   first merge, with exact commands or steps, so nobody has to piece the manual
+   work together from the rest of the runbook, the PR bodies, or the
+   conversation.
 2. **Merging** — Include a global merge-order table with linked PRs, repo when
    multi-repo, exact branch, applicable version, and short contents. Give steps
    the agent can execute and verify with this session's capabilities, including
@@ -118,7 +147,11 @@ empty:
    blocker before the affected merge.
 3. **Post-merge Actions** — Required human actions that the agent cannot
    automate, with exact instructions and dependencies. Service rolls are not
-   automatically human-owned; automate them when authorized and supported.
+   automatically human-owned; automate them when authorized and supported. Be
+   complete and compact: list every action a person must carry out after the
+   last merge, with exact commands or steps, so nobody has to piece the manual
+   work together from the rest of the runbook, the PR bodies, or the
+   conversation.
 4. **Validation** — A slim human checklist after all post-merge actions. Give
    each check a short, distinct, referenceable title, the simplest steps, and
    expected results; focus on the behavior and failures motivating the work.
@@ -152,7 +185,8 @@ that remains rather than presenting the runbook as ready.
 6. The final response must include a table in global merge order: linked PR,
    repository when multi-repo, exact branch name, and short description. Link
    the runbook immediately below the table. State current head/check evidence,
-   readiness versus authorized exceptions, blockers, and limits honestly.
+   readiness versus authorized exceptions, blockers, and limits honestly. List
+   every outstanding pre- and post-merge manual action, so none is lost.
 
 ## Merging the chain — only if explicitly directed
 
@@ -168,6 +202,11 @@ that remains rather than presenting the runbook as ready.
   waivers. Record exceptions separately; unresolved unwaived gates block merging.
 - Complete prerequisites and confirm intermediate manual changes, automation,
   and any necessary safety gates are feasible before starting the sequence.
+
+**Never lose a manual action.** Restate the next pending manual action when the
+sequence reaches its point. List every outstanding pre- or post-merge manual
+action in each progress report and in the final report, so none is forgotten
+during a long merge.
 
 **For each PR, strictly in global order:**
 
