@@ -4,9 +4,9 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-10-27T15:20:49Z`
+- Retrieved after semantic change: `2026-11-09T19:47:34Z`
 - Parser version: `6`
-- Normalized SHA-256: `af17eaca32501f360a63a6c91aedfb0322366e4d125abbfa32820f5b8dc4fc97`
+- Normalized SHA-256: `74b4126c861a38d8474bb053a77fcf802730cee8b135751109ccc6aa4d50f06b`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
@@ -92,7 +92,7 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 
 ## CursorBench
 
-Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-10-07` · normalized SHA-256 `b3f21329c245702c5261ce8b601ef749202cf0a2d3b70a037faaa513638ca4b2`
+Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-10-07` · normalized SHA-256 `14d5beab6afb16e3a77431aad99d71fc08a73c9274f53c1f78badb0d397eb668`
 
 Metric: `score` · Ambiguous, multi-file tasks from real Cursor sessions. No uncertainty or sample count is published; small score differences may not be meaningful.
 
@@ -100,10 +100,15 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 
 | model | effort | score | avg cost/task | uncertainty / sample | Pareto |
 | --- | --- | ---: | ---: | --- | :---: |
+| Fable 5.2 | Max | 60.00% | $32.790 | — | ★ |
 | Opus 5.5 | Max | 57.80% | $13.430 | — | ★ |
+| Fable 5.2 | High | 56.90% | $9.700 | — | ★ |
+| Fable 5.2 | Extra High | 56.30% | $15.480 | — |  |
 | Opus 5.5 | High | 56.00% | $3.970 | — | ★ |
 | Opus 5.5 | Extra High | 56.00% | $6.980 | — |  |
 | Sonnet 5.5 | Max | 55.50% | $7.050 | — |  |
+| Fable 5.2 | Medium | 54.80% | $4.660 | — |  |
+| Fable 5.2 | Low | 53.20% | $3.940 | — | ★ |
 | Sonnet 5.5 | Extra High | 53.10% | $2.810 | — | ★ |
 | Gemini 4 Argon | High | 52.90% | $4.570 | — |  |
 | Gemini 4 Argon | Medium | 52.80% | $4.390 | — |  |
