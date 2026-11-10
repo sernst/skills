@@ -4,9 +4,9 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-11-09T19:47:34Z`
+- Retrieved after semantic change: `2026-11-10T17:01:37Z`
 - Parser version: `6`
-- Normalized SHA-256: `74b4126c861a38d8474bb053a77fcf802730cee8b135751109ccc6aa4d50f06b`
+- Normalized SHA-256: `d2c1765e33c5cdd9a946e8ea8ec2aab08731543b1c828d72f82873e6f25c9971`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
@@ -92,7 +92,7 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 
 ## CursorBench
 
-Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-10-07` · normalized SHA-256 `14d5beab6afb16e3a77431aad99d71fc08a73c9274f53c1f78badb0d397eb668`
+Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-10-07` · normalized SHA-256 `0f56b57e3de350bc8f928ebf7c2ab57068baa1e47f48997390cb0b67095f4d9d`
 
 Metric: `score` · Ambiguous, multi-file tasks from real Cursor sessions. No uncertainty or sample count is published; small score differences may not be meaningful.
 
@@ -100,9 +100,12 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 
 | model | effort | score | avg cost/task | uncertainty / sample | Pareto |
 | --- | --- | ---: | ---: | --- | :---: |
-| Fable 5.2 | Max | 60.00% | $32.790 | — | ★ |
-| Opus 5.5 | Max | 57.80% | $13.430 | — | ★ |
-| Fable 5.2 | High | 56.90% | $9.700 | — | ★ |
+| Gemini 4 Carbon | High | 60.40% | $9.220 | — | ★ |
+| Gemini 4 Carbon | Medium | 60.10% | $8.490 | — | ★ |
+| Fable 5.2 | Max | 60.00% | $32.790 | — |  |
+| Gemini 4 Carbon | Low | 58.60% | $11.890 | — |  |
+| Opus 5.5 | Max | 57.80% | $13.430 | — |  |
+| Fable 5.2 | High | 56.90% | $9.700 | — |  |
 | Fable 5.2 | Extra High | 56.30% | $15.480 | — |  |
 | Opus 5.5 | High | 56.00% | $3.970 | — | ★ |
 | Opus 5.5 | Extra High | 56.00% | $6.980 | — |  |
