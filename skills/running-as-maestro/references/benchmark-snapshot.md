@@ -4,9 +4,9 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-11-13T17:11:38Z`
+- Retrieved after semantic change: `2026-11-14T15:48:18Z`
 - Parser version: `6`
-- Normalized SHA-256: `420008611fc478fe57e8b99096bd30df7784346ace485c0b44ec3c199dc31edd`
+- Normalized SHA-256: `3e35c4a21aba239673936754ae0739b5de2431d5de24af46f37b8494cba9ddcf`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
@@ -92,7 +92,7 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 
 ## CursorBench
 
-Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-10-07` · normalized SHA-256 `c63f0d2e993560a1df504ce87e8d0909590d26d95c1a30ca9f7845ee76d845fd`
+Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-10-07` · normalized SHA-256 `c33a2074fb0af7774f43cbbd9eaca50a390993007c2a244e3253b031f1fed183`
 
 Metric: `score` · Ambiguous, multi-file tasks from real Cursor sessions. No uncertainty or sample count is published; small score differences may not be meaningful.
 
@@ -104,6 +104,7 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 | Gemini 4 Carbon | Medium | 60.10% | $8.490 | — | ★ |
 | Fable 5.2 | Max | 60.00% | $32.790 | — |  |
 | Gemini 4 Carbon | Low | 58.60% | $11.890 | — |  |
+| Gemini 4 Hydrogen | Extra High | 57.80% | $5.860 | — | ★ |
 | Opus 5.5 | Max | 57.80% | $13.430 | — |  |
 | Fable 5.2 | High | 56.90% | $9.700 | — |  |
 | Fable 5.2 | Extra High | 56.30% | $15.480 | — |  |
