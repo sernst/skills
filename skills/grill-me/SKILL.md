@@ -39,3 +39,9 @@ If a question can be answered by exploring current project files, explore the
 current project files instead.
 
 In either case, ask questions one at a time.
+
+When a question decides something a person will see or use (a screen, a
+command's output, a flow, the shape of a document), show a sample with it: mock
+output, a sketch or a wireframe for each option worth weighing. A choice can
+read well as a sentence and look wrong in practice, so let the decision be made
+against what it produces.
