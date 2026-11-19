@@ -3,7 +3,11 @@ all-features = true
 
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # chrono is flagged unmaintained, not vulnerable, and has no safe upgrade.
+    # Replace it with a maintained date-time crate, then remove this entry.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; replace per issue #88 (2026-11-18)" },
+]
 
 [licenses]
 version = 2
