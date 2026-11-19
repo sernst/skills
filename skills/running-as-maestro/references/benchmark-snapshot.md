@@ -4,9 +4,9 @@ Generated supporting evidence for maestro model/effort selection. Compare only
 within a source and version; task-specific judgment and the current roster remain
 authoritative. `★` marks the point-estimate cost/performance Pareto frontier.
 
-- Retrieved after semantic change: `2026-11-14T15:48:18Z`
+- Retrieved after semantic change: `2026-11-19T18:15:57Z`
 - Parser version: `6`
-- Normalized SHA-256: `3e35c4a21aba239673936754ae0739b5de2431d5de24af46f37b8494cba9ddcf`
+- Normalized SHA-256: `4322efd2c0a2d8b1577b0c1fec99fb624da507f7c883a71e9ff98f009bf6010a`
 - Scores and costs are source-reported; no composite or cross-source ranking is calculated.
 
 ## DeepSWE
@@ -92,7 +92,7 @@ Shared harness: `mini-swe-agent` · configuration is derived from model + effort
 
 ## CursorBench
 
-Source: [CursorBench](https://cursor.com/cursorbench) · version `4.0` · source updated `2026-10-07` · normalized SHA-256 `c33a2074fb0af7774f43cbbd9eaca50a390993007c2a244e3253b031f1fed183`
+Source: [CursorBench](https://cursor.com/cursorbench) · version `4.1` · source updated `2026-11-18` · normalized SHA-256 `cb63c22284dfe106a12538fff8f3c1b602e8ac48bf74549245ff1f0f9c301b5e`
 
 Metric: `score` · Ambiguous, multi-file tasks from real Cursor sessions. No uncertainty or sample count is published; small score differences may not be meaningful.
 
@@ -100,94 +100,56 @@ Shared harness/config: `Cursor benchmark agent` · `published CursorBench config
 
 | model | effort | score | avg cost/task | uncertainty / sample | Pareto |
 | --- | --- | ---: | ---: | --- | :---: |
-| Gemini 4 Carbon | High | 60.40% | $9.220 | — | ★ |
-| Gemini 4 Carbon | Medium | 60.10% | $8.490 | — | ★ |
-| Fable 5.2 | Max | 60.00% | $32.790 | — |  |
-| Gemini 4 Carbon | Low | 58.60% | $11.890 | — |  |
-| Gemini 4 Hydrogen | Extra High | 57.80% | $5.860 | — | ★ |
-| Opus 5.5 | Max | 57.80% | $13.430 | — |  |
-| Fable 5.2 | High | 56.90% | $9.700 | — |  |
-| Fable 5.2 | Extra High | 56.30% | $15.480 | — |  |
-| Opus 5.5 | High | 56.00% | $3.970 | — | ★ |
-| Opus 5.5 | Extra High | 56.00% | $6.980 | — |  |
-| Sonnet 5.5 | Max | 55.50% | $7.050 | — |  |
-| Fable 5.2 | Medium | 54.80% | $4.660 | — |  |
-| Gemini 4 Hydrogen | High | 54.30% | $5.590 | — |  |
-| Fable 5.2 | Low | 53.20% | $3.940 | — | ★ |
-| Sonnet 5.5 | Extra High | 53.10% | $2.810 | — | ★ |
-| Gemini 4 Argon | High | 52.90% | $4.570 | — |  |
-| Gemini 4 Argon | Medium | 52.80% | $4.390 | — |  |
-| Opus 5.5 | Medium | 52.50% | $2.910 | — |  |
-| Fable 5.1 | Max | 51.80% | $17.280 | — |  |
-| Fable 5.1 | Extra High | 51.60% | $13.010 | — |  |
-| Gemini 4 Argon | Low | 50.60% | $4.090 | — |  |
-| Muse Wonder | Max | 50.40% | $5.250 | — |  |
-| Fable 5.1 | High | 49.20% | $9.080 | — |  |
-| Haiku 5.5 | Max | 48.40% | $1.120 | — | ★ |
-| Muse Wonder | Extra High | 48.20% | $4.240 | — |  |
-| Sonnet 5.5 | High | 47.80% | $1.200 | — |  |
-| DeepSeek V4.1 Flash 1017 | Max | 47.70% | $0.980 | — | ★ |
-| Fable 5.1 | Medium | 46.80% | $7.050 | — |  |
-| Gemini 4 Hydrogen | Medium | 46.70% | $1.760 | — |  |
-| Opus 5 | Max | 46.60% | $11.950 | — |  |
-| DeepSeek V4.1 Flash 1017 | Medium | 46.30% | $0.800 | — | ★ |
-| Grok 4.7 | Extra High | 46.30% | $6.010 | — |  |
-| Muse Wonder | High | 46.10% | $3.510 | — |  |
-| Opus 5 | Extra High | 46.10% | $11.430 | — |  |
-| DeepSeek V4.1 Flash 1017 | High | 45.60% | $0.770 | — | ★ |
-| Muse Wonder | Medium | 45.20% | $2.820 | — |  |
-| Fable 5.1 | Low | 45.10% | $5.440 | — |  |
-| DeepSeek V4.1 Flash 1017 | Low | 44.90% | $0.600 | — | ★ |
-| Opus 5 | High | 44.70% | $9.000 | — |  |
-| Haiku 5.5 | Extra High | 44.30% | $0.560 | — | ★ |
-| Grok 4.7 | High | 43.90% | $4.690 | — |  |
-| Opus 5.5 | Low | 43.70% | $1.170 | — |  |
-| Opus 5 | Medium | 43.30% | $6.940 | — |  |
-| GLM 5.3 | Max | 42.60% | $5.050 | — |  |
-| Haiku 5.5 | High | 42.30% | $0.320 | — | ★ |
-| Muse Wonder | Low | 41.70% | $1.910 | — |  |
-| GPT-5.6 Sol | Max | 41.70% | $8.230 | — |  |
-| Muse Spark 1.3 | Max | 41.60% | $2.640 | — |  |
-| Grok 4.7 | Medium | 41.60% | $3.490 | — |  |
-| Grok 4.6 | Extra High | 41.40% | $6.100 | — |  |
-| GPT-5.6 Terra | Max | 41.30% | $5.140 | — |  |
-| Opus 5 | Low | 40.70% | $4.870 | — |  |
-| Grok 4.6 | High | 40.40% | $5.200 | — |  |
-| Sonnet 5.5 | Medium | 39.20% | $0.520 | — |  |
-| GLM 5.3 | High | 38.00% | $3.240 | — |  |
-| GPT-5.6 Sol | Extra High | 37.70% | $4.400 | — |  |
-| Muse Spark 1.3 | Extra High | 37.50% | $2.100 | — |  |
-| Haiku 5.5 | Medium | 36.90% | $0.170 | — | ★ |
-| GLM 5.3 Flash | Max | 36.80% | $0.390 | — |  |
-| Grok 4.6 | Medium | 36.10% | $3.480 | — |  |
-| GPT-5.6 Luna | Max | 35.90% | $1.030 | — |  |
-| Sonnet 5.5 | Low | 35.80% | $0.370 | — |  |
-| GPT-5.6 Sol | High | 35.70% | $2.850 | — |  |
-| Muse Wonder | Minimal | 34.20% | $0.840 | — |  |
-| Sonnet 5 | Max | 34.10% | $7.170 | — |  |
-| GPT-5.6 Terra | Extra High | 33.60% | $1.810 | — |  |
-| Muse Spark 1.3 | High | 33.40% | $1.660 | — |  |
-| Grok 4.6 | Low | 33.40% | $2.250 | — |  |
-| GLM 5.3 | Low | 33.30% | $2.040 | — |  |
-| Grok 4.7 | Low | 33.10% | $1.580 | — |  |
-| GPT-5.6 Luna | Extra High | 33.00% | $0.440 | — |  |
-| Muse Spark 1.3 | Medium | 32.60% | $1.490 | — |  |
-| Sonnet 5 | Extra High | 32.00% | $4.550 | — |  |
-| GLM 5.3 Flash | High | 31.10% | $0.250 | — |  |
-| GPT-5.6 Sol | Medium | 31.10% | $1.770 | — |  |
-| Haiku 5.5 | Low | 30.90% | $0.080 | — | ★ |
-| Sonnet 5 | High | 30.80% | $3.480 | — |  |
-| GPT-5.6 Terra | High | 30.70% | $1.110 | — |  |
-| GPT-5.6 Luna | High | 29.40% | $0.250 | — |  |
-| Muse Spark 1.3 | Low | 29.30% | $0.930 | — |  |
-| Sonnet 5 | Medium | 28.00% | $2.310 | — |  |
-| Gemini 4 Hydrogen | Low | 27.90% | $0.280 | — |  |
-| Composer 2.5 | default | 27.70% | $0.680 | — |  |
-| GPT-5.6 Terra | Medium | 27.60% | $0.640 | — |  |
-| GLM 5.3 Flash | Low | 26.90% | $0.150 | — |  |
-| GPT-5.6 Terra | Low | 25.20% | $0.520 | — |  |
-| GPT-5.6 Sol | Low | 24.60% | $0.870 | — |  |
-| Muse Spark 1.3 | Minimal | 24.30% | $0.560 | — |  |
-| Sonnet 5 | Low | 24.10% | $1.390 | — |  |
-| GPT-5.6 Luna | Medium | 22.20% | $0.080 | — |  |
-| GPT-5.6 Luna | Low | 16.00% | $0.030 | — | ★ |
+| Gemini 4 Neon | Extra High | 65.40% | $10.670 | — | ★ |
+| Gemini 4 Neon | High | 63.70% | $6.540 | — | ★ |
+| Gemini 4 Carbon | High | 61.50% | $8.520 | — |  |
+| Gemini 4 Hydrogen | Extra High | 61.40% | $8.090 | — |  |
+| Fable 5.2 | Max | 61.30% | $48.110 | — |  |
+| Gemini 4 Carbon | Medium | 60.40% | $7.220 | — |  |
+| Fable 5.2 | Extra High | 58.80% | $17.840 | — |  |
+| Opus 5.5 | Max | 58.10% | $11.880 | — |  |
+| Gemini 4 Neon | Medium | 57.70% | $3.070 | — | ★ |
+| Gemini 4 Hydrogen | High | 57.30% | $4.570 | — |  |
+| Opus 5.5 | Extra High | 56.70% | $6.540 | — |  |
+| Gemini 4 Argon | High | 56.50% | $9.140 | — |  |
+| Fable 5.2 | High | 56.50% | $10.510 | — |  |
+| Gemini 4 Argon | Medium | 55.80% | $7.640 | — |  |
+| Gemini 4 Carbon | Low | 55.00% | $8.640 | — |  |
+| Opus 5.5 | High | 54.50% | $3.870 | — |  |
+| Sonnet 5.5 | Max | 54.40% | $8.630 | — |  |
+| Fable 5.2 | Medium | 54.20% | $5.010 | — |  |
+| Fable 5.2 | Low | 53.40% | $4.260 | — |  |
+| Opus 5.5 | Medium | 50.00% | $2.850 | — | ★ |
+| Sonnet 5.5 | Extra High | 49.90% | $3.130 | — |  |
+| Grok 4.7 | Extra High | 48.60% | $10.190 | — |  |
+| Haiku 5.5 | Max | 48.40% | $1.140 | — | ★ |
+| Gemini 4 Argon | Low | 47.90% | $7.960 | — |  |
+| Gemini 4 Hydrogen | Medium | 46.40% | $1.280 | — |  |
+| Grok 4.7 | High | 46.00% | $6.880 | — |  |
+| Gemini 4 Neon | Low | 45.50% | $1.260 | — |  |
+| Haiku 5.5 | Extra High | 45.20% | $0.560 | — | ★ |
+| Grok 4.6 | Extra High | 44.30% | $5.260 | — |  |
+| Sonnet 5.5 | High | 43.80% | $1.410 | — |  |
+| Opus 5.5 | Low | 42.70% | $1.430 | — |  |
+| Grok 4.7 | Medium | 42.50% | $5.520 | — |  |
+| Muse Spark 1.3 | Max | 41.90% | $2.890 | — |  |
+| Grok 4.6 | High | 41.30% | $4.280 | — |  |
+| GPT-5.6 Sol | Max | 40.90% | $7.600 | — |  |
+| Grok 4.6 | Medium | 38.90% | $2.590 | — |  |
+| Haiku 5.5 | High | 37.50% | $0.310 | — | ★ |
+| GPT-5.6 Sol | Extra High | 37.40% | $4.320 | — |  |
+| Muse Spark 1.3 | Extra High | 34.60% | $2.330 | — |  |
+| Sonnet 5.5 | Medium | 34.30% | $0.630 | — |  |
+| Haiku 5.5 | Medium | 34.20% | $0.170 | — | ★ |
+| GPT-5.6 Sol | High | 33.20% | $3.000 | — |  |
+| Grok 4.6 | Low | 33.10% | $1.760 | — |  |
+| Muse Spark 1.3 | High | 32.10% | $1.970 | — |  |
+| Sonnet 5.5 | Low | 31.80% | $0.440 | — |  |
+| Grok 4.7 | Low | 31.50% | $2.730 | — |  |
+| Muse Spark 1.3 | Medium | 31.30% | $1.750 | — |  |
+| GPT-5.6 Sol | Medium | 28.70% | $1.970 | — |  |
+| Haiku 5.5 | Low | 27.80% | $0.080 | — | ★ |
+| Muse Spark 1.3 | Low | 27.50% | $1.130 | — |  |
+| Gemini 4 Hydrogen | Low | 23.90% | $0.280 | — |  |
+| GPT-5.6 Sol | Low | 23.00% | $0.980 | — |  |
+| Muse Spark 1.3 | Minimal | 21.30% | $0.690 | — |  |
